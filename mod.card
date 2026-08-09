@@ -1,0 +1,27 @@
+-- PotatoVoxel sharing metadata.
+return {
+  summary = "Unconditional Brick-mode voxel overworld for low-end devices.",
+  author = "ShaneMcGovernIE",
+  contact = "https://github.com/ShaneMcGovernIE",
+  tags = { "graphics", "3d", "voxel", "render-pipeline", "low-end" },
+  differences = {
+    changed = {
+      "Brick mode is the only supported profile: VOXEL OFF / HIGH / MEDIUM / LOW / POTATO.",
+      "Render scales are 1.0 / 0.75 / 0.5 / 0.33; HIGH keeps the two-layer 1536px shadow map and lower active modes use contact shadows.",
+      "Water and forest effects remain pinned off while terrain, actors, structures, mesh caching and prebuild remain available.",
+    },
+    added = {
+      "A compact VOXEL quality row and Android-friendly cache prebuild progress/cancel flow.",
+      "Brick-tuned billboard structures and cached voxel terrain.",
+    },
+    known = {
+      "The first visit to a map may build terrain meshes; the disk cache is stored under the save directory.",
+      "Shader and depth-canvas support are required for the 3D pass.",
+    },
+  },
+  credits = {
+    { who = "DramaticShape", for_ = "the upstream Dramatic Shape Voxel Mod this fork derives from (v1.6.2)" },
+    { who = "pret/pokered", for_ = "the tile and sprite data the geometry is derived from" },
+  },
+  compat = { engine = ">=0.1.37 <2.0.0", modApi = 2 },
+}

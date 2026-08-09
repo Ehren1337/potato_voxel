@@ -1,0 +1,7 @@
+# Files that stay in the repo and out of the distributed package.
+# Exact relative paths, one per line -- modkit matches literally, no globs.
+
+# The SDK suite. A shipped test that requires an engine module reads as a
+# private require against the archive (CONTRIBUTING-mods.md "What the PR
+# must contain", 2).
+tests/potato_voxel_test.lua
