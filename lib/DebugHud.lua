@@ -1,7 +1,8 @@
 -- Voxel world mode: the realtime diagnostics panel.
 --
--- A DEBUG OFF/ON row on the OPTIONS menu. ON arms the same instrumentation
--- the benchmark driver uses (the Perf.wrap spans over Structures.forMap,
+-- The diagnostics panel is retained for benchmark instrumentation, but is
+-- disabled for players. The benchmark driver uses the same instrumentation
+-- (the Perf.wrap spans over Structures.forMap,
 -- Buildings.build, ChunkMesher.pump and VoxelScene.render, plus the
 -- once-per-rendered-frame stamp) and draws a live panel over the finished
 -- frame: whole-frame stats (n, avg, p50, p95, p99, worst, the >16.7ms and
@@ -39,12 +40,17 @@ function DebugHud.enabled()
   return DebugHud.setting:get() and true or false
 end
 
-function DebugHud.sync(value)
-  DebugHud.setting:sync(value and true or false)
-end
-
-function DebugHud.row()
-  return DebugHud.setting:row()
+-- Migrate the former option to OFF once. Existing users who had DEBUG enabled
+-- must not keep the old value after the row is removed from the menu.
+local disabled = false
+function DebugHud.disable(game)
+  if disabled then return end
+  disabled = true
+  if DebugHud.setting:get() then
+    DebugHud.setting:setValue(false, game)
+  else
+    DebugHud.setting:sync(false)
+  end
 end
 
 -- ------- instrumentation
