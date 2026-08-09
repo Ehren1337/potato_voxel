@@ -5,6 +5,7 @@
 ### Fixed
 
 - Fixed performance regressions in POTATO Mode.
+- Removed the DEBUG option from the in-game OPTIONS menu; diagnostics remain available only through benchmark instrumentation.
 
 ## [1.2.3] - 2026-08-09
 
