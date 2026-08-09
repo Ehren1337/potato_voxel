@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.2.4] - 2026-08-10
+
+### Fixed
+
+- Fixed performance regressions in POTATO Mode.
+
 ## [1.2.3] - 2026-08-09
 
 ### Fixed
@@ -9,4 +15,5 @@
 - Replaced animated NPC shadow silhouettes with fixed contact-shadow blobs so animation frames, mirroring, and jump lift cannot stretch or shimmer shadows.
 - Removed the DEBUG option from the in-game options menu.
 
+[1.2.4]: https://github.com/ShaneMcGovernIE/potato_voxel/releases/tag/v1.2.4
 [1.2.3]: https://github.com/ShaneMcGovernIE/potato_voxel/releases/tag/v1.2.3
