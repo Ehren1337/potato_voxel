@@ -638,7 +638,7 @@ mod.options:define(schema)
 -- The Brick build is a single quality ladder, so the keys that cycled the
 -- removed rungs are left alone: 5/7/8/9 fall through to the engine, and 6
 -- is the tilt-shift key, whose pipeline is not registered there. Only "3"
--- (and SELECT, below) stays, stepping OFF -> HIGH -> MEDIUM -> LOW.
+-- stays, stepping OFF -> HIGH -> MEDIUM -> LOW.
 local HOTKEYS = BrickProfile.isBrick()
   and { ["8"] = "pipeline", ["lshift"] = "pipeline", ["rshift"] = "pipeline" }
   or {
@@ -653,15 +653,15 @@ local HOTKEYS = BrickProfile.isBrick()
 }
 
 -- One step of the VOXEL angle ladder: everything an "8" press does, named
--- so the pad's SELECT button (below) can make exactly the same step. The
+-- so VR view control can make exactly the same step. The
 -- gate is the registry's own; the tilt/GBC FX clearing is the engine work
 -- the key has always delegated (see the wrap below for why).
 local function cycleVoxel(game)
   local Pipelines = require("src.render.Pipelines")
   -- HORDE MODE holds the rung at 1ST for as long as it runs. Refused HERE
   -- rather than at each caller because this one function IS every way a
-  -- player can step the ladder: the "8" key, the pad's SELECT, and the VR
-  -- left-stick click all come through it.
+  -- player can step the ladder: the "8" key and the VR left-stick click
+  -- both come through it.
   if Horde.viewLocked() then return false end
   local top = game.stack and game.stack:top()
   if not Pipelines.canToggle("voxel", top, game.overworld) then return false end
@@ -722,8 +722,8 @@ do
         -- 8 walks the ANGLE rungs and steps over FULL (Voxel.HOTKEY_ORDER),
         -- so the registry's plain "advance one and wrap" is not what it
         -- wants; 6 still is. The gate is the registry's own either way.
-        -- The whole of 8's step lives in cycleVoxel, because the pad's
-        -- SELECT button makes the same step (see the handleInput wrap).
+        -- The whole of 8's step lives in cycleVoxel, so keyboard and VR
+        -- controls share one guarded implementation.
         if key == "8" or key == "lshift" or key == "rshift" then
           if cycleVoxel(self) then return end
         elseif Pipelines.hotkey(key, top, self.overworld) then
@@ -1175,7 +1175,7 @@ CamControl.install()
 -- ------- the konami code, and everything it turns on
 --
 -- Installed last of the input seams so its handleInput reasoning sits
--- outside FreeMove's and SELECT's. The detector itself does not live on
+-- outside FreeMove's. The detector itself does not live on
 -- handleInput at all -- it reads the fixed step's own press queue, which
 -- is where keyboard, pad, touch and the VR controllers have all already
 -- become the same eight buttons. See lib/Horde.lua.

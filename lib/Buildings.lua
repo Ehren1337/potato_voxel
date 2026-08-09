@@ -50,6 +50,7 @@
 local V = ...
 
 local Budget = V.require("BuildBudget")
+local Perf = V.require("Perf")
 
 local Buildings = {}
 
@@ -159,18 +160,41 @@ local function read(t, data, perRow)
   local bh, bw = #tiles, #t.tiles[1]
   local W, H = bw * 8, bh * 8
   local col, ax, ay = {}, {}, {}
+  -- A tile can occur many times in one template (and adjacent templates can
+  -- reuse the same atlas coordinates). Keep the sampled shade, not the source
+  -- colour: shadeOf() is the only observable result and the atlas is immutable
+  -- for the lifetime of a build. This removes repeated getPixel calls without
+  -- changing any classification or UV source coordinates.
+  local sampled = {}
+  local atlasStride = perRow * 8
+  local atlasSamples, atlasHits = 0, 0
   for sy = 0, H - 1 do
     Budget.tick()
     local row = tiles[math.floor(sy / 8) + 1]
+    local syInTile = sy % 8
+    local rowBase = sy * W
     for sx = 0, W - 1 do
       local tile = row[math.floor(sx / 8) + 1]
       local px = (tile % perRow) * 8 + sx % 8
-      local py = math.floor(tile / perRow) * 8 + sy % 8
-      local i = sy * W + sx
+      local py = math.floor(tile / perRow) * 8 + syInTile
+      local i = rowBase + sx
       ax[i], ay[i] = px, py
-      local r, g, b, a = data:getPixel(px, py)
-      col[i] = shadeOf(r, g, b, a)
+      local sampleKey = py * atlasStride + px
+      local shade = sampled[sampleKey]
+      if shade == nil then
+        local r, g, b, a = data:getPixel(px, py)
+        shade = shadeOf(r, g, b, a)
+        sampled[sampleKey] = shade
+        atlasSamples = atlasSamples + 1
+      else
+        atlasHits = atlasHits + 1
+      end
+      col[i] = shade
     end
+  end
+  if Perf.enabled then
+    Perf.count("buildings.atlas_samples", atlasSamples)
+    Perf.count("buildings.atlas_cache_hits", atlasHits)
   end
 
   local outside = {}
@@ -260,8 +284,10 @@ local function measure(sp, t)
   for x = 0, W - 1 do
     Budget.tick()
     local r = roofRows
+    local rowBase = x
     for y = 0, roofRows - 1 do
-      if sp.inside[y * W + x] then r = y break end
+      if sp.inside[rowBase] then r = y break end
+      rowBase = rowBase + W
     end
     top[x] = r
   end
@@ -276,11 +302,13 @@ local function measure(sp, t)
   local surfaceTop = {}
   for x = 0, W - 1 do
     local y = top[x]
-    while y < roofRows and sp.inside[y * W + x]
-        and sp.col[y * W + x] == BLACK do
+    local rowBase = y * W + x
+    while y < roofRows and sp.inside[rowBase]
+        and sp.col[rowBase] == BLACK do
       y = y + 1
+      rowBase = rowBase + W
     end
-    if y < roofRows and sp.inside[y * W + x] then
+    if y < roofRows and sp.inside[rowBase] then
       surfaceTop[x] = y
     else
       surfaceTop[x] = top[x]
@@ -296,8 +324,9 @@ local function measure(sp, t)
   for sy = H - 1, roofRows, -1 do
     Budget.tick()
     local drawn = false
+    local rowBase = sy * W
     for sx = 0, W - 1 do
-      if sp.inside[sy * W + sx] then drawn = true break end
+      if sp.inside[rowBase + sx] then drawn = true break end
     end
     if drawn then
       ground = sy + 1
@@ -313,8 +342,9 @@ local function measure(sp, t)
   -- colour, which is what the flanks of the real thing would show.
   local interior = {}
   for sy = roofRows, H - 1 do
+    local rowBase = sy * W
     for sx = 0, W - 1 do
-      local i = sy * W + sx
+      local i = rowBase + sx
       local src = i
       if sp.inside[i] and sp.col[i] == BLACK then
         local step = sx < W / 2 and 1 or -1
@@ -387,7 +417,8 @@ local function measure(sp, t)
   -- but never paints, and they must still wear its palette (and pick up
   -- whatever SGB recolouring the atlas carries).
   local shadeTexel = {}
-  for i = 0, sp.W * sp.H - 1 do
+  local pixelCount = sp.W * sp.H
+  for i = 0, pixelCount - 1 do
     if sp.inside[i] and not shadeTexel[sp.col[i]] then
       shadeTexel[sp.col[i]] = i
     end
@@ -1026,20 +1057,26 @@ end
 local function emit(m, sp, atlasW, atlasH)
   local W = m.W
   local quads = { voxels = 0, shell = 0 }
+  -- Positive one-based indices keep this dense voxel volume on Lua's array
+  -- part of the table (the historical zero-based key range made it a hash).
+  -- The stored values and all externally visible counts/quads remain the same.
   local cell = {}                        -- (y, z, x) -> sprite pixel index
 
   local zmin, zmax, ytop = m.zmin, m.zmax, m.ytop
   local zn = zmax - zmin + 1
+  local function cellIndex(x, y, z)
+    return (y * zn + (z - zmin)) * W + x + 1
+  end
   local function ci(x, y, z)
     if x < 0 or x >= W or y < 0 or y > ytop or z < zmin or z > zmax then
       return nil
     end
-    return cell[(y * zn + (z - zmin)) * W + x]
+    return cell[cellIndex(x, y, z)]
   end
   for y = 0, ytop do
     Budget.tick()
     for z = zmin, zmax do
-      local base = (y * zn + (z - zmin)) * W
+      local base = (y * zn + (z - zmin)) * W + 1
       for x = 0, W - 1 do
         local v = m.at(x, y, z)
         cell[base + x] = v
@@ -1238,14 +1275,38 @@ function Buildings.build(S, map, data, perRow)
   local tw, th = map.def.width * 4, map.def.height * 4
   local quads = S.objectQuads
 
+  -- Every template is anchored by its north-west tile. Build the reverse
+  -- index once so a template only examines positions carrying its anchor
+  -- tile, rather than rescanning the whole map. The scan is row-major, so
+  -- candidate order (and therefore first-claim semantics) is unchanged.
+  local anchors = {}
+  for ty = 0, th - 1 do
+    Budget.tick()
+    for tx = 0, tw - 1 do
+      local tile = S.tileAt[keyOf(tx, ty)]
+      if tile ~= nil then
+        local row = anchors[tile]
+        if not row then
+          row = {}
+          anchors[tile] = row
+        end
+        row[#row + 1] = tx
+        row[#row + 1] = ty
+      end
+    end
+  end
+  if Perf.enabled then Perf.count("buildings.anchor_cells", tw * th) end
+
   for index, t in ipairs(list) do
     if type(t.tiles) == "table" and #t.tiles > 0 then
       local bh, bw = #t.tiles, #t.tiles[1]
       local first = t.tiles[1][1]
       local built = nil
-      for ty = 0, th - bh do
-        Budget.tick()
-        for tx = 0, tw - bw do
+      local candidates = anchors[first]
+      if candidates then
+        for n = 1, #candidates, 2 do
+          Budget.tick()
+          local tx, ty = candidates[n], candidates[n + 1]
           -- A placement never stamps into cells another template already
           -- claimed. Templates are matched independently, and one
           -- drawing can satisfy two grids: the Pokemon Tower's upper
@@ -1254,8 +1315,9 @@ function Buildings.build(S, map, data, perRow)
           -- second building behind the tower. First claim wins, so the
           -- list order below is the priority order -- the tower's own
           -- templates come first precisely so they take those cells.
-          local free = S.tileAt[keyOf(tx, ty)] == first
-          if free then
+          if tx <= tw - bw and ty <= th - bh then
+            if Perf.enabled then Perf.count("buildings.candidate_checks") end
+            local free = true
             for r = 0, bh - 1 do
               for c = 0, bw - 1 do
                 if S.skip[keyOf(tx + c, ty + r)] then
@@ -1265,27 +1327,28 @@ function Buildings.build(S, map, data, perRow)
               end
               if not free then break end
             end
-          end
-          if free and matches(S, t, tx, ty) then
-            if not built then
-              local key = tileset.id .. ":" .. index
-              if not models[key] then
-                if t.claimOnly then
-                  -- claim the cells, stamp nothing: the drawing here is
-                  -- the off-map half of a building another map models in
-                  -- full (the tower's roof rows on ROUTE_10 -- Lavender's
-                  -- placement composites them via topRows). Left to the
-                  -- detector they stood as a second half-building.
-                  models[key] = {}
-                else
-                  local sp = read(t, data, perRow)
-                  local pr = measure(sp, t)
-                  models[key] = emit(model(sp, pr, t), sp, atlasW, atlasH)
+            if free and matches(S, t, tx, ty) then
+              if Perf.enabled then Perf.count("buildings.matches") end
+              if not built then
+                local key = tileset.id .. ":" .. index
+                if not models[key] then
+                  if t.claimOnly then
+                    -- claim the cells, stamp nothing: the drawing here is
+                    -- the off-map half of a building another map models in
+                    -- full (the tower's roof rows on ROUTE_10 -- Lavender's
+                    -- placement composites them via topRows). Left to the
+                    -- detector they stood as a second half-building.
+                    models[key] = {}
+                  else
+                    local sp = read(t, data, perRow)
+                    local pr = measure(sp, t)
+                    models[key] = emit(model(sp, pr, t), sp, atlasW, atlasH)
+                  end
                 end
+                built = models[key]
               end
-              built = models[key]
+              Buildings.stamp(S, map, built, tx, ty, bw, bh, t)
             end
-            Buildings.stamp(S, map, built, tx, ty, bw, bh, t)
           end
         end
       end

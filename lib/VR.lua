@@ -512,7 +512,7 @@ end
 --                 so it grid-walks the diorama and free-walks 1ST);
 --                 A/B are A/B; either trigger is START; clicking the
 --                 LEFT stick steps the VOXEL angle ladder exactly as
---                 the "3" key (and the pad's SELECT) does.
+--                 the "3" key does.
 --   1ST only      right stick left/right SNAP-TURNS 45 degrees a flick.
 --   diorama only  right stick up/down zooms the model; squeezing a grip
 --                 and moving that hand up or down drags the whole table
@@ -524,8 +524,8 @@ end
 -- The left stick click makes EXACTLY the step the "3" key makes: one
 -- rung up the VOXEL angle ladder, wrapping, stepping over FULL, clearing
 -- TILT and GBC FX in the save -- by calling the very function the key
--- and the pad's SELECT button already share. main.lua installs it below
--- (cycleVoxel is a local of that file); the free-roam gate is the
+-- and VR view control share. main.lua installs it below (cycleVoxel is a
+-- local of that file); the free-roam gate is the
 -- registry's own, inside it, so a click over a menu or mid-warp is a
 -- no-op exactly like the key.
 VR.cycleVoxel = nil             -- cycleVoxel(game), set by main.lua
