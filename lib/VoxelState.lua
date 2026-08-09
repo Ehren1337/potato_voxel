@@ -131,6 +131,29 @@ Voxel.t = 1
 -- the whole frame for seconds).
 Voxel.ready = true
 
+-- A cold destination owns an opaque cover until its first terrain mesh lands,
+-- so the asynchronous build never leaks the vanilla 2D world.
+Voxel.loading = false
+Voxel.loadingMap = nil
+Voxel.loadingSince = 0
+
+local clock = (love and love.timer and love.timer.getTime) or os.clock
+
+function Voxel.beginLoading(mapId)
+  if Voxel.loading and Voxel.loadingMap == mapId then return end
+  Voxel.loading = true
+  Voxel.loadingMap = mapId
+  Voxel.loadingSince = clock()
+  Voxel.ready = false
+end
+
+function Voxel.finishLoading(mapId)
+  if mapId and Voxel.loadingMap ~= mapId then return end
+  Voxel.loading = false
+  Voxel.loadingMap = nil
+  Voxel.loadingSince = 0
+end
+
 Voxel.TWEEN_TIME = 0.25
 -- Camera distance as a multiple of the view height, and the matching field
 -- of view. Kept equal to Tilt.FOCAL so a given angle frames the world the
@@ -150,6 +173,7 @@ function Voxel.setLevel(level)
   if level < 0 then level = 0 end
   if level > Voxel.MAX_LEVEL then level = Voxel.MAX_LEVEL end
   local goal = goalFor(level)
+  if goal <= 0 then Voxel.finishLoading() end
   if goal ~= Voxel.goal or level ~= Voxel.level then
     Voxel.from = Voxel.angle
     Voxel.goal = goal
@@ -166,6 +190,7 @@ end
 function Voxel.reset()
   Voxel.level, Voxel.angle = 0, 0
   Voxel.from, Voxel.goal, Voxel.t = 0, 0, 1
+  Voxel.finishLoading()
 end
 
 function Voxel.levelLabel(level)

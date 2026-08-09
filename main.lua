@@ -108,6 +108,22 @@ local HordeHud = V.require("HordeHud")
 local DebugHud = V.require("DebugHud")
 local CachePrebuild = V.require("CachePrebuild")
 local HordeSfx = V.require("HordeSfx")
+local VoxelLoading = V.require("VoxelLoading")
+local publishedLoading
+
+local function publishLoading()
+  local loading = Voxel.loading == true
+  if publishedLoading == loading then return end
+  publishedLoading = loading
+  mod.events:emit("mod.potato_voxel.loading_changed", {
+    loading = loading,
+    mapId = Voxel.loadingMap,
+  })
+end
+
+mod.exports.isLoading = function()
+  return Voxel.loading == true, Voxel.loadingMap
+end
 
 -- The low-end runtime tuner (lib/BrickProfile.lua): the TrimUI Brick
 -- tuning this fork ships with, applied on every platform. Loaded on
@@ -258,14 +274,23 @@ mod.content.render_pipelines:register("voxel", {
     -- The cache prebuilder is deliberately independent of the active display
     -- mode: an Options-menu press must keep progressing while VOXEL is OFF.
     CachePrebuild.update()
-    if not Voxel.active() then return end
+    if not Voxel.active() then
+      publishLoading()
+      return
+    end
     local Game = require("src.core.Game")
     local ow = Game and Game.overworld
     if ow and ow.map and ow.camera then
       pcall(VoxelScene.prefetch, ow)
     end
-    ChunkMesher.pump(Game and Game.stack
-                     and Game.stack:top() ~= ow)
+    local covered = Game and Game.stack and Game.stack:top() ~= ow
+    ChunkMesher.pump(covered or Voxel.loading)
+    -- The covered slice may have completed the current terrain. Re-read now
+    -- so the loading canvas does not survive for one empty extra frame.
+    if Voxel.loading and ow and ow.map and ow.camera then
+      pcall(VoxelScene.prefetch, ow)
+    end
+    publishLoading()
   end,
 
   drawWorld = function(ctx)
@@ -289,6 +314,9 @@ mod.content.render_pipelines:register("voxel", {
     -- a magnified low-res image, while the FX closures keep drawing in
     -- world-pixel units.
     local sw, sh = sceneSize(ctx)
+    if Voxel.loading then
+      return VoxelLoading.draw(sw, sh, ChunkMesher.pending())
+    end
     -- With AA on, the whole pass runs into a canvas BIGGER than the window
     -- and is folded back down at the end (see AntiAlias).  Nothing between
     -- these two lines knows: every pass in the frame measures itself in the
@@ -344,11 +372,26 @@ mod.content.render_pipelines:register("voxel", {
     OverworldBattle.invalidate()
     AntiAlias.invalidate()
     Upscale.invalidate()
+    VoxelLoading.invalidate()
     ChunkMesher.invalidate()   -- no map id = every cached mesh
     ForestAtmos.invalidate()   -- shaft/particle meshes and shader sentinels
     VR.invalidate()            -- the mirror, and FBO ids of dead canvases
   end,
 })
+
+-- The loading cover hides gameplay, not time: the pipeline update above keeps
+-- pumping mesh jobs while scripts, encounters and invisible movement pause.
+do
+  local OverworldController = require("src.world.OverworldController")
+  if not OverworldController.potatoVoxelLoadingHook then
+    local inner = OverworldController.update
+    function OverworldController:update(dt)
+      if Voxel.loading then return end
+      return inner(self, dt)
+    end
+    OverworldController.potatoVoxelLoadingHook = true
+  end
+end
 
 -- The tilt-shift blur and its OPTIONS row are dropped on the Brick: the
 -- diorama is already ON its optimised framing there, and a full-screen

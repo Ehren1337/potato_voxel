@@ -32,6 +32,7 @@ return {
       "BACK SPRITES options row (OFF / ON, off by default), which keeps your own Pokemon on the battle menu in its classic slot",
       "VR options row (OFF / ON, off by default, desktop path only): PCVR through OpenXR on Windows -- the diorama as a head-tracked tabletop model. Requires the OpenXR loader, which PotatoVoxel no longer ships (restore assets/vr from the upstream mod to use it)",
       "a day/night clock that reaches the flat 2D overworld as well as the diorama",
+      "an opaque Town Map loading cover for cold asynchronous terrain builds, so the vanilla 2D world never flashes before the voxel mesh is ready",
       "an over-the-shoulder battle camera on a slow parallax orbit, with a depth-of-field pass that holds both mons sharp",
       "a sky behind the diorama at the 75-degree rung, outdoor maps only",
       "a hand-authored tile shape profile (data/voxel_heights.lua) a mod can extend",
