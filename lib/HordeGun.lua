@@ -32,7 +32,7 @@ local V = ...
 
 local Mat4 = V.require("Mat4")
 local Voxel3D = V.require("Voxel3D")
--- Flat-screen Brick mode has no tracked-hand rig.
+local VRRig = V.require("VRRig")
 local FirstPerson = V.require("FirstPerson")
 local Horde = V.require("Horde")
 local HordeSfx = V.require("HordeSfx")
@@ -405,11 +405,11 @@ end
 -- the tracked right hand -- the runtime's aim pose where it has one.
 
 function HordeGun.place(pose, pivot, anchor, scale, yaw)
-  -- Tracked-hand placement was part of the removed VR integration.
-  HordeGun.clear()
-  return
-  --[[
-  local m = nil
+  if not (Horde.active and pose) then
+    HordeGun.clear()
+    return
+  end
+  local m = VRRig.propMatrix(pose, pivot, anchor, scale, yaw)
   m = Mat4.mul(m, Mat4.translate(HordeGun.HAND_OFFSET[1],
                                  HordeGun.HAND_OFFSET[2],
                                  HordeGun.HAND_OFFSET[3]))
@@ -433,7 +433,6 @@ function HordeGun.place(pose, pivot, anchor, scale, yaw)
   else
     gun.ray = nil
   end
-  ]]
 end
 
 function HordeGun.clear()
@@ -482,7 +481,7 @@ local function flatModel()
   local m = Mat4.translate(eye[1], eye[2], eye[3])
   m = Mat4.mul(m, Mat4.rotateY(FirstPerson.yaw))
   m = Mat4.mul(m, Mat4.rotateX(FirstPerson.pitch - 0.34 * k))
-  m = Mat4.mul(m, Mat4.scale(1, 1, 1))
+  m = Mat4.mul(m, Mat4.scale(VRRig.FP_SCALE, VRRig.FP_SCALE, VRRig.FP_SCALE))
   m = Mat4.mul(m, Mat4.translate(ox, oy, oz))
   if gun.reloading then
     local t = math.min(1, gun.reloadT / HordeGun.RELOAD_TIME)

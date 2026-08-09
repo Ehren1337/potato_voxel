@@ -26,6 +26,8 @@ local Water = V.require("Water")
 local VoxelGrid = V.require("VoxelGrid")
 local DayNight = V.require("DayNight")
 local FirstPerson = V.require("FirstPerson")
+local BattleBillboard = V.require("BattleBillboard")
+local Pokedex = V.require("Pokedex")
 local PaletteFX = require("src.render.PaletteFX")
 local Map = require("src.world.Map")
 
@@ -888,6 +890,15 @@ local function castShadows(state, terrain, nbMesh, posed, cx, cy, vw, vh,
         ShadowMap.draw(mesh, atlasFor(nb.map), ShadowMap.snug(caster))
       end)
     end
+    -- the STADIUM models: geometry, not cut-outs (see BattleScene.castShadows
+    -- for why they are un-snugged and outside the sprite flag)
+    pcall(function()
+      local stageArena, stageY = V.require("OverworldBattle").stage()
+      if stageArena and stageArena.discs then
+        V.require("StadiumStage").cast(ShadowMap, stageArena, stageY or 0)
+      end
+      V.require("Stadium").cast(ShadowMap)
+    end)
     ShadowMap.sprites(false)
     ShadowMap.finish(worldSig, false)
   end
@@ -996,7 +1007,20 @@ function VoxelScene.render(state, w, h, vw, vh, paletteFor, eyes)
     cx, cy = eyes.cx, eyes.cy
   end
 
+  -- A staged fight, seen by the VR eyes: the flat screen draws the battle
+  -- SCREEN while one is up (this pass never runs), but the headset keeps
+  -- looking at the world, so the world had better have the fight on it.
+  -- Fetched per frame for the sun, and again per EYE in drawScene, because
+  -- the cards yaw toward whichever eye is asking.
   local battleCards, battleTex, battleToken = nil, nil, nil
+  if eyes then
+    local okB, cards, tex, token = pcall(function()
+      return V.require("OverworldBattle").worldCards()
+    end)
+    if okB and cards then
+      battleCards, battleTex, battleToken = cards, tex, token
+    end
+  end
 
   -- The sun's box, pushed along the first-person look so it covers the
   -- ground THIS camera sees (a no-op at blend zero): the orbit's fit

@@ -160,7 +160,8 @@ end
 -- Required lazily and guarded: VR reaches this module through FirstPerson,
 -- and a headless run has no VR module worth loading at all.
 local function headset()
-  return false
+  local ok, on = pcall(function() return V.require("VR").active() end)
+  return ok and on or false
 end
 
 function ThirdPerson.selected()

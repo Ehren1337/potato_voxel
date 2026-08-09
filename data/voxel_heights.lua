@@ -198,10 +198,16 @@ return {
       -- one voxel ball per 16x16 cell from the canopy's darkest-pixel
       -- outline, round in depth, so tree rows become rows of real canopies
       cylinder = { 42, 43, 58, 59, 64, 65, 80, 81 },
-      -- Town signs and ordinary fence posts keep their authored production
-      -- classes. The macOS-only Pewter shoreline comparison is a positional
-      -- renderer pin in TileShape, not a tileset-wide post/sign override.
+      -- the town sign (blockset 8's SE cell): a standing per-pixel slab
+      -- 2 voxels thin, transparency respected -- never a solid box
       signpost = { 70, 71, 86, 87 },
+      -- the fence posts drawn in VERTICAL runs (14 the post tops, 85
+      -- the bottoms -- across all 222 maps the two tiles pair only in
+      -- this one cell). The detector already turns the HORIZONTAL runs
+      -- (tile 57) into per-post standees, but a vertical run of repeated
+      -- cells trips its scenery guard and fell to the volume path as a
+      -- fence-textured tower. `post` extracts each cell alone, so these
+      -- render as the same thin posts, marching north
       post = { 14, 85 },
       -- the cliff-mound's dark east slope and its NE corner ($24 the
       -- slope column, $02 the corner).  Their drawn runs span the whole

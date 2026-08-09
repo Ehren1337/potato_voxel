@@ -20,10 +20,18 @@
 local BrickProfile = {}
 
 function BrickProfile.on()
+  -- DS_BRICK overrides the default on ANY device:
+  --   DS_BRICK=1  force the Brick profile on
+  --   DS_BRICK=0  force it off (the full desktop mod)
+  -- Unset: ON -- this fork is the Brick build, so its tuning is what a
+  -- fresh install gets everywhere.
+  local force = os.getenv("DS_BRICK")
+  if force == "1" then return true end
+  if force == "0" then return false end
   return true
 end
 
-BrickProfile.brick = true
+BrickProfile.brick = BrickProfile.on()
 
 function BrickProfile.isBrick()
   return BrickProfile.brick
@@ -40,6 +48,7 @@ end
 BrickProfile.RENDER_SCALES = { [1] = 1.0, [2] = 0.75, [3] = 0.5, [4] = 0.33 }
 
 function BrickProfile.renderScale(level)
+  if not BrickProfile.isBrick() then return 1 end
   return BrickProfile.RENDER_SCALES[level] or 1
 end
 
@@ -50,17 +59,6 @@ end
 -- remains governed by the renderer's existing shadow gates.
 BrickProfile.DESKTOP_HIGH_LEVEL = 1
 BrickProfile.DESKTOP_MEDIUM_LEVEL = 2
-
--- Seed only a missing pipeline selection. Existing saves keep the exact level
--- they stored, including migrated HIGH selections; the default is for new
--- installs/saves that have no VOXEL entry yet.
-function BrickProfile.ensureVoxelDefault(options)
-  if type(options) ~= "table" then return false end
-  if type(options.pipelines) ~= "table" then options.pipelines = {} end
-  if options.pipelines.voxel ~= nil then return false end
-  options.pipelines.voxel = BrickProfile.DESKTOP_MEDIUM_LEVEL
-  return true
-end
 
 function BrickProfile.actorShadowMapEnabled(level)
   return level == BrickProfile.DESKTOP_HIGH_LEVEL
@@ -93,7 +91,11 @@ local function pin(V, name, values, labels)
 end
 
 function BrickProfile.apply(V)
+  if not BrickProfile.isBrick() then return end
+
   local Voxel = V.require("VoxelState")
+  local OverworldBattle = V.require("OverworldBattle")
+  local TiltShift = V.require("TiltShift")
   local ChunkMesher = V.require("ChunkMesher")
   local ShadowMap = V.require("ShadowMap")
   local Structures = V.require("Structures")
@@ -165,8 +167,22 @@ function BrickProfile.apply(V)
   --                     not need.
   pin(V, "Water", { "off" }, { "OFF" })
   pin(V, "ForestAtmos", { "off" }, { "OFF" })
+  pin(V, "OverworldBattle", { false }, { "OFF" })
+  pin(V, "AntiAlias", { 0 }, { "OFF" })
   pin(V, "WorldCurve", { 0 }, { "OFF" })
   pin(V, "VoxelGrid", { false }, { "OFF" })
+
+  -- BACK SPRITES decides what a STAGED battle frames; with 3D-BTL pinned
+  -- off it decides nothing, so it is pinned off with it.
+  OverworldBattle.backSetting.values = { false }
+  OverworldBattle.backSetting.labels = { "OFF" }
+  OverworldBattle.backSetting.index = nil
+
+  -- T-SHIFT: the pipeline is not registered on the Brick (main.lua), so the
+  -- blur never runs and its row and hotkey never exist. The LABELS table is
+  -- still pinned in case anything reads it.
+  replaceInPlace(TiltShift.LABELS, { "OFF" })
+  TiltShift.level = 0
 
   -- The mesh pump yields sooner per frame on four cores: each chunk's
   -- carve-in spreads over more frames but never spikes one. The parent

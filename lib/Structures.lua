@@ -391,14 +391,8 @@ function Structures.forMap(map)
     end
   end
 
-  -- ---- temporary low-poly bollard impostors (comparison method) ----
-  -- Only authored `post` and `signpost` profile classes reach this path via
-  -- TileShape's `bollard` art. Other sprites and scenery keep their existing
-  -- geometry. The impostor is deliberately simple: one 8-sided, textured
-  -- cylinder per 16x16 cell, with no per-pixel mask work.
+  -- ---- profile-pinned billboards (signs): forced per-pixel slabs ----
   if data then
-    Structures.buildBollards(S, map, x0, x1, y0, y1)
-
     local seenB = {}
     for ty = y0, y1 do
       for tx = x0, x1 do
@@ -561,9 +555,6 @@ function Structures.forMap(map)
 end
 
 -- ---- round scenery: outline-hulled voxel balls ----
-
--- TEMP COMPARISON: authored posts/signposts are rendered by the lightweight
--- bollard path above, not by the round-scenery hulls.
 
 -- Cells the profile pins as round (tree canopies -- the class keeps its
 -- historical `cylinder` name in the data file) render as a VOXEL HULL cut
@@ -1420,79 +1411,6 @@ end
 -- hundreds of tree cells x six Lua tables each PER MAP (the multi-GB
 -- heap growth on a cross-region trek).
 local roundCache = {}
-
--- Temporary macOS-only comparison geometry for the authored Pewter shoreline
--- bollard row. One shared eight-sided cylinder per cell keeps vertex work
--- bounded and leaves signs, fences, and ordinary posts on their production
--- standee paths.
-function Structures.buildBollards(S, map, x0, x1, y0, y1)
-  if not (love and love.system and love.system.getOS
-          and love.system.getOS() == "OS X") then return end
-  local tileset = map.tileset
-  local perRow = tileset.tilesPerRow or 16
-  local atlasW = tileset.imageWidth or 128
-  local atlasH = tileset.imageHeight or 48
-  local seen = {}
-  local sides = 8
-  -- Temporary comparison tuning: a little shorter and wider than the
-  -- original 10-unit diameter / 16-unit height cylinder.
-  local radius = 6
-  local height = 14
-  for ty = y0, y1 do
-    for tx = x0, x1 do
-      local s = S.shapeAt[keyOf(tx, ty)]
-      -- The shape resolver already applies this predicate, but repeat the
-      -- complete guard here so the comparison cannot widen if another
-      -- caller supplies a synthetic `bollard` shape.
-      local tile = S.tileAt[keyOf(tx, ty)]
-      local target = map.id == "PEWTER_CITY"
-                     and tileset.id == "OVERWORLD"
-                     and tx >= 44 and tx <= 59
-                     and (ty == 46 or ty == 47)
-                     and (tile == 14 or tile == 85)
-      if s and s.art == "bollard" and target then
-        local cx, cy = math.floor(tx / 2), math.floor(ty / 2)
-        local ck = keyOf(cx, cy)
-        if not seen[ck] then
-          seen[ck] = true
-          local tile = S.tileAt[keyOf(tx, ty)] or 0
-          local u = ((tile % perRow) * 8 + 4) / atlasW
-          local v = (math.floor(tile / perRow) * 8 + 4) / atlasH
-          local mx, mz = cx * 16 + 8, cy * 16 + 8
-          for i = 0, sides - 1 do
-            local a0 = (i / sides) * math.pi * 2
-            local a1 = ((i + 1) / sides) * math.pi * 2
-            local x0c, z0c = mx + math.cos(a0) * radius,
-                             mz + math.sin(a0) * radius
-            local x1c, z1c = mx + math.cos(a1) * radius,
-                             mz + math.sin(a1) * radius
-            S.objectQuads[#S.objectQuads + 1] = {
-              { x0c, 0, z0c }, { x1c, 0, z1c },
-              { x1c, height, z1c }, { x0c, height, z0c },
-              u = u, v = v, shade = ROUND_SHADE.side,
-            }
-            -- A triangle fan encoded as quads; the repeated center vertex
-            -- leaves one zero-area triangle and one visible triangle.
-            S.objectQuads[#S.objectQuads + 1] = {
-              { mx, height, mz }, { x0c, height, z0c },
-              { x1c, height, z1c }, { mx, height, mz },
-              u = u, v = v, shade = ROUND_SHADE.top,
-            }
-          end
-          for dy = 0, 1 do
-            for dx = 0, 1 do
-              local k = keyOf(cx * 2 + dx, cy * 2 + dy)
-              if S.shapeAt[k] and S.shapeAt[k].art == "bollard" then
-                S.skip[k] = true
-                S.ground[k] = false
-              end
-            end
-          end
-        end
-      end
-    end
-  end
-end
 
 function Structures.buildCylinders(S, map, x0, x1, y0, y1, groundTiles)
   local data = pixels(map.tileset)

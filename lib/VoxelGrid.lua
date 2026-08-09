@@ -54,7 +54,7 @@ VoxelGrid.WIDTH = 1.0
 -- reads as one row breaking the other. Scaled, it stays a one-pixel seam and
 -- simply gains the antialiasing everything else in the frame just gained.
 function VoxelGrid.width()
-  return VoxelGrid.WIDTH
+  return VoxelGrid.WIDTH * V.require("AntiAlias").factor()
 end
 
 -- where it persists and the rows that cycle it (see ModSetting)

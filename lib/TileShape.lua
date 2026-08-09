@@ -89,9 +89,6 @@ local FALLBACK_HEIGHTS = {
   billboard = 16,
   signpost = 16,
   post = 16,
-  -- Temporary macOS comparison: the one Pewter City grey bollard cell
-  -- uses the low-poly impostor's measured proportions.
-  bollard = 14,
   grass = 0,
   flower = 0,
   -- interior furniture: face-on drawings the detector would otherwise
@@ -121,9 +118,6 @@ local FALLBACK_HEIGHTS = {
   stair_down_e = 16,
   stair_down_w = 16,
 }
-
-local IS_MACOS = love and love.system and love.system.getOS
-                 and love.system.getOS() == "OS X"
 
 -- class -> how the mesher draws it (see the header). The last three are
 -- profile archetypes Structures.lua builds special geometry for:
@@ -158,11 +152,8 @@ local ART = {
   -- signposts share the billboard treatment but as their own pool at a
   -- 2-voxel depth: a sign is a thin plate on a stick, and the standard
   -- 10px standee body reads as a chunk of furniture outdoors
-  -- Ordinary signs and fences keep their production standee paths. The
-  -- temporary comparison is opted into only by `pewterBollardAt` below.
   signpost = "billboard",
   post = "post",
-  bollard = "bollard",
   grass = "grass",
   -- animated flowers: flat synthesized ground PLUS a standing cutout of
   -- the drawing's darkest tones, one voxel deep (see Structures'
@@ -317,22 +308,6 @@ local function authoredConditions(tilesetId, heights)
   return any and out or nil
 end
 
--- The Pewter shoreline bollards are the authored 14/85 tile pair in the
--- six-cell row at tile coordinates x=44..59, y=46..47. The intervening
--- 70/71 + 86/87 pair is the town sign and must remain a normal signpost.
--- Restricting the map, tileset, coordinates, and tile IDs keeps fences and
--- ordinary posts on their production geometry.
-local function pewterBollardAt(map, tile, tx, ty)
-  if not IS_MACOS or not map or map.id ~= "PEWTER_CITY"
-     or not map.tileset or map.tileset.id ~= "OVERWORLD" then
-    return false
-  end
-  if tx < 44 or tx > 59 or (ty ~= 46 and ty ~= 47) then
-    return false
-  end
-  return tile == 14 or tile == 85
-end
-
 local function shapeFor(class, heights, authored)
   return { class = class, h = heights[class] or 0,
            art = ART[class] or "upright",
@@ -444,9 +419,6 @@ end
 -- map:tileAt(tx, ty), passed in because every caller already has it.
 function TileShape.at(map, shapes, tile, tx, ty)
   local s = shapes[tile]
-  if pewterBollardAt(map, tile, tx, ty) then
-    return shapes.classes.bollard
-  end
   -- conditional pins first: they are authored answers that need the
   -- POSITION to resolve, so they outrank both the flat pin on the same
   -- tile and the cell rules below (see authoredConditions)

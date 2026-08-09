@@ -40,7 +40,7 @@ local Voxel = V.require("VoxelState")
 local Voxel3D = V.require("Voxel3D")
 local FirstPerson = V.require("FirstPerson")
 local ThirdPerson = V.require("ThirdPerson")
-local BattleCam = nil
+local BattleCam = V.require("BattleCam")
 
 local CamControl = {}
 
@@ -71,7 +71,10 @@ CamControl.SURVEY_PINCH = 2.2
 -- reasoning lives and which the RIG answers to as well -- so a stored
 -- angle from before the setting was switched on stands down with it).
 local function battleLive()
-  return false
+  local ok, shot = pcall(function()
+    return V.require("OverworldBattle").shot()
+  end)
+  return (ok and shot and BattleCam.steerable) and true or false
 end
 
 CamControl.battleLive = battleLive
