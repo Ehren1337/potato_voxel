@@ -53,15 +53,20 @@ function BrickProfile.renderScale(level)
 end
 
 -- Moving actors are the expensive, frequently changing half of the real
--- shadow-map path. HIGH always uses the full two-layer map, including the
--- animated actor layer, on desktop, Android, and the Brick. MEDIUM and lower
--- keep the existing contact/blob decal fallback for actors. The world layer
--- remains governed by the renderer's existing shadow gates.
+-- shadow-map path. HIGH uses the full two-layer map on desktop. Android's
+-- GLES canvas path can distort the actor layer's depth texture, so it uses
+-- the stable contact/blob decal fallback until that path is driver-safe.
 BrickProfile.DESKTOP_HIGH_LEVEL = 1
 BrickProfile.DESKTOP_MEDIUM_LEVEL = 2
 
+local function androidActorShadowMapUnsupported()
+  return love and love.system and love.system.getOS
+     and love.system.getOS() == "Android"
+end
+
 function BrickProfile.actorShadowMapEnabled(level)
   return level == BrickProfile.DESKTOP_HIGH_LEVEL
+     and not androidActorShadowMapUnsupported()
 end
 
 -- Active Brick rungs keep the cheap actor contact/blob fallback. The old
