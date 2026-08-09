@@ -103,8 +103,8 @@ local VR = V.require("VR")
 local Horde = V.require("Horde")
 local HordeGun = V.require("HordeGun")
 local HordeHud = V.require("HordeHud")
--- the realtime diagnostics panel (DEBUG row on the OPTIONS menu); see the
--- module for how it arms Perf and what it draws
+-- the realtime diagnostics panel; see the module for how it arms Perf and
+-- what it draws. The player-facing DEBUG option has been removed.
 local DebugHud = V.require("DebugHud")
 local CachePrebuild = V.require("CachePrebuild")
 local HordeSfx = V.require("HordeSfx")
@@ -874,12 +874,9 @@ mod.hooks:wrap("ui.options.rows", function(next, game, rows)
     OverworldBattle.forceOG(game)
     dropRow(out, "battleLayout")
   end
-  -- DEBUG is the one owned row that survives the Brick collapse: it is
-  -- instrumentation, not a quality knob, so the tuned profile can still
-  -- be watched on the device it was tuned for. Inserted ahead of the
-  -- Brick early-return below, and ahead of the SETTINGS loop so the row
-  -- never appears twice on the desktop.
-  insertGrouped(out, { DebugHud.setting:row(), {
+  -- PREBUILD is an action rather than a setting, so it is inserted separately
+  -- from the SETTINGS loop and remains available on the Brick.
+  insertGrouped(out, { {
     id = "potato_voxel:prebuild",
     label = CachePrebuild.isAndroid() and "PREBUILD / CANCEL"
             or "PREBUILD MAP CACHE",
@@ -958,8 +955,8 @@ mod.hooks:wrap("ui.options.rows", function(next, game, rows)
   return insertGrouped(out, extra)
 end)
 
--- The realtime diagnostics panel: the DEBUG row on, the mod owns a
--- screen-space overlay over the finished frame. render.hud fires once per
+-- The realtime diagnostics panel: when enabled by benchmark instrumentation,
+-- the mod owns a screen-space overlay over the finished frame. render.hud fires once per
 -- rendered frame after the composite (Game.lua), which is also exactly
 -- where Perf.frame() belongs -- so the hook does the frame stamping too,
 -- and the panel shows live frame stats and mesh-build spans. The whole
@@ -967,6 +964,7 @@ end)
 -- touching Perf's clock, and draw guards its own state).
 mod.hooks:wrap("render.hud", function(nextFn, game, viewport)
   nextFn(game, viewport)
+  DebugHud.disable(game)
   DebugHud.frameHook()
   DebugHud.draw(viewport)
 end)
