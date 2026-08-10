@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.3.3] - 2026-08-10
+
+### Added
+
+- Added optional optimized 3D battles to the Brick profile, following the VOXEL render-quality scale.
+- Reused the existing cached map terrain for staged battle scenes.
+
+### Fixed
+
+- Split battle terrain and Pokemon cards into separate shadow layers to prevent camera-dependent triangle artifacts.
+- Battle cards no longer receive their own sun-shadow depth test while continuing to cast shadows onto the arena.
+- Lower Brick battle tiers use contact shadows instead of the actor shadow map.
+
 ## [1.3.2] - 2026-08-10
 
 ### Added
@@ -48,6 +61,7 @@
 - Replaced animated NPC shadow silhouettes with fixed contact-shadow blobs so animation frames, mirroring, and jump lift cannot stretch or shimmer shadows.
 - Removed the DEBUG option from the in-game options menu.
 
+[1.3.3]: https://github.com/ShaneMcGovernIE/potato_voxel/releases/tag/v1.3.3
 [1.3.2]: https://github.com/ShaneMcGovernIE/potato_voxel/releases/tag/v1.3.2
 [1.3.1]: https://github.com/ShaneMcGovernIE/potato_voxel/releases/tag/v1.3.1
 [1.3.0]: https://github.com/ShaneMcGovernIE/potato_voxel/releases/tag/v1.3.0

@@ -52,6 +52,20 @@ function BrickProfile.renderScale(level)
   return BrickProfile.RENDER_SCALES[level] or 1
 end
 
+-- Battles can be enabled while VOXEL is OFF. Use the cheapest scene rung in
+-- that case; otherwise follow the player's selected quality level.
+function BrickProfile.battleRenderScale(level)
+  if not BrickProfile.isBrick() then return 1 end
+  level = math.floor(tonumber(level) or 0)
+  if level < 1 or level > 4 then level = 4 end
+  return BrickProfile.renderScale(level)
+end
+
+function BrickProfile.battleActorShadowMap(level)
+  if not BrickProfile.isBrick() then return true end
+  return level == 1
+end
+
 -- Moving actors are the expensive, frequently changing half of the real
 -- shadow-map path. HIGH always uses the full two-layer map, including the
 -- animated actor layer, on desktop, Android, and the Brick. MEDIUM and lower
@@ -158,8 +172,9 @@ function BrickProfile.apply(V)
   --                     single most expensive per-pixel pass in the mod
   --                     (FULL peaked near 40% of frame cost in forests);
   --                     the Brick's frame budget does not stretch to them.
-  --   3D-BTL     OFF  -- a staged battle was the single biggest mid-battle
-  --                     cost; flat card battles on the diorama floor.
+  --   3D-BTL     OFF by default -- staged battles are optional because they
+  --                     remain the biggest mid-battle cost; the row is still
+  --                     available when a player wants the full scene.
   --   AA         OFF  -- OFF was already the default; the 4X rung's 4x
   --                     canvases are not worth a handheld's fill rate or
   --                     RAM.
@@ -167,13 +182,13 @@ function BrickProfile.apply(V)
   --                     not need.
   pin(V, "Water", { "off" }, { "OFF" })
   pin(V, "ForestAtmos", { "off" }, { "OFF" })
-  pin(V, "OverworldBattle", { false }, { "OFF" })
+  pin(V, "OverworldBattle", { false, true }, { "OFF", "ON" })
   pin(V, "AntiAlias", { 0 }, { "OFF" })
   pin(V, "WorldCurve", { 0 }, { "OFF" })
   pin(V, "VoxelGrid", { false }, { "OFF" })
 
-  -- BACK SPRITES decides what a STAGED battle frames; with 3D-BTL pinned
-  -- off it decides nothing, so it is pinned off with it.
+  -- BACK SPRITES decides what a STAGED battle frames. It stays off on the
+  -- Brick: the optimized scene owns both cards and keeps one composition.
   OverworldBattle.backSetting.values = { false }
   OverworldBattle.backSetting.labels = { "OFF" }
   OverworldBattle.backSetting.index = nil

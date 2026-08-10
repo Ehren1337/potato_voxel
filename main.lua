@@ -876,7 +876,9 @@ local function voxelSettingsRows(game)
   local Pipelines = require("src.render.Pipelines")
   local rows = {}
   for _, row in ipairs(Pipelines.rows(game)) do rows[#rows + 1] = row end
-  if not BrickProfile.isBrick() then
+  if BrickProfile.isBrick() then
+    rows[#rows + 1] = OverworldBattle.setting:row()
+  else
     local full = Voxel.isFull(Pipelines.level("voxel"))
     if full then
       DayNight.forceSync(game)

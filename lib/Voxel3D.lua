@@ -156,6 +156,7 @@ local SHADER = [[
   uniform Image sunMap;
   uniform Image sunMap2;      // the CAST layer: sprites only (see ShadowMap)
   uniform float sunDark;      // how far into black a shadow goes; 0 = off
+  uniform float sunReceive;   // 0 = cast-only geometry, 1 = receive shadows
   uniform float sunBias;
   uniform vec2 sunTexel;
 
@@ -255,7 +256,8 @@ local SHADER = [[
     if (p.a < 0.5) discard;
     // the hour's tint multiplies like the sun terms do: it is LIGHT, the
     // same warm or moonlit cast on every surface, not a palette swap
-    vec3 rgb = p.rgb * vShade * sunlight(vSun) * dayTint;
+    float sun = mix(1.0, sunlight(vSun), sunReceive);
+    vec3 rgb = p.rgb * vShade * sun * dayTint;
 #ifdef VOXEL_GRID
     // darken what is there rather than painting a colour, so a seam across
     // dark grass and one across a white roof each stay in their own palette
@@ -326,6 +328,7 @@ local slots = {}
 local canvas, canvasW, canvasH = nil, 0, 0   -- the slot this pass bound
 local held = nil                             -- and the whole record for it
 local active = false
+local lastSunReceive = 1
 
 -- A READABLE depth canvas, so a later pass in the same frame can ask the
 -- buffer questions rather than only write to it -- which is the whole of
@@ -961,6 +964,8 @@ function Voxel3D.beginScene(w, h, cx, cy, vw, vh, sky, slot)
   local spriteTex = ShadowMap.texture(true)
   if spriteTex then pcall(sh.send, sh, "sunMap2", spriteTex) end
   pcall(sh.send, sh, "sunDark", map and Voxel3D.SHADOW_ALPHA or 0)
+  pcall(sh.send, sh, "sunReceive", 1)
+  lastSunReceive = 1
   pcall(sh.send, sh, "sunBias", ShadowMap.bias)
   local texel = 1 / ShadowMap.res
   pcall(sh.send, sh, "sunTexel", { texel, texel })
@@ -1389,7 +1394,7 @@ end
 -- upright transform or it reads its own shadow as falling on itself.
 local lastPull = nil
 
-function Voxel3D.draw(mesh, texture, model, pull, sunModel)
+function Voxel3D.draw(mesh, texture, model, pull, sunModel, receiveSun)
   if not (active and mesh) then return end
   -- the variant beginScene actually bound, not whichever one is default:
   -- sending a uniform to the other shader would go nowhere
@@ -1399,6 +1404,11 @@ function Voxel3D.draw(mesh, texture, model, pull, sunModel)
   -- LOVE defaults matrix uniforms to column-major; Mat4 is row-major
   pcall(sh.send, sh, "model", "row", model or IDENTITY)
   pcall(sh.send, sh, "sunModel", "row", sunModel or model or IDENTITY)
+  local receive = receiveSun == false and 0 or 1
+  if receive ~= lastSunReceive then
+    pcall(sh.send, sh, "sunReceive", receive)
+    lastSunReceive = receive
+  end
   local targetPull = pull or 0
   if targetPull ~= lastPull then
     pcall(sh.send, sh, "pull", targetPull)

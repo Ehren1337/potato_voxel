@@ -1152,7 +1152,7 @@ function VoxelScene.render(state, w, h, vw, vh, paletteFor, eyes)
       end
       for _, card in ipairs(cards) do
         Voxel3D.draw(BattleBillboard.mesh(), card.tex, card.model,
-                     BattleBillboard.PULL)
+                     BattleBillboard.PULL, nil, false)
       end
       -- and, on the STADIUM rungs, the models -- the same skinned meshes the
       -- flat pass and the sun already used this frame, drawn again through

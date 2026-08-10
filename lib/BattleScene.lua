@@ -35,14 +35,18 @@ local V = ...
 local Mat4 = V.require("Mat4")
 local Voxel3D = V.require("Voxel3D")
 local ShadowMap = V.require("ShadowMap")
+local SpriteBillboards = V.require("SpriteBillboards")
 local ChunkMesher = V.require("ChunkMesher")
 local TerrainAtlas = V.require("TerrainAtlas")
 local VoxelScene = V.require("VoxelScene")
 local BattleCam = V.require("BattleCam")
 local BattleBillboard = V.require("BattleBillboard")
 local VoxelGrid = V.require("VoxelGrid")
+local VoxelState = V.require("VoxelState")
 local DayNight = V.require("DayNight")
+local BrickProfile = V.require("BrickProfile")
 local AntiAlias = V.require("AntiAlias")
+local Upscale = V.require("Upscale")
 local PaletteFX = require("src.render.PaletteFX")
 local Map = require("src.world.Map")
 
@@ -96,6 +100,10 @@ function BattleScene.pixelSize()
     if pw and ph and pw > 0 and ph > 0 then return pw, ph end
   end
   return love.graphics.getDimensions()
+end
+
+function BattleScene.renderScale(level)
+  return BrickProfile.battleRenderScale(level)
 end
 
 -- Widen the rig's vertical field of view from the GB frame to the whole
@@ -319,66 +327,74 @@ end
 
 local function castShadows(state, arena, terrain, nbMesh, cx, cy, vw, vh,
                            atlasFor, cards, token, host, neighbors,
-                           water, nbWater, groundY)
+                           water, nbWater, groundY, actorShadows)
   if not ShadowMap.available() then return end
-  local sig = shadowSignature(state, arena, terrain, nbMesh, token)
-  if not ShadowMap.stale(sig) then return end
-  if not ShadowMap.begin(cx, cy, vw, vh) then return end
+  local worldSig = shadowSignature(state, arena, terrain, nbMesh)
+  local spriteSig = shadowSignature(state, arena, terrain, nbMesh, token)
+  local worldStale = ShadowMap.stale(worldSig, false)
+  local spriteStale = actorShadows and ShadowMap.stale(spriteSig, true) or false
+  if not worldStale and not spriteStale then return end
 
-  -- A DISC RUNG: the two discs are the only ground there is, so they are the
-  -- only thing the sun has to see besides the Pokemon themselves. Everything
-  -- below this is a map that is not in the shot.
-  if arena.discs then
-    pcall(function()
-      V.require("StadiumStage").cast(ShadowMap, arena, groundY or 0)
-    end)
-    pcall(function() V.require("Stadium").cast(ShadowMap) end)
-    ShadowMap.finish(sig)
-    return
+  if worldStale then
+    if not ShadowMap.begin(cx, cy, vw, vh, false) then return end
+    -- A DISC RUNG: the two discs are the only ground there is, so they are the
+    -- only thing the sun has to see besides the Pokemon themselves.
+    if arena.discs then
+      pcall(function()
+        V.require("StadiumStage").cast(ShadowMap, arena, groundY or 0)
+      end)
+      pcall(function() V.require("Stadium").cast(ShadowMap) end)
+    else
+      ShadowMap.draw(terrain, atlasFor(host), nil)
+      for i, nb in ipairs(neighbors) do
+        ShadowMap.draw(nbMesh[i], atlasFor(nb.map),
+                       Mat4.translate(nb.ox, 0, nb.oy))
+      end
+      -- Water is a separate surface pass, but still belongs in the world
+      -- shadow layer so lakes receive terrain and building shadows.
+      ShadowMap.draw(water, atlasFor(host), nil)
+      for i, nb in ipairs(neighbors) do
+        ShadowMap.draw(nbWater and nbWater[i], atlasFor(nb.map),
+                       Mat4.translate(nb.ox, 0, nb.oy))
+      end
+      ShadowMap.draw(ChunkMesher.flowers(host), atlasFor(host),
+                     ShadowMap.snug(nil))
+      for _, nb in ipairs(neighbors) do
+        ShadowMap.draw(ChunkMesher.flowers(nb.map), atlasFor(nb.map),
+                       ShadowMap.snug(Mat4.translate(nb.ox, 0, nb.oy)))
+      end
+      -- Stadium models are real geometry, not cut-out sprite cards.
+      pcall(function() V.require("Stadium").cast(ShadowMap) end)
+    end
+    ShadowMap.finish(worldSig, false)
   end
 
-  ShadowMap.draw(terrain, atlasFor(host), nil)
-  for i, nb in ipairs(neighbors) do
-    ShadowMap.draw(nbMesh[i], atlasFor(nb.map), Mat4.translate(nb.ox, 0, nb.oy))
+  if actorShadows and (worldStale or spriteStale) then
+    if not ShadowMap.begin(cx, cy, vw, vh, true) then return end
+    -- Battle cards belong in the actor layer, never in the terrain layer.
+    -- This prevents a card from self-shadowing its own two triangles.
+    ShadowMap.sprites(true)
+    for _, card in ipairs(cards or {}) do
+      ShadowMap.draw(BattleBillboard.mesh(), card.tex,
+                     ShadowMap.snug(card.model))
+    end
+    ShadowMap.sprites(false)
+    ShadowMap.finish(spriteSig, true)
   end
-  -- the water surface is its own reflective pass now (see Water) and so is
-  -- no longer inside the terrain mesh; the sun still has to see it, or the
-  -- light's map has a hole at every lake
-  ShadowMap.draw(water, atlasFor(host), nil)
-  for i, nb in ipairs(neighbors) do
-    ShadowMap.draw(nbWater and nbWater[i], atlasFor(nb.map),
-                   Mat4.translate(nb.ox, 0, nb.oy))
-  end
-  -- thin cards are snugged toward the sun (ShadowMap.snug) so their shadows
-  -- keep contact with their bases instead of starting a bias-width away
-  ShadowMap.draw(ChunkMesher.flowers(host), atlasFor(host),
-                 ShadowMap.snug(nil))
-  for _, nb in ipairs(neighbors) do
-    ShadowMap.draw(ChunkMesher.flowers(nb.map), atlasFor(nb.map),
-                   ShadowMap.snug(Mat4.translate(nb.ox, 0, nb.oy)))
-  end
+end
 
-  -- the mons themselves, as the same cards the camera will see. Their alpha
-  -- is the silhouette, so what lands on the ground is the shape of the
-  -- Pokemon rather than a blob standing in for one.
-  -- marked as the CAST, so a fight staged at the water's edge does not lay a
-  -- cut-out of a Pokemon across the lake (see ShadowMap.sprites); the arena's
-  -- own floor still takes them, which is the shadow that matters here
-  ShadowMap.sprites(true)
-  for _, card in ipairs(cards or {}) do
-    ShadowMap.draw(BattleBillboard.mesh(), card.tex,
-                   ShadowMap.snug(card.model))
+local function drawContactShadows(arena, groundY)
+  local mesh, texture = SpriteBillboards.shadowBlob()
+  if not mesh then return end
+  Voxel3D.beginShadows()
+  for _, cell in ipairs({ arena.player, arena.enemy }) do
+    if cell then
+      Voxel3D.draw(mesh, texture,
+                   Voxel3D.shadowBlobMatrix(cell[1], cell[2], groundY),
+                   Voxel3D.SHADOW_PULL)
+    end
   end
-  ShadowMap.sprites(false)
-  -- and the STADIUM models, when that rung is the one running. NOT marked
-  -- as sprites: that flag exists so a flat card's cut-out is kept off the
-  -- water (see ShadowMap.sprites), and these are real geometry standing in
-  -- the world -- a Gyarados at the water's edge should put a Gyarados on
-  -- the water. Un-snugged for the same reason: snug is a bias for a card
-  -- rooted to the ground plane, and a model has thickness of its own.
-  pcall(function() V.require("Stadium").cast(ShadowMap) end)
-
-  ShadowMap.finish(sig)
+  Voxel3D.endShadows()
 end
 
 -- The height of the arena floor: the ground the two mons stand on. Both
@@ -540,8 +556,11 @@ function BattleScene.render(state, arena, textures, token)
   Voxel3D.viewProjection(cx, cy, vw, vh)
   local cards = monCards(arena, groundY, textures)
   Voxel3D.camera = nil
+  local actorShadows = BrickProfile.battleActorShadowMap(VoxelState.level)
+  ShadowMap.setSpriteLayerActive(actorShadows)
   castShadows(state, arena, terrain, nbMesh, cx, cy, vw, vh, atlasFor,
-              cards, token, host, neighbors, water, nbWater, groundY)
+              cards, token, host, neighbors, water, nbWater, groundY,
+              actorShadows)
 
   -- An opaque void either way. Outdoors the camera is low enough that the
   -- horizon is genuinely in frame, so it is sky; indoors it is the dark end
@@ -590,7 +609,10 @@ function BattleScene.render(state, arena, textures, token)
     -- of the identical shot -- which is why the pins below still measure in
     -- pw and ph, and why the HUDs and the depth of field, drawn onto the
     -- folded canvas afterwards, stay the chunky GB art they are.
-    local rw, rh = AntiAlias.expand(pw, ph)
+    local renderScale = BattleScene.renderScale(VoxelState.level)
+    local sceneW = math.max(1, math.floor(pw * renderScale + 0.5))
+    local sceneH = math.max(1, math.floor(ph * renderScale + 0.5))
+    local rw, rh = AntiAlias.expand(sceneW, sceneH)
     if not Voxel3D.beginScene(rw, rh, cx, cy, vw, vh, sky, "battle") then
       return
     end
@@ -623,6 +645,9 @@ function BattleScene.render(state, arena, textures, token)
       end
     end
     end
+    if not discs and not actorShadows then
+      drawContactShadows(arena, groundY)
+    end
     -- The mons, standing on their tiles. Depth-tested like everything else,
     -- so a ledge or a tree between the camera and a Pokemon really is in
     -- front of it, and the alpha discard cuts the sprite's own outline out of
@@ -649,7 +674,7 @@ function BattleScene.render(state, arena, textures, token)
       -- the sun stored this card snugged (castShadows), so its own shadow
       -- lookup must read the same snugged transform -- see ShadowMap.snug
       Voxel3D.draw(BattleBillboard.mesh(), card.tex, card.model,
-                   BattleBillboard.PULL, ShadowMap.snug(card.model))
+                   BattleBillboard.PULL, ShadowMap.snug(card.model), false)
     end
     Voxel3D.glass(true)
     Voxel3D.seams(true)
@@ -683,7 +708,10 @@ function BattleScene.render(state, arena, textures, token)
                      ShadowMap.snug(Mat4.translate(nb.ox, 0, nb.oy)))
       end
     end
-    local canvas = AntiAlias.resolve(Voxel3D.endScene(), pw, ph, "battle")
+    local canvas = AntiAlias.resolve(Voxel3D.endScene(), sceneW, sceneH, "battle")
+    if renderScale < 1 then
+      canvas = Upscale.apply(canvas, pw, ph, "battle")
+    end
     if not canvas then return end
 
     local vp = Voxel3D.vp

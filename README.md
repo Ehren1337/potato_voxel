@@ -27,7 +27,7 @@ The **VOXEL** option is a simple ladder:
 - **LOW** — 50% render scale with cheaper actor shadows.
 - **POTATO** — 33% render scale with the lowest GPU workload.
 
-The potato profile is enabled by default on every device. This keeps the first experience consistent and avoids requiring players to tune several independent graphics settings. On that profile, **3D-BTL** appears directly after VOXEL as a simple **OFF / ON** switch; legacy staged and Stadium selections remain compatible internally when ON.
+The potato profile is enabled by default on every device. This keeps the first experience consistent and avoids requiring players to tune several independent graphics settings. On that profile, **3D-BTL** appears directly after VOXEL as an **OFF / ON** switch. It defaults OFF, follows the VOXEL quality scale when enabled, and keeps the map mesh cache; legacy staged and Stadium selections remain compatible internally when ON.
 
 ## Desktop compatibility
 
@@ -86,6 +86,9 @@ python3 tools/modkit.py pack mods/potato_voxel
 - **CACHE STATUS** shows the active geometry-cache version. **WIPE CACHE**
   removes the precalculated terrain files and clears the completion marker;
   the next voxel visit rebuilds maps on demand.
+- **3D-BTL** reuses the same cached map terrain as the overworld. The battle
+  cards and effects stay dynamic because they follow the live battle state;
+  only the static map geometry belongs in the disk cache.
 
 ## Credits
 
