@@ -27,7 +27,7 @@ The **VOXEL** option is a simple ladder:
 - **LOW** — 50% render scale with cheaper actor shadows.
 - **POTATO** — 33% render scale with the lowest GPU workload.
 
-The potato profile is enabled by default on every device. This keeps the first experience consistent and avoids requiring players to tune several independent graphics settings.
+The potato profile is enabled by default on every device. This keeps the first experience consistent and avoids requiring players to tune several independent graphics settings. On that profile, **3D-BTL** appears directly after VOXEL as a simple **OFF / ON** switch; legacy staged and Stadium selections remain compatible internally when ON.
 
 ## Desktop compatibility
 
@@ -75,13 +75,17 @@ python3 tools/modkit.py pack mods/potato_voxel
   rebuild. `MeshCache.GEOMETRY_VERSION` must be bumped whenever geometry
   output changes — the cache fingerprint does not cover every geometry
   knob.
-- **OPTIONS → PREBUILD MAP CACHE** cooperatively builds every map's body and
-  full terrain variant, including water and auxiliary meshes. The row shows
-  map/job progress; press A again to cancel. On Android it uses a compact
-  `BUILD n/total ETA Ns` readout and changes to **CANCEL PREBUILD** while the
-  job is active, so the touch-friendly options action stays obvious. Runtime
-  GPU meshes are released after each map while the disk cache remains. The
-  action is available on both desktop and the potato profile.
+- **OPTIONS → PREBUILD CACHE** cooperatively builds every map's body and full
+  terrain variant, including water and auxiliary meshes. The game checks the
+  complete cache at boot and shows **READY** when every current job is present.
+  When the cache is incomplete, selecting **CONTINUE** or **NEW GAME** offers
+  to build it first; choosing NO starts normally. The progress screen can be
+  cancelled, and runtime GPU meshes are released after each map while the disk
+  cache remains. The action is available on both desktop and the potato
+  profile.
+- **CACHE STATUS** shows the active geometry-cache version. **WIPE CACHE**
+  removes the precalculated terrain files and clears the completion marker;
+  the next voxel visit rebuilds maps on demand.
 
 ## Credits
 

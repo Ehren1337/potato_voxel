@@ -107,6 +107,7 @@ local HordeHud = V.require("HordeHud")
 -- what it draws. The player-facing DEBUG option has been removed.
 local DebugHud = V.require("DebugHud")
 local CachePrebuild = V.require("CachePrebuild")
+local MeshCache = V.require("MeshCache")
 local HordeSfx = V.require("HordeSfx")
 
 -- The low-end runtime tuner (lib/BrickProfile.lua): the TrimUI Brick
@@ -848,51 +849,62 @@ local function pinEngineFx(game)
   if changed and game.writeOptions then pcall(game.writeOptions, game) end
 end
 
--- call next() first and decorate what comes back, so every other mod's
--- rows survive this one
-mod.hooks:wrap("ui.options.rows", function(next, game, rows)
-  local out = next(game, rows)
-  if type(out) ~= "table" then return out end
-  local Pipelines = require("src.render.Pipelines")
-  -- ahead of every branch below, including FULL's early return: these two are
-  -- off the menu whatever else this mod is or is not doing
-  pinEngineFx(game)
-  dropRow(out, "tilt")
-  dropRow(out, "gbcfx")
-  -- and BATTLE BG with them: this mode fills the window with the map, so
-  -- the row's whole question -- what to put in the voids around the battle
-  -- -- no longer has voids to be about (see pinEngineFx)
-  dropRow(out, "battleBg")
-  -- BATTLE LAYOUT is the ENGINE's row, and this is the one place the mod takes
-  -- one away. While a fight can be staged on the map, OG is the only layout it
-  -- can be composed in (OverworldBattle.forceOG), so the value is pinned there
-  -- and the row comes off the list on the same reasoning as the rows FULL owns:
-  -- a row that no longer decides anything is worse than no row. Nothing is
-  -- lost by switching 3D-BTL off -- the row is back, WIDE and all, on the same
-  -- keypress.
-  if stagedBattles() then
-    OverworldBattle.forceOG(game)
-    dropRow(out, "battleLayout")
+-- Build the complete PotatoVoxel-owned row set for the dedicated submenu.
+local function showCacheStatus(game)
+  local TextBox = require("src.render.TextBox")
+  game.stack:push(TextBox.new(game,
+    ("CACHE %s\nGEOMETRY %d"):format(CachePrebuild.status(),
+                                      MeshCache.GEOMETRY_VERSION)))
+end
+
+local function confirmCacheWipe(game)
+  local _, _, running = CachePrebuild.progress()
+  local TextBox = require("src.render.TextBox")
+  if running then
+    game.stack:push(TextBox.new(game, "CANCEL BUILD\nBEFORE WIPING."))
+    return
   end
-  -- PREBUILD is an action rather than a setting, so it is inserted separately
-  -- from the SETTINGS loop and remains available on the Brick.
-  insertGrouped(out, { {
+  game.stack:push(TextBox.new(game, "WIPE CACHE?", nil, {
+    defaultNo = true,
+    choice = function(yes)
+      if yes then CachePrebuild.wipe(game) end
+    end,
+  }))
+end
+
+local function voxelSettingsRows(game)
+  local Pipelines = require("src.render.Pipelines")
+  local rows = {}
+  for _, row in ipairs(Pipelines.rows(game)) do rows[#rows + 1] = row end
+  if not BrickProfile.isBrick() then
+    local full = Voxel.isFull(Pipelines.level("voxel"))
+    if full then
+      DayNight.forceSync(game)
+      for i = #rows, 1, -1 do
+        if rows[i].id == "pipeline:tiltshift" then table.remove(rows, i) end
+      end
+    end
+    for _, entry in ipairs(SETTINGS) do
+      if (entry.full or not full) and (not entry.when or entry.when()) then
+        rows[#rows + 1] = entry[1]:row()
+      end
+    end
+    local okPick, importRow = pcall(function()
+      return V.require("StadiumRomPick").row()
+    end)
+    if okPick and importRow then rows[#rows + 1] = importRow end
+  end
+  rows[#rows + 1] = {
     id = "potato_voxel:prebuild",
-    label = CachePrebuild.isAndroid() and "PREBUILD / CANCEL"
-            or "PREBUILD MAP CACHE",
+    label = "PREBUILD CACHE",
     value = function() return CachePrebuild.status() end,
     activate = function(g)
       local status = CachePrebuild.status()
       local _, _, running = CachePrebuild.progress()
       local decision = CachePrebuild.activationDecision(status, running)
-      if decision == "cancel" then
-        CachePrebuild.cancel()
-      elseif decision == "start" then
-        CachePrebuild.start(g)
+      if decision == "cancel" then CachePrebuild.cancel()
+      elseif decision == "start" then CachePrebuild.start(g)
       elseif decision == "confirm_rebuild" then
-        -- A completed cache may be stale, so do not silently rebuild it on an
-        -- A press. Use the engine's normal text-plus-ChoiceBox confirmation
-        -- flow, with NO selected by default; only YES starts a fresh build.
         local TextBox = require("src.render.TextBox")
         local ChoiceBox = require("src.ui.ChoiceBox")
         g.stack:push(TextBox.new(g, "REBUILD CACHE?", function()
@@ -902,57 +914,96 @@ mod.hooks:wrap("ui.options.rows", function(next, game, rows)
         end))
       end
     end,
-  } })
-  -- Brick: the OPTIONS page shows exactly one row for this mod -- the
-  -- engine's own VOXEL OFF/HIGH/MEDIUM/LOW quality ladder -- so every
-  -- owned row and the ROM import stay off the list. The knobs they would
-  -- have cycled are pinned by BrickProfile and cannot be moved, 3D-BTL is
-  -- off so BATTLE LAYOUT's row is already back (a flat battle never pins
-  -- it), and the tilt-shift row does not exist because its pipeline was
-  -- never registered.
-  if BrickProfile.isBrick() then
-    return out
+  }
+  rows[#rows + 1] = {
+    id = "potato_voxel:cache_status",
+    label = "CACHE STATUS",
+    value = function()
+      return ("GEO %d"):format(MeshCache.GEOMETRY_VERSION)
+    end,
+    activate = showCacheStatus,
+  }
+  rows[#rows + 1] = {
+    id = "potato_voxel:wipe_cache",
+    label = "WIPE CACHE",
+    value = function() return "DELETE" end,
+    activate = confirmCacheWipe,
+  }
+  return rows
+end
+
+-- Keep engine OPTIONS focused: one launcher replaces every PotatoVoxel row.
+mod.hooks:wrap("ui.options.rows", function(next, game, rows)
+  local out = next(game, rows)
+  if type(out) ~= "table" then return out end
+  pinEngineFx(game)
+  dropRow(out, "tilt")
+  dropRow(out, "gbcfx")
+  dropRow(out, "battleBg")
+  if stagedBattles() then
+    OverworldBattle.forceOG(game)
+    dropRow(out, "battleLayout")
   end
-  local full = Voxel.isFull(Pipelines.level("voxel"))
-  if full then
-    -- FULL owns the rows that PARAMETERISE the diorama -- the wireframe, the
-    -- horizon bend, the blur, the hour -- so those come off the menu and
-    -- DAYTIME is held at SYNC while its row is unreachable.
-    DayNight.forceSync(game)
-    dropRow(out, "pipeline:tiltshift")
+  for i = #out, 1, -1 do
+    local id = type(out[i]) == "table" and out[i].id or ""
+    id = id or ""
+    if id == "pipeline:voxel" or id == "pipeline:tiltshift"
+       or id:find("^potato_voxel:") then table.remove(out, i) end
   end
-  local extra = {}
-  for _, entry in ipairs(SETTINGS) do
-    -- Two things decide whether a row is offered.
-    --
-    -- FULL: a preset that owns the look, so the rows that describe the look go
-    -- with it. The BATTLE rows are not that -- 3D-BTL decides what a fight is
-    -- drawn OVER and BACK SPRITES how it is framed, and neither is a knob on
-    -- the diorama FULL is a preset for. FULL still SETS them on arrival (see
-    -- applyFull); it does not hold them, so leaving them on the menu is the
-    -- difference between a preset and a lock.
-    --
-    -- And a row whose own switch is off the table this frame (BACK SPRITES,
-    -- which needs a staged fight to be about) is left off with it. The mod
-    -- manager's page carries every one of them either way.
-    local offered = (entry.full or not full)
-                    and (not entry.when or entry.when())
-    if offered then extra[#extra + 1] = entry[1]:row() end
+  out[#out + 1] = {
+    id = "potato_voxel:settings", label = "VOXEL SETTINGS",
+    value = function() return "OPEN" end,
+    activate = function(g)
+      require("src.ui.Screens").push(g, "PotatoVoxelSettings")
+    end,
+  }
+  return out
+end)
+
+mod.content.screens:register("PotatoVoxelSettings", {
+  new = function(game)
+    return V.require("VoxelSettingsMenu").new(game, voxelSettingsRows)
+  end,
+})
+
+local function startTitleAction(game, action)
+  if CachePrebuild.isReady() or not CachePrebuild.available() then
+    action()
+    return
   end
-  -- and the ROM import, which is an ACTION and not a setting: there is no
-  -- rung to store, nothing for the mod manager's page to persist and nothing
-  -- to restore on the next boot, so it is appended here rather than living in
-  -- SETTINGS. nil on a platform with no file dialog, which takes it off the
-  -- menu rather than offering a button that cannot do anything.
-  -- On EVERY platform. Where there is no file dialog it says WHERE? and
-  -- shows the folder to put the cartridge in, which is the one thing a
-  -- player on a phone could not otherwise find out -- the row used to vanish
-  -- there, which reads as the feature being missing rather than manual.
-  local okPick, importRow = pcall(function()
-    return V.require("StadiumRomPick").row()
-  end)
-  if okPick and importRow then extra[#extra + 1] = importRow end
-  return insertGrouped(out, extra)
+  local TextBox = require("src.render.TextBox")
+  game.stack:push(TextBox.new(game, "MAP CACHE\nNOT READY.\fBUILD NOW?", nil, {
+    defaultNo = true,
+    choice = function(yes)
+      if not yes then
+        action()
+        return
+      end
+      if not CachePrebuild.start(game) then
+        action()
+        return
+      end
+      local Progress = V.require("CachePrebuildScreen")
+      game.stack:push(Progress.new(game, action, function()
+        local title = game.stack:top()
+        if title and title.openMenu then title:openMenu() end
+      end))
+    end,
+  }))
+end
+
+mod.hooks:wrap("ui.title_menu.items", function(next, game, items)
+  local out = next(game, items)
+  if type(out) ~= "table" then return out end
+  local Strings = require("src.core.Strings")
+  local labels = { [Strings("CONTINUE")] = true, [Strings("NEW GAME")] = true }
+  for _, item in ipairs(out) do
+    if type(item) == "table" and labels[item.label] and item.onSelect then
+      local action = item.onSelect
+      item.onSelect = function() startTitleAction(game, action) end
+    end
+  end
+  return out
 end)
 
 -- The realtime diagnostics panel: when enabled by benchmark instrumentation,
@@ -1284,6 +1335,10 @@ DayTint.install()
 -- the bytes hit disk -- and read back whenever a save is opened or begun. A
 -- save with no clock in it starts at day; that is DayNight.restore's
 -- fallback, and also the DAYTIME row's own default.
+mod.events:on("game.ready", function(payload)
+  if payload and payload.game then CachePrebuild.bootstrap(payload.game) end
+end)
+
 mod.events:on("save.writing", function()
   DayNight.store()
 end)

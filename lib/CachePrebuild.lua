@@ -5,6 +5,7 @@ local V = ...
 local Prebuild = {}
 
 local ChunkMesher = V.require("ChunkMesher")
+local MeshCache = V.require("MeshCache")
 
 -- Use the engine's own placement routine so prebuilt FULL masks cover the same
 -- connected strips (including two-hop neighbours) as the live renderer.
@@ -12,7 +13,8 @@ local OverworldState = require("src.world.OverworldController")
 
 local state = { running = false, cancelled = false, maps = {}, index = 0,
                 slot = nil, done = 0, total = 0, game = nil,
-                startedAt = nil, eta = nil }
+                startedAt = nil, eta = nil, ready = false,
+                failed = false, error = nil, completed = {} }
 
 local function sortedIds(maps)
   local ids = {}
@@ -61,6 +63,22 @@ Prebuild.enumerate = function(maps)
 end
 Prebuild.masksFor = masksFor
 
+function Prebuild.available()
+  return MeshCache.available()
+end
+
+function Prebuild.bootstrap(game)
+  local data = game and game.data
+  MeshCache.configure(data)
+  local jobs = Prebuild.enumerate(data and data.maps)
+  local ready, done = MeshCache.ready(jobs)
+  state = { running = false, cancelled = false, maps = jobs, index = 0,
+            slot = nil, done = ready and #jobs or done, total = #jobs,
+            game = nil, startedAt = nil, eta = nil, ready = ready,
+            failed = false, error = nil, completed = {} }
+  return ready
+end
+
 -- Never tear down an instance the overworld can still draw.  The options
 -- action may outlive the menu that started it (and the player can move while
 -- it runs), so the live set has to be checked at the moment a job completes,
@@ -89,6 +107,13 @@ end
 local function finish(cancelled)
   if state.index > 0 and state.maps[state.index] then
     releaseMap(state.maps[state.index].id, state.game)
+  end
+  if not cancelled and not state.failed and state.done >= state.total then
+    state.ready = MeshCache.writeManifest(state.completed, state.total)
+    if not state.ready then
+      state.failed = true
+      state.error = "manifest write failed"
+    end
   end
   state.running, state.cancelled = false, cancelled or false
   state.slot = nil
@@ -121,16 +146,31 @@ function Prebuild.start(game)
   end
   local data = game and game.data
   local jobs = Prebuild.enumerate(data and data.maps)
-  if #jobs == 0 then return false end
+  if #jobs == 0 or not MeshCache.available() then return false end
+  MeshCache.begin()
   state = { running = true, cancelled = false, maps = jobs, index = 1,
             slot = nil, done = 0, total = #jobs, game = game,
-            startedAt = now(), eta = nil }
+            startedAt = now(), eta = nil, ready = false,
+            failed = false, error = nil, completed = {} }
   return true
 end
 
 function Prebuild.cancel()
   if state.running then state.cancelled = true; return true end
   return false
+end
+
+function Prebuild.wipe(game)
+  if state.running then return false end
+  local data = game and game.data
+  local jobs = Prebuild.enumerate(data and data.maps)
+  local ok = MeshCache.wipe(jobs)
+  if ok then
+    ChunkMesher.invalidate()
+    state.ready, state.cancelled, state.failed = false, false, false
+    state.done, state.total, state.error = 0, #jobs, nil
+  end
+  return ok
 end
 
 -- Keep the options-row decision separate from the UI so the READY path can be
@@ -151,44 +191,52 @@ function Prebuild.update()
     local MapLoader = require("src.world.MapLoader")
     local map = MapLoader.load(state.game.data, job.id)
     state.slot = map
-    ChunkMesher.request(map, job.slot == "body", job.masks, false)
+    ChunkMesher.request(map, job.slot == "body", job.masks, false, true)
   end
   -- Prebuild runs alongside normal gameplay; use the ordinary cooperative
   -- slice rather than the 30ms covered/menu budget.
   ChunkMesher.pump(false)
-  if not (ChunkMesher.jobPending and ChunkMesher.jobPending(job.id,
-                                                        job.slot == "body")) then
-    releaseMap(job.id, state.game)
-    state.done = state.done + 1
-    state.index = state.index + 1
-    state.slot = nil
-    local elapsed = state.startedAt and now()
-    if elapsed and state.startedAt and state.done > 0 then
-      state.eta = (elapsed - state.startedAt) * (state.total - state.done) / state.done
-    end
+  local bodyOnly = job.slot == "body"
+  local jobStatus = ChunkMesher.jobStatus(job.id, bodyOnly)
+  if jobStatus == "pending" then return end
+  if jobStatus ~= "complete" or not MeshCache.verifyJob(state.slot, job.slot) then
+    state.failed = true
+    state.error = jobStatus or "cache verification failed"
+    finish(false)
+    return
   end
+  state.completed[tostring(job.id) .. "/" .. tostring(job.slot)] =
+    MeshCache.jobRecord(state.slot, job.slot)
+  releaseMap(job.id, state.game)
+  state.done = state.done + 1
+  state.index = state.index + 1
+  state.slot = nil
+  local elapsed = state.startedAt and now()
+  if elapsed and state.startedAt and state.done > 0 then
+    state.eta = (elapsed - state.startedAt) * (state.total - state.done) / state.done
+  end
+  if state.done >= state.total then finish(false) end
 end
 
 function Prebuild.status()
   if state.running then
-    local current = state.maps[state.index]
-    if android() then
-      local eta = state.eta and (state.eta < 1 and "<1s"
-                                 or ("%ds"):format(math.ceil(state.eta))) or "--"
-      -- The Android options box is fixed at 160x144; keep the value short
-      -- enough that the progress and ETA remain visible beside the row label.
-      return ("B%d/%d E%s"):format(state.done, state.total, eta)
-    end
-    return ("BUILDING %d/%d %s %s"):format(state.done, state.total,
-      current and tostring(current.id) or "", current and current.slot or "")
+    return (android() and "B" or "BUILD ") .. ("%d/%d"):format(
+      state.done, state.total)
   end
+  if state.ready and MeshCache.isDirty() then state.ready = false end
+  if not Prebuild.available() then return "UNAVAILABLE" end
+  if state.failed then return "FAILED" end
+  if state.ready then return "READY" end
   if state.cancelled then return "CANCELLED" end
-  if state.total > 0 and state.done >= state.total then return "READY" end
   return "PREBUILD"
 end
 
 function Prebuild.progress()
   return state.done, state.total, state.running, state.eta
+end
+
+function Prebuild.isReady()
+  return state.ready and not MeshCache.isDirty()
 end
 
 return Prebuild

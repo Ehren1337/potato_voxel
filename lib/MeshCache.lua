@@ -51,7 +51,16 @@ do
   if ok then SaveData = mod end
 end
 
+local GameVersion = nil
+do
+  local ok, mod = pcall(require, "src.core.GameVersion")
+  if ok then GameVersion = mod end
+end
+
 local MeshCache = {}
+local dataKey = "unconfigured"
+local dirty = false
+local MANIFEST = "cache.info"
 
 -- Bump when the meshing algorithm changes the vertex/UV output, so a
 -- cache written by an older build is never trusted by a newer one. (The
@@ -100,7 +109,101 @@ local MeshCache = {}
 -- 33% duplicated corners brick.11 removed from terrain/water. Their
 -- payloads now carry the u32 vertex map section like the terrain ones,
 -- so every aux file written before this bump must be discarded.
-MeshCache.GEOMETRY_VERSION = 13
+-- 13: Method 3 adds dedicated octagonal stump geometry and changes the
+-- billboard hull's cut-face projection; every existing stump mesh is stale.
+-- 14: the OVERWORLD CUT bush now emits a dedicated 16-quad low-poly model
+-- from the pinned prop path; cached auxiliary/object geometry must rebuild.
+-- 16: CUT uses sprite stacking with region-relative atlas/state indexing and
+-- isolates adjacent same-class props; all derived meshes must be regenerated.
+-- 17: cache headers include the active ROM/data identity, so a Red/Blue/
+-- Yellow switch or a changed map dataset can never reuse old geometry.
+MeshCache.GEOMETRY_VERSION = 17
+
+-- A small deterministic revision for the inputs that can change terrain
+-- output without changing the mesher. It is intentionally not a checksum:
+-- it only separates cache generations, while the file headers still validate
+-- the actual payloads.
+local function hashString(hash, value)
+  value = tostring(value or "")
+  for i = 1, #value do
+    hash = (hash * 31 + value:byte(i)) % 2147483647
+  end
+  return hash
+end
+
+local function sortedKeys(table_)
+  local keys = {}
+  for key in pairs(table_ or {}) do keys[#keys + 1] = key end
+  table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+  return keys
+end
+
+local function hashValues(hash, values)
+  for i, value in ipairs(values or {}) do
+    hash = hashString(hash, i)
+    if type(value) == "table" then
+      hash = hashValues(hash, value)
+    else
+      hash = hashString(hash, value)
+    end
+  end
+  return hash
+end
+
+local function datasetRevision(data)
+  local hash = 17
+  local maps = data and data.maps or {}
+  for _, id in ipairs(sortedKeys(maps)) do
+    local def = maps[id]
+    hash = hashString(hash, id)
+    hash = hashString(hash, def.width)
+    hash = hashString(hash, def.height)
+    hash = hashString(hash, def.tileset)
+    hash = hashString(hash, def.borderBlock)
+    hash = hashValues(hash, def.blocks)
+    local connections = def.connections or {}
+    for _, direction in ipairs(sortedKeys(connections)) do
+      local connection = connections[direction]
+      hash = hashString(hash, direction)
+      hash = hashString(hash, connection.map)
+      hash = hashString(hash, connection.offset)
+    end
+  end
+  local tilesets = data and data.tilesets or {}
+  for _, id in ipairs(sortedKeys(tilesets)) do
+    local tileset = tilesets[id]
+    hash = hashString(hash, id)
+    hash = hashString(hash, tileset.image)
+    hash = hashString(hash, tileset.trueColor)
+    hash = hashString(hash, tileset.tilesPerRow)
+    hash = hashValues(hash, tileset.blocks)
+  end
+  return tostring(hash)
+end
+
+local function activeVersion()
+  if GameVersion and GameVersion.get then return GameVersion.get() end
+  return "red"
+end
+
+local function identity()
+  local okTR, TileRenderer = pcall(require, "src.render.TileRenderer")
+  local voidFill = (okTR and TileRenderer and TileRenderer.voidFill) or "trees"
+  local profile = Brick.isBrick() and "b" or "f"
+  return table.concat({ "PVMC1", MeshCache.GEOMETRY_VERSION, activeVersion(),
+                        profile, dataKey, tostring(voidFill) }, "|")
+end
+
+function MeshCache.configure(data)
+  dataKey = datasetRevision(data)
+  dirty = false
+end
+
+function MeshCache.isDirty()
+  return dirty
+end
+
+MeshCache.identity = identity
 
 -- ---------------------------------------------------------- availability
 
@@ -179,6 +282,17 @@ local function writeFile(path, data)
   return true
 end
 
+local function manifestPath()
+  local dir = MeshCache.dir()
+  return dir and dir .. "/" .. MANIFEST or nil
+end
+
+function MeshCache.begin()
+  dirty = true
+  local path = manifestPath()
+  if path then os.remove(path) end
+end
+
 -- ------------------------------------------------------------- fingerprint
 
 -- The exact string of everything a map's geometry depends on. Stored in
@@ -189,24 +303,17 @@ local function fingerprint(map, slot)
   local tileset = (map.tileset and map.tileset.image) or "?"
   local trueColor = (map.tileset and map.tileset.trueColor) and "1" or "0"
   local atlas = (map.renderer and map.renderer.gbcAtlas) and "g" or "s"
-  local profile = Brick.isBrick() and "b" or "f"
-  -- The void-fill mode picks the border ring's block, and the ring is
-  -- BAKED INTO THE MESH -- so a void-fill change must invalidate the
-  -- cache just like a mesher rewrite does. It lives in the fingerprint
-  -- rather than as a disk wipe: the engine changes the setting from
-  -- several places, none of them announcing it, and the fingerprint
-  -- makes any change a silent miss instead of a full-cache deletion.
-  local okTR, TileRenderer = pcall(require, "src.render.TileRenderer")
-  local voidFill = (okTR and TileRenderer and TileRenderer.voidFill) or "trees"
-  return MeshCache.GEOMETRY_VERSION .. "|" .. profile .. "|" .. tostring(map.id) .. "|"
-         .. tostring(slot) .. "|" .. tileset .. "|" .. trueColor .. "|" .. atlas
-         .. "|" .. tostring(voidFill)
+  return identity() .. "|" .. tostring(map.id) .. "|" .. tostring(slot) .. "|"
+         .. tileset .. "|" .. trueColor .. "|" .. atlas
+end
+
+local function fileName(map, slot, kind)
+  return tostring(map.id):gsub("[^%w_]", "_") .. "." .. tostring(slot)
+         .. "." .. kind
 end
 
 local function fileFor(map, slot, kind)
-  local name = tostring(map.id):gsub("[^%w_]", "_") .. "." .. tostring(slot)
-               .. "." .. kind
-  return MeshCache.dir() .. "/" .. name
+  return MeshCache.dir() .. "/" .. fileName(map, slot, kind)
 end
 
 -- ------------------------------------------------------------- encoding
@@ -380,6 +487,170 @@ local function decodeFigures(s)
   return list
 end
 
+local function payloadFingerprint(path, fp, kind, prefix)
+  local s = readFile(path)
+  if not s then return nil end
+  local got, off = parseHeader(s)
+  if not got then return nil end
+  if prefix then
+    if got:sub(1, #fp) ~= fp then return nil end
+  elseif got ~= fp then
+    return nil
+  end
+  local body = s:sub(off)
+  if kind ~= "aux" then
+    return decodeIndexed(body) and got or nil
+  end
+  local grass = decodeIndexed(body)
+  if not grass then return nil end
+  local flowerPos = 4 + grass.n * 24 + 4 + grass.m * 4
+  local flowers = decodeIndexed(body:sub(1 + flowerPos))
+  if not flowers then return nil end
+  local figurePos = flowerPos + 4 + flowers.n * 24 + 4 + flowers.m * 4
+  return decodeFigures(body:sub(1 + figurePos)) and got or nil
+end
+
+local function validPayload(path, fp, kind)
+  return payloadFingerprint(path, fp, kind) ~= nil
+end
+
+local function safeValidPayload(path, fp, kind)
+  local ok, valid = pcall(validPayload, path, fp, kind)
+  return ok and valid
+end
+
+local function safePayloadFingerprint(path, fp, kind, prefix)
+  local ok, got = pcall(payloadFingerprint, path, fp, kind, prefix)
+  return ok and type(got) == "string" and got or nil
+end
+
+function MeshCache.jobRecord(map, slot)
+  return {
+    key = tostring(map.id) .. "/" .. tostring(slot),
+    terrain = fileName(map, slot, "terrain"),
+    terrainFp = fingerprint(map, slot),
+    water = fileName(map, slot, "water"),
+    waterFp = fingerprint(map, slot .. "Water"),
+    aux = fileName(map, slot, "aux"),
+    auxFp = fingerprint(map, slot .. "Aux"),
+  }
+end
+
+local function scanJob(job, dir)
+  local map = { id = job.id }
+  local slot = tostring(job.slot)
+  local terrain = fileName(map, slot, "terrain")
+  local water = fileName(map, slot, "water")
+  local aux = fileName(map, slot, "aux")
+  local terrainFp = safePayloadFingerprint(
+    dir .. "/" .. terrain,
+    identity() .. "|" .. tostring(job.id) .. "|" .. slot .. "|", "mesh", true)
+  local waterFp = safePayloadFingerprint(
+    dir .. "/" .. water,
+    identity() .. "|" .. tostring(job.id) .. "|" .. slot .. "Water|", "mesh", true)
+  local auxFp = safePayloadFingerprint(
+    dir .. "/" .. aux,
+    identity() .. "|" .. tostring(job.id) .. "|" .. slot .. "Aux|", "aux", true)
+  if not (terrainFp and waterFp and auxFp) then return nil end
+  return { key = tostring(job.id) .. "/" .. slot, terrain = terrain,
+           terrainFp = terrainFp, water = water, waterFp = waterFp,
+           aux = aux, auxFp = auxFp }
+end
+
+function MeshCache.verifyJob(map, slot)
+  local dir = MeshCache.dir()
+  if not dir then return false end
+  local record = MeshCache.jobRecord(map, slot)
+  return safeValidPayload(dir .. "/" .. record.terrain, record.terrainFp, "mesh")
+     and safeValidPayload(dir .. "/" .. record.water, record.waterFp, "mesh")
+     and safeValidPayload(dir .. "/" .. record.aux, record.auxFp, "aux")
+end
+
+local function readManifest()
+  local path = manifestPath()
+  if not path then return nil end
+  local text = readFile(path)
+  if not text then return nil end
+  local lines = {}
+  for line in text:gmatch("[^\n]+") do lines[#lines + 1] = line end
+  local format, manifestIdentity, total
+  if lines[1] then
+    format, manifestIdentity, total =
+      lines[1]:match("^(%S+)%s+(%S+)%s+(%d+)$")
+  end
+  if format ~= "PVMC1" or manifestIdentity ~= identity() then return nil end
+  local records = {}
+  for i = 2, #lines do
+    local key, terrain, terrainFp, water, waterFp, aux, auxFp =
+      lines[i]:match("^job\t([^\t]+)\t([^\t]+)\t([^\t]+)\t([^\t]+)\t([^\t]+)\t([^\t]+)\t([^\t]+)$")
+    if not key then return nil end
+    records[key] = { key = key, terrain = terrain, terrainFp = terrainFp,
+                     water = water, waterFp = waterFp, aux = aux, auxFp = auxFp }
+  end
+  return { total = tonumber(total), records = records }
+end
+
+function MeshCache.ready(jobs)
+  if dirty or not MeshCache.available() then return false, 0 end
+  local manifest = readManifest()
+  if not manifest or manifest.total ~= #jobs then
+    local dir = MeshCache.dir()
+    local records, done = {}, 0
+    for _, job in ipairs(jobs or {}) do
+      local record = scanJob(job, dir)
+      if not record then return false, done end
+      records[record.key] = record
+      done = done + 1
+    end
+    if done == #jobs and MeshCache.writeManifest(records, #jobs) then
+      return true, done
+    end
+    return false, done
+  end
+  local dir = MeshCache.dir()
+  local done = 0
+  for _, job in ipairs(jobs or {}) do
+    local key = tostring(job.id) .. "/" .. tostring(job.slot)
+    local record = manifest.records[key]
+    if not record then return false, done end
+    local ok = safeValidPayload(dir .. "/" .. record.terrain, record.terrainFp, "mesh")
+           and safeValidPayload(dir .. "/" .. record.water, record.waterFp, "mesh")
+           and safeValidPayload(dir .. "/" .. record.aux, record.auxFp, "aux")
+    if not ok then
+      local records, scanned = {}, 0
+      for _, candidate in ipairs(jobs or {}) do
+        local migrated = scanJob(candidate, dir)
+        if not migrated then return false, done end
+        records[migrated.key] = migrated
+        scanned = scanned + 1
+      end
+      if scanned == #jobs and MeshCache.writeManifest(records, #jobs) then
+        return true, scanned
+      end
+      return false, done
+    end
+    done = done + 1
+  end
+  return done == #jobs, done
+end
+
+function MeshCache.writeManifest(records, total)
+  local path = manifestPath()
+  if not path or type(records) ~= "table" then return false end
+  local keys = sortedKeys(records)
+  if #keys ~= total then return false end
+  local lines = { ("PVMC1\t%s\t%d"):format(identity(), total) }
+  for _, key in ipairs(keys) do
+    local record = records[key]
+    lines[#lines + 1] = table.concat({ "job", record.key, record.terrain,
+      record.terrainFp, record.water, record.waterFp, record.aux,
+      record.auxFp }, "\t")
+  end
+  local ok = writeFile(path, table.concat(lines, "\n") .. "\n")
+  if ok then dirty = false end
+  return ok
+end
+
 -- ------------------------------------------------------------ save/load
 
 function MeshCache.saveTerrain(map, slot, buf, n, idx, m)
@@ -486,20 +757,55 @@ end
 -- at boot is what made every launch cold -- the cache never survived a
 -- restart.
 function MeshCache.invalidate(mapId)
-  if not mapId then return end
+  dirty = true
   local dir = MeshCache.dir()
   if not dir then return end
-  local glob = "^" .. tostring(mapId):gsub("[^%w_]", "_") .. "%."
-  local q = dir:gsub('"', '\\"')
-  if io.popen then
-    local p = io.popen('ls -1 "' .. q .. '" 2>/dev/null', "r")
-    if p then
-      for name in p:lines() do
-        if name:match(glob) then os.remove(dir .. "/" .. name) end
-      end
-      p:close()
+  os.remove(dir .. "/" .. MANIFEST)
+  if not mapId then return end
+  local prefix = tostring(mapId):gsub("[^%w_]", "_")
+  for _, slot in ipairs({ "body", "full" }) do
+    for _, kind in ipairs({ "terrain", "water", "aux" }) do
+      os.remove(dir .. "/" .. prefix .. "." .. slot .. "." .. kind)
     end
   end
+end
+
+local function listFiles(dir)
+  if not io.popen then return {} end
+  local quoted = dir:gsub('"', '\\"')
+  local command = package.config:sub(1, 1) == "\\"
+    and ('dir /b "' .. quoted .. '" 2>nul')
+    or ('ls -1 "' .. quoted .. '" 2>/dev/null')
+  local ok, pipe = pcall(io.popen, command, "r")
+  if not ok or not pipe then return {} end
+  local names = {}
+  for name in pipe:lines() do names[#names + 1] = name end
+  pipe:close()
+  return names
+end
+
+function MeshCache.wipe(jobs)
+  dirty = true
+  local dir = MeshCache.dir()
+  if not dir then return false end
+  os.remove(dir .. "/" .. MANIFEST)
+  -- The direct pass also works on platforms without io.popen. The directory
+  -- pass catches stale files from maps no longer present in the current data.
+  for _, job in ipairs(jobs or {}) do
+    local prefix = tostring(job.id):gsub("[^%w_]", "_")
+    for _, slot in ipairs({ "body", "full" }) do
+      for _, kind in ipairs({ "terrain", "water", "aux" }) do
+        os.remove(dir .. "/" .. prefix .. "." .. slot .. "." .. kind)
+      end
+    end
+  end
+  for _, name in ipairs(listFiles(dir)) do
+    if name:match("%.terrain$") or name:match("%.water$")
+       or name:match("%.aux$") or name:match("%.tmp$") then
+      os.remove(dir .. "/" .. name)
+    end
+  end
+  return true
 end
 
 -- ------------------------------------------------ pure helpers (exported)

@@ -11,8 +11,8 @@
 --
 --   options:define   a home in options.modOptions.DRAMATIC_SHAPE, plus a row
 --                    on this mod's page in the mod manager.
---   ui.options.rows  the same setting on the OPTIONS menu, where the
---                    player already goes for VOXEL and T-SHIFT.
+--   the dedicated VOXEL SETTINGS screen renders the same setting descriptors
+--                    alongside the VOXEL and T-SHIFT pipeline rows.
 --
 -- Both rows read and write the one stored value, so they cannot disagree.
 -- Writing mirrors what the manager's own page does (ManagerState:setOption):
@@ -168,8 +168,7 @@ function ModSetting:sync(value)
   self.index = indexOf(self, value)
 end
 
--- The descriptor src/ui/OptionRows.lua renders, in the shape the
--- ui.options.rows hook appends.
+-- The descriptor is rendered by the dedicated VOXEL SETTINGS screen.
 function ModSetting:row()
   local self_ = self
   return {

@@ -776,6 +776,8 @@ local function runGeometry(map, bodyOnly, masks, sink, waterSink)
   end
 
   local scUV = { { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 } }
+  local scObject = { { 0, 0, 0 }, { 0, 0, 0 },
+                     { 0, 0, 0 }, { 0, 0, 0 } }
   local function quadUV(q)
     if q.uv then return q.uv end
     for i = 1, 4 do
@@ -786,18 +788,31 @@ local function runGeometry(map, bodyOnly, masks, sink, waterSink)
 
   for _, q in ipairs(S.objectQuads) do
     Budget.tick()
-    local x0 = math.min(q[1][1], q[2][1], q[3][1], q[4][1])
-    local x1 = math.max(q[1][1], q[2][1], q[3][1], q[4][1])
-    local z0 = math.min(q[1][3], q[2][3], q[3][3], q[4][3])
-    local z1 = math.max(q[1][3], q[2][3], q[3][3], q[4][3])
+    -- Building stamps retain their immutable template and placement offset;
+    -- materialize into reusable corners before bounds, culling, and push.
+    local source, drawQ = q, q
+    if q.localQ then
+      source = q.localQ
+      local ox, oz = q.offsetX, q.offsetZ
+      for i = 1, 4 do
+        local c, d = source[i], scObject[i]
+        d[1], d[2], d[3] = c[1] + ox, c[2], c[3] + oz
+      end
+      drawQ = scObject
+    end
+    local x0 = math.min(drawQ[1][1], drawQ[2][1], drawQ[3][1], drawQ[4][1])
+    local x1 = math.max(drawQ[1][1], drawQ[2][1], drawQ[3][1], drawQ[4][1])
+    local z0 = math.min(drawQ[1][3], drawQ[2][3], drawQ[3][3], drawQ[4][3])
+    local z1 = math.max(drawQ[1][3], drawQ[2][3], drawQ[3][3], drawQ[4][3])
     -- q.own: a body-anchored structure's own quad (a building placed by
     -- Buildings.build, whose scan never leaves the body). Exempt from
     -- the edge keep-rules entirely: its eave legitimately overhangs the
     -- boundary plane into the neighbour's airspace, and no variant of
     -- the neighbour will ever draw that geometry
-    if q.own or outwardOnEdge(q, x0, z0, x1, z1)
+    if q.own or outwardOnEdge(drawQ, x0, z0, x1, z1)
        or keepQuad(x0, z0, x1, z1) then
-      push({ q[1], q[2], q[3], q[4] }, quadUV(q), groundShades(q, q.shade))
+      push({ drawQ[1], drawQ[2], drawQ[3], drawQ[4] },
+           quadUV(q), groundShades(q, q.shade))
     end
   end
 
@@ -1019,6 +1034,7 @@ end
 
 local jobs = {}       -- FIFO of pending jobs
 local jobIndex = {}   -- "id:slot" -> job
+local completion = {} -- "id:slot" -> complete|failed|cancelled
 
 local clock = (love and love.timer and love.timer.getTime) or os.clock
 
@@ -1027,7 +1043,9 @@ local function jobKey(id, slot)
 end
 
 local function finishJob(job, ok, err)
-  jobIndex[jobKey(job.id, job.slot)] = nil
+  local key = jobKey(job.id, job.slot)
+  jobIndex[key] = nil
+  completion[key] = ok and "complete" or "failed"
   for i, j in ipairs(jobs) do
     if j == job then
       table.remove(jobs, i)
@@ -1254,7 +1272,10 @@ end
 -- stale queues its rebuild AND keeps handing back the old mesh, so a
 -- one-block edit never drops the scene to the flat 2D path while the
 -- replacement cooks.
-function ChunkMesher.request(map, bodyOnly, masks, urgent)
+-- `force` is used by the disk-cache prebuilder. Runtime cache state is not
+-- evidence that the serialized terrain/aux files exist (or are current), so
+-- a map visited earlier this session must still be allowed to run the job.
+function ChunkMesher.request(map, bodyOnly, masks, urgent, force)
   local slot = bodyOnly and "body" or "full"
   -- Create the entry HERE, at request time -- not in runJob when the
   -- build starts. The entry is the "seen this session" marker the
@@ -1263,17 +1284,28 @@ function ChunkMesher.request(map, bodyOnly, masks, urgent)
   -- time the player crosses into it, or the full build would wrongly
   -- go urgent.
   local c = entry(map.id)
+  if force then
+    -- Force the job to validate/load the disk payloads or rebuild them.
+    -- Mark aux too: a populated in-memory slot can otherwise skip
+    -- fillAux(), leaving the prebuilder reporting success with no aux file.
+    c.stale = c.stale or {}
+    c.stale.aux = true
+    c.stale[slot] = true
+  end
   local stale = c.stale and (c.stale[slot] or c.stale.aux)
-  if c[slot] ~= nil and not stale then return c[slot] or nil end
+  if c[slot] ~= nil and not force and not stale then return c[slot] or nil end
   local key = jobKey(map.id, slot)
   local job = jobIndex[key]
+  if force then completion[key] = nil end
   if not job then
     job = { id = map.id, map = map, slot = slot, masks = masks,
-            urgent = urgent or false, gen = gen[map.id] or 0 }
+            urgent = urgent or false, prebuild = force or false,
+            gen = gen[map.id] or 0 }
     jobIndex[key] = job
     jobs[#jobs + 1] = job
-  elseif urgent then
-    job.urgent = true
+  else
+    if urgent then job.urgent = true end
+    if force then job.prebuild = true end
   end
   return (c and c[slot]) or nil
 end
@@ -1286,6 +1318,12 @@ end
 -- retain the mesh; it only answers whether a slot is still in flight.
 function ChunkMesher.jobPending(mapId, bodyOnly)
   return jobIndex[jobKey(mapId, bodyOnly and "body" or "full")] ~= nil
+end
+
+function ChunkMesher.jobStatus(mapId, bodyOnly)
+  local key = jobKey(mapId, bodyOnly and "body" or "full")
+  if jobIndex[key] then return "pending" end
+  return completion[key]
 end
 
 -- Release a completed prebuild map immediately. Unlike invalidate(), this
@@ -1301,7 +1339,9 @@ function ChunkMesher.release(mapId)
   for i = #jobs, 1, -1 do
     local job = jobs[i]
     if job.id == mapId then
-      jobIndex[jobKey(job.id, job.slot)] = nil
+      local key = jobKey(job.id, job.slot)
+      jobIndex[key] = nil
+      completion[key] = "cancelled"
       table.remove(jobs, i)
     end
   end
@@ -1536,9 +1576,16 @@ end
 -- round trip free while staying bounded at two neighbourhoods.
 local prevLive = {}
 
+local function hasPrebuildJob(mapId)
+  for _, job in ipairs(jobs) do
+    if job.id == mapId and job.prebuild then return true end
+  end
+  return false
+end
+
 function ChunkMesher.setLive(live)
   for id, c in pairs(cache) do
-    if not live[id] and not prevLive[id] then
+    if not hasPrebuildJob(id) and not live[id] and not prevLive[id] then
       releaseEntry(c)
       cache[id] = nil
       gen[id] = (gen[id] or 0) + 1
@@ -1547,8 +1594,10 @@ function ChunkMesher.setLive(live)
   end
   for i = #jobs, 1, -1 do
     local job = jobs[i]
-    if not live[job.id] and not prevLive[job.id] then
-      jobIndex[jobKey(job.id, job.slot)] = nil
+    if not job.prebuild and not live[job.id] and not prevLive[job.id] then
+      local key = jobKey(job.id, job.slot)
+      jobIndex[key] = nil
+      completion[key] = "cancelled"
       table.remove(jobs, i)
     end
   end
@@ -1575,7 +1624,9 @@ function ChunkMesher.invalidate(mapId)
   for i = #jobs, 1, -1 do
     local job = jobs[i]
     if mapId == nil or job.id == mapId then
-      jobIndex[jobKey(job.id, job.slot)] = nil
+      local key = jobKey(job.id, job.slot)
+      jobIndex[key] = nil
+      completion[key] = "cancelled"
       table.remove(jobs, i)
     end
   end
