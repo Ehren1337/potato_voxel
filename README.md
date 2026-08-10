@@ -74,7 +74,10 @@ python3 tools/modkit.py pack mods/potato_voxel
   the save dir; delete it (or the whole `mod-derived` tree) to force a
   rebuild. `MeshCache.GEOMETRY_VERSION` must be bumped whenever geometry
   output changes — the cache fingerprint does not cover every geometry
-  knob.
+  knob. Large payloads use LZ4 compression when the runtime supports it;
+  raw payloads remain readable as a fallback. This reduces storage and cache
+  read cost, not steady-state GPU draw cost. Existing raw entries are repacked
+  lazily as they are loaded; running PREBUILD CACHE migrates the full set.
 - **OPTIONS → PREBUILD CACHE** cooperatively builds every map's body and full
   terrain variant, including water and auxiliary meshes. The game checks the
   complete cache at boot and shows **READY** when every current job is present.

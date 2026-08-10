@@ -98,6 +98,41 @@ if ffiOk and cacheDir then
           and not exists(cacheDir .. "/" .. manifestRecord.water)
           and not exists(cacheDir .. "/" .. manifestRecord.aux),
           "wipe cache removes all payload variants")
+
+  local oldLove = love
+  local testLove = oldLove or {}
+  local oldData = testLove.data
+  local packed = {}
+  local serial = 0
+  testLove.data = {
+    compress = function(_, _, body)
+      serial = serial + 1
+      local key = "packed" .. serial
+      packed[key] = body
+      return key
+    end,
+    decompress = function(_, _, body) return packed[body] end,
+  }
+  _G.love = testLove
+  MeshCache.configure({ maps = maps, tilesets = {} })
+  local vertices = ffi.new("float[?]", 64 * 6)
+  MeshCache.saveTerrain(fakeMap, "body", vertices, 64)
+  local compressed = io.open(cacheDir .. "/A.body.terrain", "rb")
+  local compressedFormat = compressed and compressed:read(4):byte(4) or nil
+  if compressed then compressed:close() end
+  T.eq(compressedFormat, 2, "cache uses compressed format when available")
+  MeshCache.saveWater(fakeMap, "body", nil, 0)
+  MeshCache.saveAux(fakeMap, "body", { figures = {} })
+  local loaded = MeshCache.loadTerrain(fakeMap, "body")
+  T.check(loaded ~= nil and loaded.n == 64,
+          "compressed cache payload loads through the normal decoder")
+  T.check(MeshCache.ready({ { id = "A", slot = "body" } }),
+          "compressed cache reports READY")
+  T.eq(MeshCache.compressionStatus(), "compressed",
+       "cache status identifies compressed payloads")
+  testLove.data = oldData
+  _G.love = oldLove
+  MeshCache.wipe({ { id = "A", slot = "body" } })
   MeshCache.available = originalAvailable
 end
 

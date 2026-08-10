@@ -60,6 +60,7 @@ end
 local MeshCache = {}
 local dataKey = "unconfigured"
 local dirty = false
+local compression = "unknown"
 local MANIFEST = "cache.info"
 
 -- Bump when the meshing algorithm changes the vertex/UV output, so a
@@ -197,10 +198,15 @@ end
 function MeshCache.configure(data)
   dataKey = datasetRevision(data)
   dirty = false
+  compression = "unknown"
 end
 
 function MeshCache.isDirty()
   return dirty
+end
+
+function MeshCache.compressionStatus()
+  return compression
 end
 
 MeshCache.identity = identity
@@ -289,6 +295,7 @@ end
 
 function MeshCache.begin()
   dirty = true
+  compression = "unknown"
   local path = manifestPath()
   if path then os.remove(path) end
 end
@@ -319,12 +326,16 @@ end
 -- ------------------------------------------------------------- encoding
 
 -- Binary layout, little-endian throughout:
---   header: "DSM" + format byte (1) + u16 fp-len + fp bytes
+--   raw format: "DSM" + format byte (1) + u32 fp-len + fp bytes + payload
+--   LZ4 format: same header, then codec + raw length + packed length + hash
 --   mesh payload:   u32 vertex count n, then n*6 floats
 --   figures payload: u8 count, then per figure: u32 n, n*6 floats,
 --                    then f32 wx, f32 wz, f32 y, f32 w
 local MAGIC = "DSM"
-local FORMAT = 1
+local RAW_FORMAT = 1
+local COMPRESSED_FORMAT = 2
+local LZ4_CODEC = 1
+local MAX_PAYLOAD = 512 * 1024 * 1024
 
 local function f32(v)
   local buf = ffi.new("float[1]")
@@ -346,20 +357,87 @@ local function u32(n)
                      math.floor(n / 65536) % 256, math.floor(n / 16777216) % 256)
 end
 
-local function header(fp)
-  return MAGIC .. string.char(FORMAT) .. u32(#fp) .. fp
+local function readU32(s, offset)
+  return s:byte(offset) + s:byte(offset + 1) * 256
+       + s:byte(offset + 2) * 65536 + s:byte(offset + 3) * 16777216
+end
+
+local function payloadHash(s)
+  local hash = 17
+  for i = 1, #s do hash = (hash * 31 + s:byte(i)) % 2147483647 end
+  return hash
+end
+
+local function header(fp, format, rawLen, packedLen, checksum)
+  local out = MAGIC .. string.char(format) .. u32(#fp) .. fp
+  if format == COMPRESSED_FORMAT then
+    out = out .. string.char(LZ4_CODEC) .. u32(rawLen) .. u32(packedLen)
+         .. u32(checksum)
+  end
+  return out
 end
 
 -- Parse and validate the header at `s:sub(1)`. Returns the fingerprint
--- and the payload start offset (1-based), or nil (bad magic/format/length).
+-- and payload metadata, or nil (bad magic/format/length).
 local function parseHeader(s)
   if not s or #s < 8 then return nil end
-  if s:sub(1, 3) ~= MAGIC or s:byte(4) ~= FORMAT then return nil end
-  local fpLen = s:byte(5) + s:byte(6) * 256 + s:byte(7) * 65536
-                + s:byte(8) * 16777216
+  local format = s:byte(4)
+  if s:sub(1, 3) ~= MAGIC
+     or (format ~= RAW_FORMAT and format ~= COMPRESSED_FORMAT) then
+    return nil
+  end
+  local fpLen = readU32(s, 5)
   local head = 8 + fpLen             -- 1-based index of the LAST fp byte
   if #s < head then return nil end
-  return s:sub(9, head), head + 1    -- payload starts the byte AFTER fp
+  local meta = { format = format }
+  local offset = head + 1
+  if format == COMPRESSED_FORMAT then
+    if #s < head + 13 then return nil end
+    meta.codec = s:byte(offset)
+    meta.rawLen = readU32(s, offset + 1)
+    meta.packedLen = readU32(s, offset + 5)
+    meta.checksum = readU32(s, offset + 9)
+    offset = offset + 13
+    if meta.codec ~= LZ4_CODEC or #s - offset + 1 ~= meta.packedLen then
+      return nil
+    end
+  end
+  return s:sub(9, head), offset, meta
+end
+
+local function unpackPayload(s, offset, meta)
+  local body = s:sub(offset)
+  if meta.format == RAW_FORMAT then return body end
+  if meta.rawLen > MAX_PAYLOAD or meta.packedLen > #body then return nil end
+  local data = love and love.data
+  if not (data and data.decompress) then return nil end
+    local ok, raw = pcall(data.decompress, "string", "lz4", body)
+  if not (ok and type(raw) == "string" and #raw == meta.rawLen
+          and payloadHash(raw) == meta.checksum) then
+    return nil
+  end
+  return raw
+end
+
+local function packPayload(fp, body)
+  local data = love and love.data
+  if data and data.compress and #body >= 1024 then
+    local ok, packed = pcall(data.compress, "string", "lz4", body)
+    if ok and type(packed) == "string" and #packed < #body then
+      return header(fp, COMPRESSED_FORMAT, #body, #packed, payloadHash(body))
+             .. packed
+    end
+  end
+  return header(fp, RAW_FORMAT) .. body
+end
+
+local function repackRaw(path, fp, body, meta)
+  if meta.format ~= RAW_FORMAT then return end
+  local packed = packPayload(fp, body)
+  if packed:byte(4) == COMPRESSED_FORMAT then
+    compression = "unknown"
+    pcall(writeFile, path, packed)
+  end
 end
 
 -- A float* at byte offset `off` into a Lua string. The string keeps the
@@ -490,14 +568,15 @@ end
 local function payloadFingerprint(path, fp, kind, prefix)
   local s = readFile(path)
   if not s then return nil end
-  local got, off = parseHeader(s)
+  local got, off, meta = parseHeader(s)
   if not got then return nil end
   if prefix then
     if got:sub(1, #fp) ~= fp then return nil end
   elseif got ~= fp then
     return nil
   end
-  local body = s:sub(off)
+  local body = unpackPayload(s, off, meta)
+  if not body then return nil end
   if kind ~= "aux" then
     return decodeIndexed(body) and got or nil
   end
@@ -522,6 +601,45 @@ end
 local function safePayloadFingerprint(path, fp, kind, prefix)
   local ok, got = pcall(payloadFingerprint, path, fp, kind, prefix)
   return ok and type(got) == "string" and got or nil
+end
+
+local function safeFormat(path, fp)
+  local ok, format, rawLen = pcall(function()
+    local s = readFile(path)
+    if not s then return nil end
+    local got, offset, meta = parseHeader(s)
+    if got ~= fp then return nil end
+    local rawLen = meta.format == COMPRESSED_FORMAT
+                  and meta.rawLen or (#s - offset + 1)
+    return meta.format, rawLen
+  end)
+  return ok and format or nil, ok and rawLen or nil
+end
+
+local function updateCompression(records, dir)
+  local total, compressed = 0, 0
+  for _, record in pairs(records or {}) do
+    for _, pair in ipairs({
+      { record.terrain, record.terrainFp },
+      { record.water, record.waterFp },
+      { record.aux, record.auxFp },
+    }) do
+      local format, rawLen = safeFormat(dir .. "/" .. pair[1], pair[2])
+      if rawLen and rawLen >= 1024 then
+        total = total + 1
+        if format == COMPRESSED_FORMAT then compressed = compressed + 1 end
+      end
+    end
+  end
+  if total == 0 then
+    compression = "unknown"
+  elseif compressed == total then
+    compression = "compressed"
+  elseif compressed == 0 then
+    compression = "raw"
+  else
+    compression = "mixed"
+  end
 end
 
 function MeshCache.jobRecord(map, slot)
@@ -631,7 +749,11 @@ function MeshCache.ready(jobs)
     end
     done = done + 1
   end
-  return done == #jobs, done
+  if done == #jobs then
+    updateCompression(manifest.records, dir)
+    return true, done
+  end
+  return false, done
 end
 
 function MeshCache.writeManifest(records, total)
@@ -647,7 +769,10 @@ function MeshCache.writeManifest(records, total)
       record.auxFp }, "\t")
   end
   local ok = writeFile(path, table.concat(lines, "\n") .. "\n")
-  if ok then dirty = false end
+  if ok then
+    dirty = false
+    updateCompression(records, MeshCache.dir())
+  end
   return ok
 end
 
@@ -658,7 +783,7 @@ function MeshCache.saveTerrain(map, slot, buf, n, idx, m)
   local ok = pcall(function()
     local fp = fingerprint(map, slot)
     writeFile(fileFor(map, slot, "terrain"),
-              header(fp) .. encodeIndexed(n, buf, m, idx))
+              packPayload(fp, encodeIndexed(n, buf, m, idx)))
   end)
   if not ok then os.remove(fileFor(map, slot, "terrain") .. ".tmp") end
 end
@@ -668,7 +793,7 @@ function MeshCache.saveWater(map, slot, buf, n, idx, m)
   local ok = pcall(function()
     local fp = fingerprint(map, slot .. "Water")
     writeFile(fileFor(map, slot, "water"),
-              header(fp) .. encodeIndexed(n, buf, m, idx))
+              packPayload(fp, encodeIndexed(n, buf, m, idx)))
   end)
   if not ok then os.remove(fileFor(map, slot, "water") .. ".tmp") end
 end
@@ -690,12 +815,14 @@ end
 function MeshCache.loadMeshData(path, fp)
   local ok, s = pcall(readFile, path)
   if not ok or not s then return nil end
-  local got, off = parseHeader(s)
+  local got, off, meta = parseHeader(s)
   if not got or got ~= fp then
     os.remove(path)
     return nil
   end
-  return decodeIndexed(s:sub(off))
+  local body = unpackPayload(s, off, meta)
+  if body then repackRaw(path, fp, body, meta) end
+  return body and decodeIndexed(body) or nil
 end
 
 -- Persist the aux (grass/flowers/figures) vertex streams. `flattened` is
@@ -715,7 +842,7 @@ function MeshCache.saveAux(map, slot, flattened)
                                   flattened.flowers and flattened.flowers.idx)
     local figures = encodeFigures(flattened.figures or {})
     writeFile(fileFor(map, slot, "aux"),
-              header(fp) .. body .. flowers .. figures)
+              packPayload(fp, body .. flowers .. figures))
   end)
   if not ok then os.remove(fileFor(map, slot, "aux") .. ".tmp") end
 end
@@ -726,12 +853,14 @@ function MeshCache.loadAux(map, slot)
   if not dir then return nil end
   local okS, s = pcall(readFile, fileFor(map, slot, "aux"))
   if not okS or not s then return nil end
-  local got, off = parseHeader(s)
+  local got, off, meta = parseHeader(s)
   if not got or got ~= fingerprint(map, slot .. "Aux") then
     os.remove(fileFor(map, slot, "aux"))
     return nil
   end
-  local body = s:sub(off)
+  local body = unpackPayload(s, off, meta)
+  if not body then return nil end
+  repackRaw(fileFor(map, slot, "aux"), fingerprint(map, slot .. "Aux"), body, meta)
   -- grass mesh | flowers mesh | figures payload (each length-prefixed,
   -- and each carries its own u32 index section since version 12)
   local g = decodeIndexed(body)
@@ -758,6 +887,7 @@ end
 -- restart.
 function MeshCache.invalidate(mapId)
   dirty = true
+  compression = "unknown"
   local dir = MeshCache.dir()
   if not dir then return end
   os.remove(dir .. "/" .. MANIFEST)
@@ -786,6 +916,7 @@ end
 
 function MeshCache.wipe(jobs)
   dirty = true
+  compression = "unknown"
   local dir = MeshCache.dir()
   if not dir then return false end
   os.remove(dir .. "/" .. MANIFEST)

@@ -850,11 +850,28 @@ local function pinEngineFx(game)
 end
 
 -- Build the complete PotatoVoxel-owned row set for the dedicated submenu.
+local function cacheReadyLabel(status)
+  if status ~= "READY" then return status end
+  local mode = MeshCache.compressionStatus()
+  if mode == "compressed" then return "READY CMP" end
+  if mode == "mixed" then return "READY MIX" end
+  if mode == "raw" then return "READY RAW" end
+  return "READY"
+end
+
 local function showCacheStatus(game)
   local TextBox = require("src.render.TextBox")
+  local status = CachePrebuild.status()
+  local label = status
+  if status == "READY" then
+    local mode = MeshCache.compressionStatus()
+    label = mode == "compressed" and "READY (COMPRESSED)"
+            or mode == "mixed" and "READY (MIXED)"
+            or mode == "raw" and "READY (RAW)"
+            or "READY"
+  end
   game.stack:push(TextBox.new(game,
-    ("CACHE %s\nGEOMETRY %d"):format(CachePrebuild.status(),
-                                      MeshCache.GEOMETRY_VERSION)))
+    ("%s\fGEOMETRY %d"):format(label, MeshCache.GEOMETRY_VERSION)))
 end
 
 local function confirmCacheWipe(game)
@@ -921,7 +938,10 @@ local function voxelSettingsRows(game)
     id = "potato_voxel:cache_status",
     label = "CACHE STATUS",
     value = function()
-      return ("GEO %d"):format(MeshCache.GEOMETRY_VERSION)
+      local status = CachePrebuild.status()
+      return status == "READY"
+             and cacheReadyLabel(status)
+             or ("GEO %d"):format(MeshCache.GEOMETRY_VERSION)
     end,
     activate = showCacheStatus,
   }
