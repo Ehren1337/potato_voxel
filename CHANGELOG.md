@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.3.1] - 2026-08-10
+
+### Changed
+
+- Added conflict detection for `BATTLE_ART_VOXEL_FORK` and `DRAMALESS_SHAPE`, showing a clearer warning that two voxel mods should not be installed at the same time.
+
 ## [1.3.0] - 2026-08-10
 
 ### Performance
@@ -28,6 +34,7 @@
 - Replaced animated NPC shadow silhouettes with fixed contact-shadow blobs so animation frames, mirroring, and jump lift cannot stretch or shimmer shadows.
 - Removed the DEBUG option from the in-game options menu.
 
+[1.3.1]: https://github.com/ShaneMcGovernIE/potato_voxel/releases/tag/v1.3.1
 [1.3.0]: https://github.com/ShaneMcGovernIE/potato_voxel/releases/tag/v1.3.0
 [1.2.4]: https://github.com/ShaneMcGovernIE/potato_voxel/releases/tag/v1.2.4
 [1.2.3]: https://github.com/ShaneMcGovernIE/potato_voxel/releases/tag/v1.2.3

@@ -1,7 +1,7 @@
 {
   "id": "potato_voxel",
   "name": "PotatoVoxel",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "api": 2,
   "entry": "main.lua",
   "profile": "content",
@@ -13,7 +13,9 @@
   "conflicts": [
     "DRAMATIC_SHAPE",
     "ds_fp_ceiling",
-    "dramatic_shape_brick"
+    "dramatic_shape_brick",
+    "BATTLE_ART_VOXEL_FORK",
+    "DRAMALESS_SHAPE"
   ],
   "permissions": [
     "engine_internals",
