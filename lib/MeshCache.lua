@@ -362,12 +362,6 @@ local function readU32(s, offset)
        + s:byte(offset + 2) * 65536 + s:byte(offset + 3) * 16777216
 end
 
-local function payloadHash(s)
-  local hash = 17
-  for i = 1, #s do hash = (hash * 31 + s:byte(i)) % 2147483647 end
-  return hash
-end
-
 local function header(fp, format, rawLen, packedLen, checksum)
   local out = MAGIC .. string.char(format) .. u32(#fp) .. fp
   if format == COMPRESSED_FORMAT then
@@ -436,8 +430,12 @@ local function unpackPayload(s, offset, meta)
   local data = love and love.data
   if not (data and data.decompress) then return nil end
     local ok, raw = pcall(data.decompress, "string", "lz4", body)
-  if not (ok and type(raw) == "string" and #raw == meta.rawLen
-          and payloadHash(raw) == meta.checksum) then
+  -- ponytail: no per-byte checksum -- a Lua loop over a 10-25MB payload is a
+  -- 100ms+ hitch on every cold map transition. Truncation is caught by the
+  -- packed-length check in parseHeader and the raw-length check here; corrupt
+  -- LZ4 fails to decompress or yields the wrong size. Add hashing back only if
+  -- bit-rot that decompresses to the exact length is ever observed.
+  if not (ok and type(raw) == "string" and #raw == meta.rawLen) then
     return nil
   end
   return raw
@@ -448,8 +446,7 @@ local function packPayload(fp, body)
   if data and data.compress and #body >= 1024 then
     local ok, packed = pcall(data.compress, "string", "lz4", body)
     if ok and type(packed) == "string" and #packed < #body then
-      return header(fp, COMPRESSED_FORMAT, #body, #packed, payloadHash(body))
-             .. packed
+      return header(fp, COMPRESSED_FORMAT, #body, #packed, 0) .. packed
     end
   end
   return header(fp, RAW_FORMAT) .. body

@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.3.7] - 2026-08-11
+
+### Added
+
+- Added a `github` field to the manifest (`ShaneMcGovernIE/potato_voxel`) so the
+  launcher enables the Check for updates / Versions / Update flow for
+  PotatoVoxel.
+
+### Fixed
+
+- Removed the per-byte Lua checksum pass that ran over every decompressed
+  cache payload on load, eliminating a slight hitch when moving between maps
+  with the compressed mesh cache enabled. Truncation is still caught by the
+  packed-length and raw-length checks.
+
 ## [1.3.6] - 2026-08-11
 
 ### Added
@@ -120,6 +135,7 @@
 - Replaced animated NPC shadow silhouettes with fixed contact-shadow blobs so animation frames, mirroring, and jump lift cannot stretch or shimmer shadows.
 - Removed the DEBUG option from the in-game options menu.
 
+[1.3.7]: https://github.com/ShaneMcGovernIE/potato_voxel/releases/tag/v1.3.7
 [1.3.6]: https://github.com/ShaneMcGovernIE/potato_voxel/releases/tag/v1.3.6
 [1.3.5]: https://github.com/ShaneMcGovernIE/potato_voxel/releases/tag/v1.3.5
 [1.3.4]: https://github.com/ShaneMcGovernIE/potato_voxel/releases/tag/v1.3.4

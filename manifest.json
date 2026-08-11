@@ -1,7 +1,7 @@
 {
   "id": "potato_voxel",
   "name": "PotatoVoxel",
-  "version": "1.3.6",
+  "version": "1.3.7",
   "api": 2,
   "entry": "main.lua",
   "profile": "content",
@@ -22,5 +22,6 @@
     "filesystem"
   ],
   "affects_link": false,
+  "github": "ShaneMcGovernIE/potato_voxel",
   "description": "PotatoVoxel (fork of Dramatic Shape): the overworld as a 3D voxel diorama, retuned for low-end devices. Same diorama, with the settings that would otherwise cost a handheld its frame budget: one quality ladder (VOXEL OFF / HIGH / MEDIUM / LOW / POTATO = 100% / 75% / 50% / 33% render scale, sub-native rungs folded back with ordinary canvas filtering), every quality knob pre-pinned, disk mesh cache. Desktop HIGH keeps the full two-layer actor shadow map; MEDIUM and lower use contact/blob actor shadows. The full desktop mod is one env var away (DS_BRICK=0)."
 }
