@@ -1,5 +1,32 @@
 # Changelog
 
+## [1.3.6] - 2026-08-11
+
+### Added
+
+- Added an opaque Town Map loading cover for cold asynchronous voxel builds. On
+  a cold cache the cover stays up until the current map's first terrain mesh is
+  ready, so the vanilla 2D world never flashes before the diorama appears. The
+  mesh queue keeps pumping behind it, and invisible overworld updates pause
+  until the build finishes, failing open if a build ends without terrain or
+  voxel mode is turned off. Loading state is exposed through
+  `mod.potato_voxel.loading_changed` and `mod.exports.isLoading`.
+
+### Fixed
+
+- Staged battles now honour the engine's `bottomUIVisible()` and
+  `statusHUDVisible()` seams before drawing PotatoVoxel's battle backings, so a
+  mod hiding the battle UI no longer leaves frosted panels behind.
+- The staged-battle front-sprite wrapper now runs before downstream
+  `pokemon.sprite` wrappers, asks them for the FRONT variant with a copied
+  side context, and propagates `trueColor` back to the caller, so compatible
+  sprite-replacing mods apply inside staged battles instead of being bypassed.
+
+### Contributors
+
+- **AverageConsumer** — interoperability with battle UI and sprite mods, and
+  the cold mesh-build loading cover.
+
 ## [1.3.5] - 2026-08-11
 
 ### Fixed
@@ -93,6 +120,7 @@
 - Replaced animated NPC shadow silhouettes with fixed contact-shadow blobs so animation frames, mirroring, and jump lift cannot stretch or shimmer shadows.
 - Removed the DEBUG option from the in-game options menu.
 
+[1.3.6]: https://github.com/ShaneMcGovernIE/potato_voxel/releases/tag/v1.3.6
 [1.3.5]: https://github.com/ShaneMcGovernIE/potato_voxel/releases/tag/v1.3.5
 [1.3.4]: https://github.com/ShaneMcGovernIE/potato_voxel/releases/tag/v1.3.4
 [1.3.3]: https://github.com/ShaneMcGovernIE/potato_voxel/releases/tag/v1.3.3

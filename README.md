@@ -103,6 +103,8 @@ python3 tools/modkit.py pack mods/potato_voxel
 - **pret/pokered** — the tile and sprite data the geometry is derived from.
 - **pret/pokestadium** — the decompilation the STADIUM extractor was
   written against (no code or data from it is included or redistributed).
+- **AverageConsumer** — battle UI/sprite interoperability improvements and
+  the cold mesh-build loading cover.
 
 Version history (including the 1.6.2-brick.\* lineage under the old name)
 is in [CHANGELOG.md](CHANGELOG.md).

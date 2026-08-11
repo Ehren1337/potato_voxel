@@ -54,6 +54,7 @@ return {
     { who = "DramaticShape", for_ = "the upstream Dramatic Shape Voxel Mod (github.com/DramaticShape/DramaticShapeVoxelMod, v1.6.2) this mod is a fork of. Its own code carries no license; PotatoVoxel is a derived work, retuned for low-end devices. Upstream's OpenXR loader is no longer shipped here" },
     { who = "pret/pokered", for_ = "the tile and sprite data the geometry is derived from" },
     { who = "pret/pokestadium", for_ = "the decompilation the STADIUM extractor was written against -- the bone matrix chain and where scale is applied (func_800143C0), the rotation basis (func_8000F730), the animation and texture-animation samplers (func_80016FBC / func_80017540), the battle context slots and the move-id constants. No code or data from it is included or redistributed here; see README.md" },
+    { who = "AverageConsumer", for_ = "battle UI/sprite interoperability (honouring the engine's visibility seams and composing staged-battle sprite overrides) and the cold mesh-build Town Map loading cover" },
   },
   compat = { engine = ">=0.1.37 <2.0.0", modApi = 2 },
 }
