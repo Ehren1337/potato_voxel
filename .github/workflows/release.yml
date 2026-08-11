@@ -184,9 +184,20 @@ jobs:
           range="${prev:+${prev}..}$GITHUB_SHA"
           changes="$(git log --no-merges --pretty='- %s' "$range" | head -50 || true)"
 
-          notes=$'Download the .zip and install it from the game: MODS > Import mod .zip.'
-          if [ -n "$changes" ]; then
-            notes+=$'\n\n## Changes\n\n'"$changes"
+          # Prefer the CHANGELOG.md entry for this version as the release body;
+          # fall back to the commit list when there is no entry.
+          notes="$(
+            awk -v want="[$VERSION]" '
+              index($0, "## " want) == 1 { on = 1; next }
+              on && index($0, "## [") == 1 { exit }
+              on { print }
+            ' CHANGELOG.md | sed '/^[[:space:]]*$/d'
+          )"
+          if [ -z "$notes" ]; then
+            notes=$'Download the .zip and install it from the game: MODS > Import mod .zip.'
+            if [ -n "$changes" ]; then
+              notes+=$'\n\n## Changes\n\n'"$changes"
+            fi
           fi
           printf 'Release notes:\n%s\n' "$notes"
 

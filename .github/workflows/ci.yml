@@ -38,6 +38,10 @@ jobs:
         working-directory: engine
         run: POKEPORT_DATA_DIR=$PWD/tests/fixture_data luajit mods/potato_voxel/tests/potato_voxel_cache_test.lua
 
+      - name: Full suite
+        working-directory: engine
+        run: POKEPORT_DATA_DIR=$PWD/tests/fixture_data luajit mods/potato_voxel/tests/potato_voxel_test.lua
+
       - name: Loading-cover suite
         working-directory: mod
         run: luajit tests/voxel_loading_test.lua
