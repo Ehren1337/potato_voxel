@@ -78,6 +78,8 @@ python3 tools/modkit.py pack mods/potato_voxel
   raw payloads remain readable as a fallback. This reduces storage and cache
   read cost, not steady-state GPU draw cost. Existing raw entries are repacked
   lazily as they are loaded; running PREBUILD CACHE migrates the full set.
+  Boot-time READY checks read only bounded headers and file sizes; full
+  decompression and checksum validation are deferred until a map is used.
 - **OPTIONS → PREBUILD CACHE** cooperatively builds every map's body and full
   terrain variant, including water and auxiliary meshes. The game checks the
   complete cache at boot and shows **READY** when every current job is present.

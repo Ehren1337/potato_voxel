@@ -1,5 +1,22 @@
 # Changelog
 
+## [1.3.5] - 2026-08-11
+
+### Fixed
+
+- Fixed long launcher stalls when booting with a complete compressed mesh cache.
+- Boot-time cache readiness now validates bounded file headers, fingerprints,
+  codecs, packed lengths, and file sizes without reading or decompressing every
+  terrain, water, and auxiliary payload.
+- Rebuilding a missing cache manifest now uses the same bounded header scan
+  instead of decoding the full cache before the title screen.
+
+### Performance
+
+- Full LZ4 decompression, checksum validation, and mesh decoding remain
+  deferred until a map actually loads its mesh or an explicit cache
+  verification runs, reducing startup I/O and peak memory use.
+
 ## [1.3.4] - 2026-08-10
 
 ### Added
@@ -76,6 +93,7 @@
 - Replaced animated NPC shadow silhouettes with fixed contact-shadow blobs so animation frames, mirroring, and jump lift cannot stretch or shimmer shadows.
 - Removed the DEBUG option from the in-game options menu.
 
+[1.3.5]: https://github.com/ShaneMcGovernIE/potato_voxel/releases/tag/v1.3.5
 [1.3.4]: https://github.com/ShaneMcGovernIE/potato_voxel/releases/tag/v1.3.4
 [1.3.3]: https://github.com/ShaneMcGovernIE/potato_voxel/releases/tag/v1.3.3
 [1.3.2]: https://github.com/ShaneMcGovernIE/potato_voxel/releases/tag/v1.3.2

@@ -126,10 +126,17 @@ if ffiOk and cacheDir then
   local loaded = MeshCache.loadTerrain(fakeMap, "body")
   T.check(loaded ~= nil and loaded.n == 64,
           "compressed cache payload loads through the normal decoder")
+  local oldDecompress = testLove.data.decompress
+  testLove.data.decompress = function()
+    error("boot validation should not decompress every cached payload")
+  end
   T.check(MeshCache.ready({ { id = "A", slot = "body" } }),
-          "compressed cache reports READY")
+          "compressed cache reports READY from headers")
   T.eq(MeshCache.compressionStatus(), "compressed",
        "cache status identifies compressed payloads")
+  T.check(MeshCache.ready({ { id = "A", slot = "body" } }),
+          "manifest READY check uses bounded payload headers")
+  testLove.data.decompress = oldDecompress
   testLove.data = oldData
   _G.love = oldLove
   MeshCache.wipe({ { id = "A", slot = "body" } })

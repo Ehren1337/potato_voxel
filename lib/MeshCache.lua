@@ -379,8 +379,9 @@ end
 
 -- Parse and validate the header at `s:sub(1)`. Returns the fingerprint
 -- and payload metadata, or nil (bad magic/format/length).
-local function parseHeader(s)
+local function parseHeader(s, totalLen)
   if not s or #s < 8 then return nil end
+  local length = totalLen or #s
   local format = s:byte(4)
   if s:sub(1, 3) ~= MAGIC
      or (format ~= RAW_FORMAT and format ~= COMPRESSED_FORMAT) then
@@ -388,21 +389,44 @@ local function parseHeader(s)
   end
   local fpLen = readU32(s, 5)
   local head = 8 + fpLen             -- 1-based index of the LAST fp byte
-  if #s < head then return nil end
+  if #s < head or length < head then return nil end
   local meta = { format = format }
   local offset = head + 1
   if format == COMPRESSED_FORMAT then
-    if #s < head + 13 then return nil end
+    if #s < head + 13 or length < head + 13 then return nil end
     meta.codec = s:byte(offset)
     meta.rawLen = readU32(s, offset + 1)
     meta.packedLen = readU32(s, offset + 5)
     meta.checksum = readU32(s, offset + 9)
     offset = offset + 13
-    if meta.codec ~= LZ4_CODEC or #s - offset + 1 ~= meta.packedLen then
+    if meta.codec ~= LZ4_CODEC or length - offset + 1 ~= meta.packedLen then
       return nil
     end
   end
   return s:sub(9, head), offset, meta
+end
+
+-- Boot only needs the cache identity and payload bounds. Reading the full mesh
+-- here defeats the point of the disk cache: a complete cache can be hundreds
+-- of megabytes, and decompressing every entry before the title screen makes
+-- the launcher appear hung. Full checksum/decode validation still happens
+-- when a map actually loads its mesh.
+local MAX_HEADER = 64 * 1024
+local function readHeader(path)
+  local f = io.open(path, "rb")
+  if not f then return nil end
+  local prefix = f:read(8)
+  if not prefix or #prefix < 8 then f:close(); return nil end
+  local fpLen = readU32(prefix, 5)
+  local format = prefix:byte(4)
+  local extra = format == COMPRESSED_FORMAT and 13 or 0
+  local headerLen = 8 + fpLen + extra
+  if headerLen > MAX_HEADER then f:close(); return nil end
+  local rest = headerLen > 8 and f:read(headerLen - 8) or ""
+  local totalLen = f:seek("end")
+  f:close()
+  if not rest or #rest ~= headerLen - 8 or not totalLen then return nil end
+  return prefix .. rest, totalLen
 end
 
 local function unpackPayload(s, offset, meta)
@@ -598,19 +622,41 @@ local function safeValidPayload(path, fp, kind)
   return ok and valid
 end
 
-local function safePayloadFingerprint(path, fp, kind, prefix)
-  local ok, got = pcall(payloadFingerprint, path, fp, kind, prefix)
+local function headerFingerprint(path, prefix)
+  local s, totalLen = readHeader(path)
+  if not s then return false end
+  local got, offset, meta = parseHeader(s, totalLen)
+  if not (got and totalLen >= offset
+         and (meta.format ~= COMPRESSED_FORMAT
+              or meta.rawLen <= MAX_PAYLOAD)) then
+    return nil
+  end
+  if prefix and got:sub(1, #prefix) ~= prefix then return nil end
+  return got
+end
+
+local function safeHeaderFingerprint(path, prefix)
+  local ok, got = pcall(headerFingerprint, path, prefix)
   return ok and type(got) == "string" and got or nil
+end
+
+local function validHeader(path, fp)
+  return headerFingerprint(path) == fp
+end
+
+local function safeValidHeader(path, fp)
+  local ok, valid = pcall(validHeader, path, fp)
+  return ok and valid
 end
 
 local function safeFormat(path, fp)
   local ok, format, rawLen = pcall(function()
-    local s = readFile(path)
+    local s, totalLen = readHeader(path)
     if not s then return nil end
-    local got, offset, meta = parseHeader(s)
+    local got, offset, meta = parseHeader(s, totalLen)
     if got ~= fp then return nil end
     local rawLen = meta.format == COMPRESSED_FORMAT
-                  and meta.rawLen or (#s - offset + 1)
+                  and meta.rawLen or (totalLen - offset + 1)
     return meta.format, rawLen
   end)
   return ok and format or nil, ok and rawLen or nil
@@ -660,15 +706,15 @@ local function scanJob(job, dir)
   local terrain = fileName(map, slot, "terrain")
   local water = fileName(map, slot, "water")
   local aux = fileName(map, slot, "aux")
-  local terrainFp = safePayloadFingerprint(
+  local terrainFp = safeHeaderFingerprint(
     dir .. "/" .. terrain,
-    identity() .. "|" .. tostring(job.id) .. "|" .. slot .. "|", "mesh", true)
-  local waterFp = safePayloadFingerprint(
+    identity() .. "|" .. tostring(job.id) .. "|" .. slot .. "|")
+  local waterFp = safeHeaderFingerprint(
     dir .. "/" .. water,
-    identity() .. "|" .. tostring(job.id) .. "|" .. slot .. "Water|", "mesh", true)
-  local auxFp = safePayloadFingerprint(
+    identity() .. "|" .. tostring(job.id) .. "|" .. slot .. "Water|")
+  local auxFp = safeHeaderFingerprint(
     dir .. "/" .. aux,
-    identity() .. "|" .. tostring(job.id) .. "|" .. slot .. "Aux|", "aux", true)
+    identity() .. "|" .. tostring(job.id) .. "|" .. slot .. "Aux|")
   if not (terrainFp and waterFp and auxFp) then return nil end
   return { key = tostring(job.id) .. "/" .. slot, terrain = terrain,
            terrainFp = terrainFp, water = water, waterFp = waterFp,
@@ -731,9 +777,9 @@ function MeshCache.ready(jobs)
     local key = tostring(job.id) .. "/" .. tostring(job.slot)
     local record = manifest.records[key]
     if not record then return false, done end
-    local ok = safeValidPayload(dir .. "/" .. record.terrain, record.terrainFp, "mesh")
-           and safeValidPayload(dir .. "/" .. record.water, record.waterFp, "mesh")
-           and safeValidPayload(dir .. "/" .. record.aux, record.auxFp, "aux")
+    local ok = safeValidHeader(dir .. "/" .. record.terrain, record.terrainFp)
+           and safeValidHeader(dir .. "/" .. record.water, record.waterFp)
+           and safeValidHeader(dir .. "/" .. record.aux, record.auxFp)
     if not ok then
       local records, scanned = {}, 0
       for _, candidate in ipairs(jobs or {}) do
