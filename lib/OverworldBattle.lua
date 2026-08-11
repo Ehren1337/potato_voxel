@@ -355,6 +355,7 @@ end
 
 function OverworldBattle.textRects(battle)
   if not battle or battle.blankForAskName then return {} end
+  if battle.bottomUIVisible and not battle:bottomUIVisible() then return {} end
   local r = OverworldBattle.TEXT_RECT
   local out = { box = r.box }
   if battle.phase == "moveSelect" then
@@ -1386,12 +1387,12 @@ end
 
 -- Whether each HUD block is on screen this frame.
 --
--- READ-ONLY duplicates of drawHUDs' own two guards, because there is no seam
--- that reports "the enemy HUD is up". A panel under a HUD that is not there
--- would be a frosted slab floating in the arena, so it is worth mirroring;
--- the worst a future engine change can do is show an empty one for a frame,
--- never break a battle.
+-- READ-ONLY duplicates of drawHUDs' own guards. Honour the shared visibility
+-- seam first so hidden HUDs do not leave their frosted backings behind.
 function OverworldBattle.hudLive(battle, slide)
+  if battle.statusHUDVisible and not battle:statusHUDVisible() then
+    return false, false
+  end
   local enemy = battle.enemy and not battle.showEnemyTrainer
                 and not battle.enemySendingOut
                 and not battle:growInScale(battle.enemy) and slide == 0
