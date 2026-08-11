@@ -498,7 +498,19 @@ function VoxelScene.prefetch(state)
       nbMesh[i], nbWater[i] = ChunkMesher.pair(nb.map, false)
     end
   end
-  Voxel.ready = terrain ~= nil
+  if Voxel.loading and Voxel.loadingMap ~= state.map.id then
+    Voxel.finishLoading()
+  end
+  local pending = ChunkMesher.pending()
+  if not terrain and pending > 0 then
+    Voxel.beginLoading(state.map.id)
+  elseif Voxel.loading and Voxel.loadingMap == state.map.id
+      and (terrain or pending == 0) then
+    -- A failed build reaches pending=0 too: release to vanilla rather than
+    -- trapping the player behind an infinite cover.
+    Voxel.finishLoading(state.map.id)
+  end
+  Voxel.ready = terrain ~= nil and not Voxel.loading
   return terrain, nbMesh, water, nbWater
 end
 
