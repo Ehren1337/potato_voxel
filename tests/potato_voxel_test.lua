@@ -15,6 +15,7 @@ if brick then
   local Water = exports.lib.require("Water")
   local ForestAtmos = exports.lib.require("ForestAtmos")
   local Structures = exports.lib.require("Structures")
+  local OverworldBattle = exports.lib.require("OverworldBattle")
   T.eq(#Voxel.ANGLES_DEG, 5, "VOXEL keeps OFF/HIGH/MEDIUM/LOW/POTATO")
   T.eq(Voxel.ANGLE_LABELS[1], "OFF", "VOXEL OFF rung is retained")
   T.eq(Voxel.ANGLE_LABELS[2], "HIGH", "VOXEL HIGH rung is retained")
@@ -36,6 +37,17 @@ if brick then
   T.eq(Structures.ROUND_RING, 12, "Brick keeps the full border ring")
   T.eq(Structures.HULL_BILLBOARDS, true, "Brick uses billboard hulls")
   T.eq(Structures.BILLBOARD_CROSS, true, "Brick crosses billboard hulls")
+  local intro = {
+    enemy = { fainted = false },
+    introBalls = true,
+    statusHUDVisible = function() return true end,
+    growInScale = function() return nil end,
+  }
+  T.eq(OverworldBattle.hudLive(intro, 0), false,
+       "wild intro does not show an empty enemy HUD panel")
+  intro.introBalls = nil
+  T.eq(OverworldBattle.hudLive(intro, 0), true,
+       "enemy HUD returns after the intro")
   local Prebuild = exports.lib.require("CachePrebuild")
   local jobs = Prebuild.enumerate({ B = { id="B", width=3, height=2, connections={} }, A = { id="A", width=4, height=5, connections={} } })
   T.eq(#jobs, 4, "prebuild enumerates body and full variants")

@@ -1396,6 +1396,7 @@ function OverworldBattle.hudLive(battle, slide)
   local enemy = battle.enemy and not battle.showEnemyTrainer
                 and not battle.enemySendingOut
                 and not battle:growInScale(battle.enemy) and slide == 0
+                and not battle.introBalls
                 and not battle.enemy.fainted
   local player = battle.player and not (battle.safari or battle.demo)
                  and not battle.showPlayerBack and slide == 0
