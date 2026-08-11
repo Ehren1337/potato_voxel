@@ -7,3 +7,6 @@
 tests/potato_voxel_test.lua
 tests/potato_voxel_cache_test.lua
 tests/voxel_loading_test.lua
+
+# Repo-only: issue templates must never ship in the mod zip.
+.github
