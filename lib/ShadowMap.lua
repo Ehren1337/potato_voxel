@@ -393,7 +393,13 @@ end
 -- continuously with the camera reprojects every shadow edge a fraction of a
 -- texel every frame and the whole world's shadows crawl and shimmer while
 -- you walk.
-local function fit(cx, cy, vw, vh)
+-- The light-space box the sun pass will cover: the view's slice of the
+-- world sheared into the sun's frame. Returns the lateral bounds the ortho
+-- projection maps onto the map (l, r, b, t), the depth span it maps into
+-- (zn, zf) and the view matrix itself. Pure Lua (no GPU), so the same math
+-- can stamp the shadow signature -- see fitKey -- without touching a
+-- canvas.
+local function boxCorners(cx, cy, vw, vh)
   local f = sunDir()
   local view = Mat4.lookAt({ 0, 0, 0 }, f, { 0, 0, -1 })
 
@@ -424,6 +430,35 @@ local function fit(cx, cy, vw, vh)
       end
     end
   end
+
+  return l, r, b, t, zn, zf, view
+end
+
+-- The light frustum's own texel quantum, as the whole-texel indices of the
+-- snapped box corner. fit() snaps the corner to texel multiples (below), so
+-- the box can only ever move when these two change -- and a signature that
+-- decides when to redraw the map must stamp exactly these, not a finer
+-- camera quantum. Redrawing on every quarter-pixel of travel re-fits the
+-- box between moves, and because the depth range is NOT part of the snap
+-- (it is a continuous function of the camera) that re-fit slides the packed
+-- depth and normalized bias a hair each time: shadow edges crawl a little,
+-- then snap back a whole texel when the corner finally lands on the next
+-- multiple. Keying the redraw on the snap itself means a frame between box
+-- moves reuses the map as-is -- uvVP, depth range and bias all frozen -- so
+-- edges stay glued to the world. Pure Lua (no GPU), so the per-frame
+-- signature can afford it. The box's SIZE follows from vw/vh/pitch/sun,
+-- which are separate signature terms, so the corner indices plus those
+-- terms identify the whole snapped box.
+function ShadowMap.fitKey(cx, cy, vw, vh)
+  local l, r, b, t = boxCorners(cx, cy, vw, vh)
+  local w, h = r - l, t - b
+  local res = ShadowMap._resolutionFor(w, h, Voxel.level)
+  local tx, ty = w / res, h / res
+  return math.floor(l / tx), math.floor(b / ty)
+end
+
+local function fit(cx, cy, vw, vh)
+  local l, r, b, t, zn, zf, view = boxCorners(cx, cy, vw, vh)
 
   local w, h = r - l, t - b
 

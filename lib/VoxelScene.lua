@@ -780,10 +780,14 @@ local function shadowSignature(terrain, nbMesh, posed, cx, cy, vw, vh)
     n = n + 1
     sigBuf[n] = v
   end
-  -- quarter-pixel camera granularity: the light frustum is snapped to
-  -- whole texels anyway, each a third of a world pixel
-  put(math.floor(cx * 4))
-  put(math.floor(cy * 4))
+  -- the light frustum's own texel quantum: the box is snapped to whole
+  -- texels, so the map must redraw exactly when the box moves and never in
+  -- between -- a frame the box sits still reuses the map with its uvVP,
+  -- depth range and bias frozen, so shadow edges stay glued to the world
+  -- instead of drifting and snapping back a whole texel
+  local fkx, fky = ShadowMap.fitKey(cx, cy, vw, vh)
+  put(fkx)
+  put(fky)
   -- the view size and the camera PITCH are both what the light frustum is
   -- fitted to (a lower camera sees further north, so the box grows), so a
   -- zoom step, a window resize or a rung change invalidates the map even
