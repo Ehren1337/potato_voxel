@@ -178,6 +178,11 @@ local SHADER = [[
   // while letting the sprite layer redraw alone when a character idles.
   float sunlight(vec3 p) {
     if (sunDark <= 0.0) return 1.0;
+    // NaN out of a degenerate fit: GLSL comparisons are false for NaN, so
+    // the frustum checks below would let it through and the multiply after
+    // would black the fragment out. Mali-family GPUs surface exactly this
+    // as the reported black screen; a NaN lookup casts no shadow instead.
+    if (p.x != p.x || p.y != p.y || p.z != p.z) return 1.0;
     // outside the sun's frustum nothing was recorded, so nothing occludes
     if (p.x < 0.0 || p.x > 1.0 || p.y < 0.0 || p.y > 1.0 || p.z > 1.0) {
       return 1.0;

@@ -85,6 +85,18 @@ if brick then
   ShadowSettings.enabledSetting.labels = el
   ShadowSettings.enabledSetting.index = nil
   T.check(ShadowSettings.enabled(), "SHADOWS ON re-enables the pass")
+  -- degenerate-fit guard: zero, negative or NaN extents must not write
+  -- inf/NaN into the matrices the main pass samples (black-screen class)
+  T.check(ShadowMap._degenerate(0, 100, -10, 10), "zero width is degenerate")
+  T.check(ShadowMap._degenerate(100, 0, -10, 10), "zero height is degenerate")
+  T.check(ShadowMap._degenerate(100, 100, 10, 10), "zero depth span is degenerate")
+  T.check(ShadowMap._degenerate(100, 100, 10, -10), "inverted depth is degenerate")
+  T.check(ShadowMap._degenerate(0 / 0, 100, -10, 10), "NaN width is degenerate")
+  T.check(not ShadowMap._degenerate(100, 100, -100, 100),
+          "a sane frustum is not degenerate")
+  T.check(ShadowMap._source():find("c.z == c.z", 1, true),
+          "shadow shader stores far depth instead of NaN")
+  T.check(ShadowMap.abort ~= nil, "abort() exists for pcall error handlers")
   T.eq(Water.setting.values[1], "off", "WATER defaults off")
   T.eq(#Water.setting.values, 3, "WATER ladder stays available")
   T.eq(ForestAtmos.setting.values[1], "off", "FOREST FX defaults off")

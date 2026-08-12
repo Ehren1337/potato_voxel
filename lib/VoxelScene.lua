@@ -865,90 +865,104 @@ local function castShadows(state, terrain, nbMesh, posed, cx, cy, vw, vh,
   if not worldStale and not spriteStale then return end
 
   if worldStale then
-    if not ShadowMap.begin(cx, cy, vw, vh, false) then return end
-    ShadowMap.draw(terrain, atlasFor(state.map), nil)
-    for i, nb in ipairs(state.neighbors or {}) do
-      ShadowMap.draw(nbMesh[i], atlasFor(nb.map),
-                     Mat4.translate(nb.ox, 0, nb.oy))
-    end
-    -- The water surface, which the terrain mesh no longer carries (it is its
-    -- own reflective pass now -- see Water). The sun still has to see it, or
-    -- the map the light records has a hole at every lake and the frustum's
-    -- far plane answers for the surface a shoreline tree's shadow falls on.
-    ShadowMap.draw(water, atlasFor(state.map), nil)
-    for i, nb in ipairs(state.neighbors or {}) do
-      ShadowMap.draw(nbWater and nbWater[i], atlasFor(nb.map),
-                     Mat4.translate(nb.ox, 0, nb.oy))
-    end
-    -- flower billboards live outside the terrain mesh (they draw after the
-    -- characters, pulled -- see render), but the sun still sees them: a
-    -- handful of cutouts per meadow, unlike the grass left out below.
-    -- Every thin card from here down is SNUGGED toward the sun along its own
-    -- ray (ShadowMap.snug) so its shadow keeps contact with its feet instead
-    -- of starting a bias-width away.
-    ShadowMap.draw(ChunkMesher.flowers(state.map), atlasFor(state.map),
-                   ShadowMap.snug(nil))
-    for _, nb in ipairs(state.neighbors or {}) do
-      ShadowMap.draw(ChunkMesher.flowers(nb.map), atlasFor(nb.map),
-                     ShadowMap.snug(Mat4.translate(nb.ox, 0, nb.oy)))
-    end
-    -- From here down it is the CAST, marked as such in the map (see
-    -- ShadowMap.sprites) so water can decline them: everything the world casts
-    -- still shades a lake, a silhouette of somebody standing beside it does
-    -- not. Ground, roofs and the characters themselves take them as before.
-    ShadowMap.sprites(true)
-    -- authored figures cast too, for the same reason the flowers do: a
-    -- handful of cards per map, and a person with no shadow reads as pasted on
-    eachFigure(state.map, 0, 0, function(mesh, _, caster)
-      ShadowMap.draw(mesh, atlasFor(state.map), ShadowMap.snug(caster))
-    end)
-    for _, nb in ipairs(state.neighbors or {}) do
-      eachFigure(nb.map, nb.ox, nb.oy, function(mesh, _, caster)
-        ShadowMap.draw(mesh, atlasFor(nb.map), ShadowMap.snug(caster))
-      end)
-    end
-    -- the STADIUM models: geometry, not cut-outs (see BattleScene.castShadows
-    -- for why they are un-snugged and outside the sprite flag)
-    pcall(function()
-      local stageArena, stageY = V.require("OverworldBattle").stage()
-      if stageArena and stageArena.discs then
-        V.require("StadiumStage").cast(ShadowMap, stageArena, stageY or 0)
+    -- the whole pass is pcall-wrapped: a throw between begin and finish
+    -- (a mesh released mid-map-change, a driver hiccup) used to leave the
+    -- shadow canvas bound, and the main pass then rendered the world into
+    -- the offscreen map -- the black-screen report. abort() unbinds it, so
+    -- the frame falls back to flat-lit instead of black.
+    local ok, err = pcall(function()
+      if not ShadowMap.begin(cx, cy, vw, vh, false) then return end
+      ShadowMap.draw(terrain, atlasFor(state.map), nil)
+      for i, nb in ipairs(state.neighbors or {}) do
+        ShadowMap.draw(nbMesh[i], atlasFor(nb.map),
+                       Mat4.translate(nb.ox, 0, nb.oy))
       end
-      V.require("Stadium").cast(ShadowMap)
+      -- The water surface, which the terrain mesh no longer carries (it is its
+      -- own reflective pass now -- see Water). The sun still has to see it, or
+      -- the map the light records has a hole at every lake and the frustum's
+      -- far plane answers for the surface a shoreline tree's shadow falls on.
+      ShadowMap.draw(water, atlasFor(state.map), nil)
+      for i, nb in ipairs(state.neighbors or {}) do
+        ShadowMap.draw(nbWater and nbWater[i], atlasFor(nb.map),
+                       Mat4.translate(nb.ox, 0, nb.oy))
+      end
+      -- flower billboards live outside the terrain mesh (they draw after the
+      -- characters, pulled -- see render), but the sun still sees them: a
+      -- handful of cutouts per meadow, unlike the grass left out below.
+      -- Every thin card from here down is SNUGGED toward the sun along its own
+      -- ray (ShadowMap.snug) so its shadow keeps contact with its feet instead
+      -- of starting a bias-width away.
+      ShadowMap.draw(ChunkMesher.flowers(state.map), atlasFor(state.map),
+                     ShadowMap.snug(nil))
+      for _, nb in ipairs(state.neighbors or {}) do
+        ShadowMap.draw(ChunkMesher.flowers(nb.map), atlasFor(nb.map),
+                       ShadowMap.snug(Mat4.translate(nb.ox, 0, nb.oy)))
+      end
+      -- From here down it is the CAST, marked as such in the map (see
+      -- ShadowMap.sprites) so water can decline them: everything the world casts
+      -- still shades a lake, a silhouette of somebody standing beside it does
+      -- not. Ground, roofs and the characters themselves take them as before.
+      ShadowMap.sprites(true)
+      -- authored figures cast too, for the same reason the flowers do: a
+      -- handful of cards per map, and a person with no shadow reads as pasted on
+      eachFigure(state.map, 0, 0, function(mesh, _, caster)
+        ShadowMap.draw(mesh, atlasFor(state.map), ShadowMap.snug(caster))
+      end)
+      for _, nb in ipairs(state.neighbors or {}) do
+        eachFigure(nb.map, nb.ox, nb.oy, function(mesh, _, caster)
+          ShadowMap.draw(mesh, atlasFor(nb.map), ShadowMap.snug(caster))
+        end)
+      end
+      -- the STADIUM models: geometry, not cut-outs (see BattleScene.castShadows
+      -- for why they are un-snugged and outside the sprite flag)
+      pcall(function()
+        local stageArena, stageY = V.require("OverworldBattle").stage()
+        if stageArena and stageArena.discs then
+          V.require("StadiumStage").cast(ShadowMap, stageArena, stageY or 0)
+        end
+        V.require("Stadium").cast(ShadowMap)
+      end)
+      ShadowMap.sprites(false)
+      ShadowMap.finish(worldSig, false)
     end)
-    ShadowMap.sprites(false)
-    ShadowMap.finish(worldSig, false)
+    if not ok then
+      ShadowMap.abort()
+      pcall(print, "[PotatoVoxel] shadow world pass aborted: " .. tostring(err))
+    end
   end
 
   -- sprite layer: posed characters + battle cards, snugged and marked as
   -- the cast so water declines them. Only when a sprite actually moved.
   if spriteLayer and (spriteStale or worldStale) then
-    if not ShadowMap.begin(cx, cy, vw, vh, true) then return end
-    ShadowMap.sprites(true)
-    for _, p in ipairs(posed) do
-      local def = p.sprite.def
-      -- viewFacing, exactly as the camera draw picks it (see viewFacing for
-      -- why the two passes must agree): in first person the sun's card
-      -- swaps frame as the eye circles, which costs a redraw the signature
-      -- already charges for (FirstPerson.signature) and keeps a card from
-      -- fringing against a mirror-flipped record of itself
-      local frame, mirror = frameFor(def, viewFacing(p), p.phase, p.flip)
-      local mesh = SpriteBillboards.shadowQuad(def, frame)
-      if mesh then
-        ShadowMap.draw(mesh, p.sprite:resolveImage(),
-                       ShadowMap.snug(
-                         Voxel3D.casterMatrix(p.px, p.py, p.gh + (p.lift or 0),
-                                              mirror)))
+    local ok = pcall(function()
+      if not ShadowMap.begin(cx, cy, vw, vh, true) then return end
+      ShadowMap.sprites(true)
+      for _, p in ipairs(posed) do
+        local def = p.sprite.def
+        -- viewFacing, exactly as the camera draw picks it (see viewFacing for
+        -- why the two passes must agree): in first person the sun's card
+        -- swaps frame as the eye circles, which costs a redraw the signature
+        -- already charges for (FirstPerson.signature) and keeps a card from
+        -- fringing against a mirror-flipped record of itself
+        local frame, mirror = frameFor(def, viewFacing(p), p.phase, p.flip)
+        local mesh = SpriteBillboards.shadowQuad(def, frame)
+        if mesh then
+          ShadowMap.draw(mesh, p.sprite:resolveImage(),
+                         ShadowMap.snug(
+                           Voxel3D.casterMatrix(p.px, p.py, p.gh + (p.lift or 0),
+                                                mirror)))
+        end
       end
-    end
-    -- a staged fight's mons (VR frames only): the same cards the eye pass
-    -- stands on the arena, snugged like every thin card, marked as the cast
-    -- so the water can decline them like everybody else's silhouette
-    for _, card in ipairs(battleCards or {}) do
-      ShadowMap.draw(BattleBillboard.mesh(), card.tex, ShadowMap.snug(card.model))
-    end
-    ShadowMap.sprites(false)
-    ShadowMap.finish(spriteSig, true)
+      -- a staged fight's mons (VR frames only): the same cards the eye pass
+      -- stands on the arena, snugged like every thin card, marked as the cast
+      -- so the water can decline them like everybody else's silhouette
+      for _, card in ipairs(battleCards or {}) do
+        ShadowMap.draw(BattleBillboard.mesh(), card.tex, ShadowMap.snug(card.model))
+      end
+      ShadowMap.sprites(false)
+      ShadowMap.finish(spriteSig, true)
+    end)
+    if not ok then ShadowMap.abort() end
   end
 end
 
