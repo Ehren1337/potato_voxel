@@ -1095,12 +1095,22 @@ function VoxelScene.render(state, w, h, vw, vh, paletteFor, eyes)
   local actorMapActive = BrickProfile.actorShadowMapEnabled(Voxel.level)
                         and ShadowMap.active(true)
   if shadowsOn and (not Voxel3D.shadowsActive() or not actorMapActive) then
-    Voxel3D.beginShadows()
-    for _, p in ipairs(posed) do
-      drawShadow(p.sprite, p.anchorX or p.px, p.anchorY or p.py,
-                 viewFacing(p), p.phase, p.flip, p.gh, p.lift)
+    -- pcall-wrapped: a throw in one decal (a driver-specific mesh failure)
+    -- used to abort the whole scene draw -- the engine then kept compositing
+    -- the previous frame's canvas, which reads as a FROZEN screen the player
+    -- can still walk around in. One broken decal now costs only itself.
+    local ok = pcall(function()
+      Voxel3D.beginShadows()
+      for _, p in ipairs(posed) do
+        drawShadow(p.sprite, p.anchorX or p.px, p.anchorY or p.py,
+                   viewFacing(p), p.phase, p.flip, p.gh, p.lift)
+      end
+      Voxel3D.endShadows()
+    end)
+    if not ok then
+      pcall(Voxel3D.endShadows, Voxel3D)
+      pcall(print, "[PotatoVoxel] actor decal pass aborted")
     end
-    Voxel3D.endShadows()
   end
 
   -- and the water over the top of it, reflecting everything just drawn plus

@@ -222,6 +222,29 @@ ShadowMap.bias = 0
 
 local getBlank
 
+-- Mediatek/Mali detection. On Mali GPUs the blob-decal actor path (the
+-- fallback MEDIUM and lower rungs use) misbehaves -- frozen last frame,
+-- black frames, no actor shadow at all -- while the HIGH configuration
+-- (the sprite-layer map) works. BrickProfile reads this to give every
+-- active rung the HIGH shadow path on such devices. Cached; the result
+-- cannot change mid-session.
+local maliDevice = nil
+function ShadowMap.isMali()
+  if maliDevice ~= nil then return maliDevice end
+  maliDevice = false
+  if love and love.graphics and love.graphics.getRendererInfo then
+    local ok, info = pcall(love.graphics.getRendererInfo)
+    if ok and info and info.name then
+      maliDevice = info.name:lower():find("mali", 1, true) ~= nil
+    end
+  end
+  return maliDevice
+end
+-- Test seam: forget the cached answer so the suite can stub a device.
+function ShadowMap._maliReset()
+  maliDevice = nil
+end
+
 local function getShader()
   if shader == nil then
     local ok, sh = pcall(love.graphics.newShader, SHADER)

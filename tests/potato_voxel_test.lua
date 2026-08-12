@@ -97,6 +97,29 @@ if brick then
   T.check(ShadowMap._source():find("c.z == c.z", 1, true),
           "shadow shader stores far depth instead of NaN")
   T.check(ShadowMap.abort ~= nil, "abort() exists for pcall error handlers")
+  -- Mali (Mediatek) devices: every active rung takes the proven HIGH actor
+  -- shadow path -- the blob decal fallback is what freezes/black-frames them
+  local loveG = love and love.graphics
+  local oldRendererInfo = loveG and loveG.getRendererInfo
+  if loveG then
+    loveG.getRendererInfo = function() return { name = "Mali-G57 MC2" } end
+  end
+  ShadowMap._maliReset()
+  T.check(ShadowMap.isMali() == (loveG ~= nil),
+          "a Mali renderer string is detected")
+  if loveG then
+    T.check(brick.actorShadowMapEnabled(2),
+            "Mali: MEDIUM keeps the actor shadow map")
+    T.check(brick.actorShadowMapEnabled(5),
+            "Mali: CUSTOM keeps the actor shadow map")
+    T.check(not brick.actorShadowMapEnabled(0),
+            "Mali: OFF still disables it")
+  end
+  if loveG then loveG.getRendererInfo = oldRendererInfo end
+  ShadowMap._maliReset()
+  T.check(not ShadowMap.isMali(), "a non-Mali renderer is not detected")
+  T.check(not brick.actorShadowMapEnabled(2),
+          "non-Mali: MEDIUM keeps the decal fallback")
   T.eq(Water.setting.values[1], "off", "WATER defaults off")
   T.eq(#Water.setting.values, 3, "WATER ladder stays available")
   T.eq(ForestAtmos.setting.values[1], "off", "FOREST FX defaults off")
