@@ -165,6 +165,20 @@ local function sceneSize(ctx)
 end
 
 local voidFill = { last = nil }
+-- Called after the engine applies a save's options (Game:applyOptions):
+-- the fill that just landed IS the save's declared value, so the change
+-- detector is re-seeded instead of treating the boot/load transition as
+-- a user edit. The game.ready-time cache check runs under the skeleton
+-- save's defaults, and CONTINUE then applies the real slot options -- the
+-- old code read that as a VOID FILL change and invalidated the manifest,
+-- which is why the title gate asked to rebuild on every single launch
+-- even though the cache matched the save exactly (F1). A real change
+-- still invalidates: the OPTIONS row calls setVoidFill directly, never
+-- applyOptions, so check() catches it on the next tick.
+function voidFill.reseed()
+  local TileRenderer = require("src.render.TileRenderer")
+  voidFill.last = TileRenderer.voidFill
+end
 function voidFill.check()
   local TileRenderer = require("src.render.TileRenderer")
   local now = TileRenderer.voidFill
@@ -172,6 +186,18 @@ function voidFill.check()
     ChunkMesher.invalidate()   -- no map id: every ring on every map is stale
   end
   voidFill.last = now
+end
+
+do
+  local Game = require("src.core.Game")
+  if not Game.dramaticShapeApplyOptionsHook then
+    local applyOptions = Game.applyOptions
+    function Game:applyOptions(opts)
+      applyOptions(self, opts)
+      voidFill.reseed()
+    end
+    Game.dramaticShapeApplyOptionsHook = true
+  end
 end
 
 mod.content.render_pipelines:register("voxel", {
@@ -904,8 +930,15 @@ local function showCacheStatus(game)
             or mode == "raw" and "READY (RAW)"
             or "READY"
   end
+  -- which backend created the cache dir: the love.filesystem tree or the
+  -- mkdir shell fallback -- so a support report names the active path
+  local backend = MeshCache.dirBackend()
+  local backendLabel = backend == "love" and "LOVE FS"
+      or backend == "mkdir" and "MKDIR"
+      or "NONE"
   game.stack:push(TextBox.new(game,
-    ("%s\fGEOMETRY %d"):format(label, MeshCache.GEOMETRY_VERSION)))
+    ("%s\fGEOMETRY %d\fDIR: %s"):format(label, MeshCache.GEOMETRY_VERSION,
+                                          backendLabel)))
 end
 
 local function confirmCacheWipe(game)
@@ -1017,45 +1050,52 @@ mod.content.screens:register("PotatoVoxelSettings", {
   end,
 })
 
-local function startTitleAction(game, action)
-  if CachePrebuild.isReady() or not CachePrebuild.available() then
-    action()
-    return
-  end
+-- The cache build gate, moved OFF the title menu (F1). The game.ready-time
+-- readiness check runs under the skeleton save's DEFAULT options, so a
+-- player whose save chose another VOID FILL read as "cache stale" on every
+-- launch even when the cache matched the save exactly. The READY re-check
+-- and the one-time prompt now run AFTER the engine applies the save's own
+-- options: CONTINUE lands here from restoreSave, NEW GAME from
+-- makeTitleState's onNewGame callback. The prompt is a modal over whatever
+-- the save left on top (the overworld, Oak's speech), and an accepted
+-- build runs cooperatively in the background exactly like the
+-- OPTIONS-menu prebuild.
+local function gateCacheBuild(game)
+  CachePrebuild.refresh(game)
+  if CachePrebuild.isReady() or not CachePrebuild.available() then return end
   local TextBox = require("src.render.TextBox")
   game.stack:push(TextBox.new(game, "MAP CACHE\nNOT READY.\fBUILD NOW?", nil, {
     defaultNo = true,
     choice = function(yes)
-      if not yes then
-        action()
-        return
+      if yes and CachePrebuild.start(game) then
+        local Progress = V.require("CachePrebuildScreen")
+        game.stack:push(Progress.new(game))
       end
-      if not CachePrebuild.start(game) then
-        action()
-        return
-      end
-      local Progress = V.require("CachePrebuildScreen")
-      game.stack:push(Progress.new(game, action, function()
-        local title = game.stack:top()
-        if title and title.openMenu then title:openMenu() end
-      end))
     end,
   }))
 end
 
-mod.hooks:wrap("ui.title_menu.items", function(next, game, items)
-  local out = next(game, items)
-  if type(out) ~= "table" then return out end
-  local Strings = require("src.core.Strings")
-  local labels = { [Strings("CONTINUE")] = true, [Strings("NEW GAME")] = true }
-  for _, item in ipairs(out) do
-    if type(item) == "table" and labels[item.label] and item.onSelect then
-      local action = item.onSelect
-      item.onSelect = function() startTitleAction(game, action) end
+do
+  local Game = require("src.core.Game")
+  if not Game.dramaticShapeCacheGateHook then
+    local restoreSave = Game.restoreSave
+    function Game:restoreSave(loaded, recovered)
+      restoreSave(self, loaded, recovered)
+      gateCacheBuild(self)
     end
+    local makeTitleState = Game.makeTitleState
+    function Game:makeTitleState()
+      local title = makeTitleState(self)
+      local onNewGame = title.onNewGame
+      title.onNewGame = function()
+        onNewGame()
+        gateCacheBuild(self)
+      end
+      return title
+    end
+    Game.dramaticShapeCacheGateHook = true
   end
-  return out
-end)
+end
 
 -- The realtime diagnostics panel: when enabled by benchmark instrumentation,
 -- the mod owns a screen-space overlay over the finished frame. render.hud fires once per

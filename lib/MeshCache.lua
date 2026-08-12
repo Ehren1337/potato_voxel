@@ -62,6 +62,24 @@ local dataKey = "unconfigured"
 local dirty = false
 local compression = "unknown"
 local MANIFEST = "cache.info"
+local BUILD_INFO = "build.info"
+-- Populated by ready() whenever it returns false, so a caller (the boot
+-- path) can report exactly WHY the cache was rejected -- an identity drift
+-- between the build session and this launch, or payload files that did not
+-- survive. nil after a successful ready().
+local lastFailure = nil
+-- Snapshot of identity() captured at begin(): every payload file and the
+-- manifest written by that build session share ONE identity even if a live
+-- component (voidFill) changes mid-build. Cleared when the build finishes.
+local buildIdentity = nil
+-- Components of the build-session identity, captured at begin() for the
+-- build.info sidecar so a later launch can compare against the live identity.
+local buildParts = nil
+-- Per-session write-error tracking (F5): every saveTerrain/saveWater/saveAux
+-- write failure is remembered, so a build that dies to a full SD card or a
+-- read-only folder says WHY instead of "cache verification failed".
+local lastSaveError = nil
+local saveFailures = 0
 
 -- Bump when the meshing algorithm changes the vertex/UV output, so a
 -- cache written by an older build is never trusted by a newer one. (The
@@ -168,6 +186,9 @@ local function datasetRevision(data)
       hash = hashString(hash, direction)
       hash = hashString(hash, connection.map)
       hash = hashString(hash, connection.offset)
+      -- hashed defensively: no shipped dataset carries it today, but a
+      -- walkable-capped connection would change the meshed strip
+      hash = hashString(hash, connection.walkable)
     end
   end
   local tilesets = data and data.tilesets or {}
@@ -178,6 +199,15 @@ local function datasetRevision(data)
     hash = hashString(hash, tileset.trueColor)
     hash = hashString(hash, tileset.tilesPerRow)
     hash = hashValues(hash, tileset.blocks)
+    -- The tileset fields the mesher reads but the revision used to skip:
+    -- a dataset that moved which tiles are walkable, counters, doors,
+    -- warps or grass would have produced identical geometry from stale
+    -- cache files (F6).
+    hash = hashValues(hash, tileset.walkable)
+    hash = hashValues(hash, tileset.counterTiles)
+    hash = hashValues(hash, tileset.doorTiles)
+    hash = hashValues(hash, tileset.warpTiles)
+    hash = hashString(hash, tileset.grassTile)
   end
   return tostring(hash)
 end
@@ -187,18 +217,57 @@ local function activeVersion()
   return "red"
 end
 
-local function identity()
+local function identityParts()
   local okTR, TileRenderer = pcall(require, "src.render.TileRenderer")
   local voidFill = (okTR and TileRenderer and TileRenderer.voidFill) or "trees"
   local profile = Brick.isBrick() and "b" or "f"
-  return table.concat({ "PVMC1", MeshCache.GEOMETRY_VERSION, activeVersion(),
-                        profile, dataKey, tostring(voidFill) }, "|")
+  return {
+    format = "PVMC1",
+    version = MeshCache.GEOMETRY_VERSION,
+    activeVersion = activeVersion(),
+    profile = profile,
+    dataKey = dataKey,
+    voidFill = tostring(voidFill),
+  }
+end
+
+local function identity()
+  local parts = identityParts()
+  return table.concat({ parts.format, parts.version, parts.activeVersion,
+                        parts.profile, parts.dataKey, parts.voidFill }, "|")
+end
+
+-- Compares two identity strings (expected vs actual) and returns the names of
+-- the components that differ, so diagnostics can pinpoint a drift.
+local IDENTITY_COMPONENTS = { "format", "version", "activeVersion", "profile",
+                              "dataKey", "voidFill" }
+
+local function splitIdentity(id)
+  local parts = {}
+  for part in tostring(id):gmatch("([^|]*)") do
+    if part ~= "" then parts[#parts + 1] = part end
+  end
+  return parts
+end
+
+local function identityDiff(expected, actual)
+  local e = splitIdentity(expected)
+  local a = splitIdentity(actual)
+  local diffs = {}
+  for i, name in ipairs(IDENTITY_COMPONENTS) do
+    if e[i] ~= a[i] then diffs[#diffs + 1] = name end
+  end
+  return diffs
 end
 
 function MeshCache.configure(data)
   dataKey = datasetRevision(data)
   dirty = false
   compression = "unknown"
+  -- A new configuration starts a fresh session: drop any snapshot from a
+  -- previous build so live identity() is authoritative until begin() runs.
+  buildIdentity = nil
+  buildParts = nil
 end
 
 function MeshCache.isDirty()
@@ -214,7 +283,9 @@ MeshCache.identity = identity
 -- ---------------------------------------------------------- availability
 
 local dirTried = false
+local dirTriedAt = 0            -- os.clock() of the last attempt
 local cacheDir = false          -- resolved once; false when unusable
+local dirBackend = nil          -- how the dir was created: "love" or "mkdir"
 
 -- The shell commands that create the cache directory tree. Windows cmd has
 -- no `mkdir -p`: it cannot create missing parents and errors when the
@@ -251,21 +322,56 @@ function MeshCache.available()
   return MeshCache.dir() ~= nil
 end
 
+-- Real io write probe: the cache writes every payload through io.*, so an
+-- io round-trip is the ground truth for "usable", whatever backend made
+-- the directory. Exported so the headless suite can probe paths directly.
+local function probeWritable(dir)
+  if not dir or dir == "" then return false end
+  local probe = dir .. "/.write_probe"
+  local f = io.open(probe, "wb")
+  if not f then return false end
+  local ok = f:write("x") ~= nil
+  f:close()
+  os.remove(probe)
+  return ok
+end
+
 -- The cache directory, resolved and created on first use. On the Brick
 -- this is the portable (SD-card) folder; everywhere else it is the LÖVE
 -- save directory -- the engine's own io-rooted save location (on macOS
 -- that resolves to ~/Library/Application Support/LOVE/<identity>/, the
 -- folder the engine actually reads). nil when no writable root exists
 -- (then everything no-ops).
+--
+-- Creation tries love.filesystem.createDirectory FIRST -- it makes the
+-- whole tree on desktop and needs no shell -- and only falls back to the
+-- mkdir command list (the only option in portable mode, whose SD-card
+-- folder sits outside love.filesystem's root). The resolved directory is
+-- then verified with a real io write probe, so a folder that can be
+-- created but not written to is caught here instead of mid-build.
+--
+-- A FAILURE is retried, not cached forever: one early os.execute hiccup
+-- (a mid-boot SD-card mount, a shell under load) used to disable the
+-- cache for the whole session. A success is cached for the session; a
+-- failure only suppresses retries for one second, so the next boot check
+-- or save re-attempts the mkdir instead of silently giving up.
 function MeshCache.dir()
-  if dirTried then return cacheDir end
+  if cacheDir then return cacheDir end
+  local clock = os.clock
+  local now = clock and clock() or 0
+  if dirTried and now - dirTriedAt < 1 then return nil end
   dirTried = true
+  dirTriedAt = now
   cacheDir = false
+  dirBackend = nil
   local okBase, base
+  local portable = false
   if SaveData then
     okBase, base = pcall(function() return SaveData.portableBaseDir() end)
   end
-  if not (okBase and base) then
+  if okBase and base then
+    portable = true
+  else
     -- Desktop / non-portable: fall back to the LÖVE save directory. No
     -- platform branches -- the Brick keeps its SD-card portable root,
     -- everything else lands here.
@@ -277,15 +383,39 @@ function MeshCache.dir()
   local sep = package.config:sub(1, 1)
   local d = base .. sep .. "mod-derived" .. sep .. "potato_voxel"
             .. sep .. "meshes"
-  -- io.* cannot create missing parents; mkdir the tree like the engine's
-  -- portable filesystem does. Failure stays a silent no-op (nil above).
+  -- 1) love.filesystem.createDirectory: whole tree, no shell. Portable
+  -- mode skips it -- the SD card is outside love.filesystem's root.
+  if not portable and love and love.filesystem
+     and love.filesystem.createDirectory then
+    local created = pcall(love.filesystem.createDirectory,
+                          "mod-derived/potato_voxel/meshes")
+    if created and probeWritable(d) then
+      cacheDir = d
+      dirBackend = "love"
+      return d
+    end
+  end
+  -- 2) mkdir fallback -- the only path in portable mode, and the retry
+  -- path when love.filesystem was unavailable or the folder unwritable.
+  -- io.* cannot create missing parents, so mkdir the tree like the
+  -- engine's portable filesystem does. Failure stays a silent no-op.
   for _, command in ipairs(mkdirCommands(d, sep)) do
     local ok = os.execute(command)
     if not (ok == true or ok == 0) then return nil end
   end
+  if not probeWritable(d) then return nil end
   cacheDir = d
+  dirBackend = "mkdir"
   return d
 end
+
+-- Which backend created the cache directory: "love" (love.filesystem),
+-- "mkdir" (shell commands), or nil (unresolved/unavailable). Shown in the
+-- CACHE STATUS details box.
+function MeshCache.dirBackend()
+  return dirBackend
+end
+MeshCache.probeWritable = probeWritable
 
 -- ------------------------------------------------------------- storage io
 
@@ -307,6 +437,15 @@ local function writeFile(path, data)
   f:close()
   if not ok then os.remove(tmp) return false end
   local ok2 = os.rename(tmp, path)
+  if not ok2 and package.config:sub(1, 1) == "\\" then
+    -- MSVCRT's rename fails when the destination exists (POSIX replaces
+    -- it, which is why this never runs off Windows). The self-heal path
+    -- rewrites cache.info over an existing file every boot it has to
+    -- recover, so on Windows that recovery used to fail silently and the
+    -- prompt came back on EVERY launch. Drop the target and retry once.
+    os.remove(path)
+    ok2 = os.rename(tmp, path)
+  end
   if not ok2 then os.remove(tmp) return false end
   return true
 end
@@ -319,8 +458,26 @@ end
 function MeshCache.begin()
   dirty = true
   compression = "unknown"
-  local path = manifestPath()
-  if path then os.remove(path) end
+  -- Snapshot the identity at the START of a build session. Every payload
+  -- file and the manifest written by this session share this one identity,
+  -- even if a live component (e.g. voidFill) changes mid-build. This removes
+  -- the "identity drifted between begin() and finish()" failure class.
+  buildIdentity = identity()
+  buildParts = identityParts()
+  lastFailure = nil
+  lastSaveError = nil
+  saveFailures = 0
+  -- The manifest is KEPT, not deleted. Deleting it here meant a build
+  -- interrupted before finish() (an Android background kill, a battery
+  -- pull) left no manifest behind at all -- and the next boot saw only
+  -- orphaned payloads and prompted for a rebuild on every single launch.
+  -- Keeping it is safe: payload writes are atomic (tmp + rename), so the
+  -- files a mid-build death leaves behind are each EITHER the old
+  -- complete payload or the new complete payload, and the fingerprint
+  -- check accepts whichever mix survived when the identity matches.
+  -- Prebuild overwrites the manifest per job (writeProgress) so even the
+  -- very first build leaves a manifest describing exactly the jobs that
+  -- finished.
 end
 
 -- ------------------------------------------------------------- fingerprint
@@ -333,7 +490,8 @@ local function fingerprint(map, slot)
   local tileset = (map.tileset and map.tileset.image) or "?"
   local trueColor = (map.tileset and map.tileset.trueColor) and "1" or "0"
   local atlas = (map.renderer and map.renderer.gbcAtlas) and "g" or "s"
-  return identity() .. "|" .. tostring(map.id) .. "|" .. tostring(slot) .. "|"
+  local id = buildIdentity or identity()
+  return id .. "|" .. tostring(map.id) .. "|" .. tostring(slot) .. "|"
          .. tileset .. "|" .. trueColor .. "|" .. atlas
 end
 
@@ -750,11 +908,15 @@ function MeshCache.verifyJob(map, slot)
      and safeValidPayload(dir .. "/" .. record.aux, record.auxFp, "aux")
 end
 
+-- Returns (manifest, failReason, manifestIdentity) where failReason is nil on
+-- success, or one of "no_dir", "missing", "format", "identity", "records".
+-- manifestIdentity is the identity string read from the manifest header, so
+-- an identity mismatch can be diffed against the live identity.
 local function readManifest()
   local path = manifestPath()
-  if not path then return nil end
+  if not path then return nil, "no_dir" end
   local text = readFile(path)
-  if not text then return nil end
+  if not text then return nil, "missing" end
   local lines = {}
   for line in text:gmatch("[^\n]+") do lines[#lines + 1] = line end
   local format, manifestIdentity, total
@@ -762,81 +924,195 @@ local function readManifest()
     format, manifestIdentity, total =
       lines[1]:match("^(%S+)%s+(%S+)%s+(%d+)$")
   end
-  if format ~= "PVMC1" or manifestIdentity ~= identity() then return nil end
+  if format ~= "PVMC1" then return nil, "format" end
+  if manifestIdentity ~= identity() then
+    return nil, "identity", manifestIdentity
+  end
   local records = {}
   for i = 2, #lines do
     local key, terrain, terrainFp, water, waterFp, aux, auxFp =
       lines[i]:match("^job\t([^\t]+)\t([^\t]+)\t([^\t]+)\t([^\t]+)\t([^\t]+)\t([^\t]+)\t([^\t]+)$")
-    if not key then return nil end
+    if not key then return nil, "records" end
     records[key] = { key = key, terrain = terrain, terrainFp = terrainFp,
                      water = water, waterFp = waterFp, aux = aux, auxFp = auxFp }
   end
   return { total = tonumber(total), records = records }
 end
 
+local function setLastFailure(reason, detail)
+  lastFailure = { reason = reason, expected = identity() }
+  if detail then
+    for k, v in pairs(detail) do lastFailure[k] = v end
+  end
+end
+
 function MeshCache.ready(jobs)
-  if dirty or not MeshCache.available() then return false, 0 end
-  local manifest = readManifest()
-  if not manifest or manifest.total ~= #jobs then
+  if dirty or not MeshCache.available() then
+    setLastFailure(dirty and "dirty" or "unavailable")
+    return false, 0
+  end
+  local manifest, failReason, manifestIdentity = readManifest()
+  if not manifest then
+    if failReason == "identity" then
+      -- The definitive diagnostic: the manifest was built under a different
+      -- identity than the live one. Report it as the primary reason; a
+      -- self-heal scan can only succeed if files were rebuilt under the live
+      -- identity, and even then the mismatch is what a user needs to know.
+      setLastFailure("identity_mismatch", {
+        actual = manifestIdentity,
+        diffs = identityDiff(manifestIdentity, identity()),
+      })
+    elseif failReason == "missing" or failReason == "no_dir" then
+      setLastFailure("no_manifest")
+    else
+      setLastFailure("corrupt_manifest", { reason = failReason })
+    end
     local dir = MeshCache.dir()
     local records, done = {}, 0
     for _, job in ipairs(jobs or {}) do
       local record = scanJob(job, dir)
-      if not record then return false, done end
+      if not record then
+        -- Preserve the identity_mismatch diagnostic when present (the scan
+        -- failing against live identity is the expected consequence).
+        if lastFailure.reason ~= "identity_mismatch" then
+          setLastFailure("file_missing", { job = tostring(job.id) .. "/"
+            .. tostring(job.slot) })
+        end
+        return false, done
+      end
       records[record.key] = record
       done = done + 1
     end
     if done == #jobs and MeshCache.writeManifest(records, #jobs) then
+      lastFailure = nil
       return true, done
     end
     return false, done
+  end
+  if manifest.total ~= #jobs then
+    setLastFailure("total_mismatch",
+      { actual = manifest.total, jobs = #jobs })
+    return false, 0
   end
   local dir = MeshCache.dir()
   local done = 0
   for _, job in ipairs(jobs or {}) do
     local key = tostring(job.id) .. "/" .. tostring(job.slot)
     local record = manifest.records[key]
-    if not record then return false, done end
-    local ok = safeValidHeader(dir .. "/" .. record.terrain, record.terrainFp)
+    local ok = record ~= nil
+           and safeValidHeader(dir .. "/" .. record.terrain, record.terrainFp)
            and safeValidHeader(dir .. "/" .. record.water, record.waterFp)
            and safeValidHeader(dir .. "/" .. record.aux, record.auxFp)
-    if not ok then
-      local records, scanned = {}, 0
-      for _, candidate in ipairs(jobs or {}) do
-        local migrated = scanJob(candidate, dir)
-        if not migrated then return false, done end
-        records[migrated.key] = migrated
-        scanned = scanned + 1
-      end
-      if scanned == #jobs and MeshCache.writeManifest(records, #jobs) then
-        return true, scanned
-      end
-      return false, done
-    end
-    done = done + 1
+    if ok then done = done + 1 end
   end
   if done == #jobs then
+    lastFailure = nil
     updateCompression(manifest.records, dir)
     return true, done
   end
-  return false, done
+  -- Some records are missing or invalid -- a partial manifest from a build
+  -- interrupted before finish(), a file that did not survive -- so rescan
+  -- the actual files. Payload writes are atomic, so whatever survived is a
+  -- COMPLETE old-or-new payload and the scan accepts the mix. A full rescan
+  -- self-heals the manifest (READY); a partial one reports how many jobs
+  -- are done so the prebuild can RESUME instead of restarting from zero.
+  local records, scanned = {}, 0
+  for _, candidate in ipairs(jobs or {}) do
+    local migrated = scanJob(candidate, dir)
+    if migrated then
+      records[migrated.key] = migrated
+      scanned = scanned + 1
+    end
+  end
+  if scanned == #jobs and MeshCache.writeManifest(records, #jobs) then
+    lastFailure = nil
+    return true, scanned
+  end
+  setLastFailure("file_missing", { done = scanned, jobs = #jobs })
+  return false, scanned
 end
 
-function MeshCache.writeManifest(records, total)
+-- The records of every job whose three payload files all survive with the
+-- live identity -- the resume set a boot can hand back to a prebuild that
+-- was interrupted mid-session. File-level, like scanJob, so a manifest is
+-- neither required nor trusted here.
+function MeshCache.scanComplete(jobs)
+  local dir = MeshCache.dir()
+  if not dir then return {}, 0 end
+  local records, done = {}, 0
+  for _, job in ipairs(jobs or {}) do
+    local record = scanJob(job, dir)
+    if record then
+      records[record.key] = record
+      done = done + 1
+    end
+  end
+  return records, done
+end
+
+-- Writes the build.info sidecar: the identity (and its components) that the
+-- cache was actually built with, plus a timestamp. Read at the next launch so
+-- a persistent cache rejection can be diffed against the live identity.
+local function writeBuildInfo(id, parts)
+  local dir = MeshCache.dir()
+  if not dir then return end
+  writeFile(dir .. "/" .. BUILD_INFO, table.concat({
+    "identity=" .. id,
+    "format=" .. parts.format,
+    "version=" .. tostring(parts.version),
+    "activeVersion=" .. tostring(parts.activeVersion),
+    "profile=" .. parts.profile,
+    "dataKey=" .. parts.dataKey,
+    "voidFill=" .. parts.voidFill,
+    "builtAt=" .. tostring(os.time and os.time() or 0),
+  }, "\n") .. "\n")
+end
+
+-- The shared manifest writer: records keyed by job key, `total` the full
+-- job count. writeProgress lets a build UPDATE the manifest after every
+-- completed job (records may be fewer than total), so a build interrupted
+-- before finish() still leaves a manifest naming exactly the jobs whose
+-- files survived. Returns (ok, writtenIdentity).
+local function writeManifestLines(records, total)
   local path = manifestPath()
   if not path or type(records) ~= "table" then return false end
   local keys = sortedKeys(records)
-  if #keys ~= total then return false end
-  local lines = { ("PVMC1\t%s\t%d"):format(identity(), total) }
+  if #keys > total then return false end
+  -- During an active build the manifest carries the begin()-time snapshot so
+  -- it matches every payload file exactly; outside a build (self-heal rescan)
+  -- it carries the live identity the scan was validated against.
+  local id = dirty and buildIdentity or identity()
+  local lines = { ("PVMC1\t%s\t%d"):format(id, total) }
   for _, key in ipairs(keys) do
     local record = records[key]
     lines[#lines + 1] = table.concat({ "job", record.key, record.terrain,
       record.terrainFp, record.water, record.waterFp, record.aux,
       record.auxFp }, "\t")
   end
-  local ok = writeFile(path, table.concat(lines, "\n") .. "\n")
+  return writeFile(path, table.concat(lines, "\n") .. "\n"), id
+end
+
+-- Per-job progress manifest (F3): the prebuild calls this after each job
+-- so an interrupted build leaves a manifest instead of a hole the boot
+-- prompts about forever.
+function MeshCache.writeProgress(records, total)
+  local ok, id = writeManifestLines(records, total)
   if ok then
+    writeBuildInfo(id, buildParts or identityParts())
+  end
+  return ok
+end
+
+function MeshCache.writeManifest(records, total)
+  if not records or #sortedKeys(records) ~= total then return false end
+  local ok, id = writeManifestLines(records, total)
+  if ok then
+    writeBuildInfo(id, buildParts or identityParts())
     dirty = false
+    -- The build session is over: drop the snapshot so any later self-heal
+    -- scan validates against the LIVE identity, not the stale build one.
+    buildIdentity = nil
+    buildParts = nil
     updateCompression(records, MeshCache.dir())
   end
   return ok
@@ -844,24 +1120,45 @@ end
 
 -- ------------------------------------------------------------ save/load
 
+-- A save that cannot write is now SURFACED, not swallowed (F5): the old
+-- pcall only caught thrown errors, so a writeFile that returned false --
+-- a full SD card, a read-only folder, a missing rename target -- vanished
+-- into the next "cache verification failed". The per-session reason lands
+-- in lastSaveError, which Prebuild copies into its failure message.
+local function recordSaveFailure(kind, detail)
+  saveFailures = saveFailures + 1
+  lastSaveError = kind .. (detail and (": " .. tostring(detail)) or "")
+  return false
+end
+
 function MeshCache.saveTerrain(map, slot, buf, n, idx, m)
-  if not MeshCache.dir() then return end
-  local ok = pcall(function()
+  if not MeshCache.dir() then return false end
+  local path = fileFor(map, slot, "terrain")
+  local ok, result = pcall(function()
     local fp = fingerprint(map, slot)
-    writeFile(fileFor(map, slot, "terrain"),
-              packPayload(fp, encodeIndexed(n, buf, m, idx)))
+    return writeFile(path, packPayload(fp, encodeIndexed(n, buf, m, idx)))
   end)
-  if not ok then os.remove(fileFor(map, slot, "terrain") .. ".tmp") end
+  if not ok then
+    os.remove(path .. ".tmp")
+    return recordSaveFailure("terrain", result)
+  end
+  if result ~= true then return recordSaveFailure("terrain") end
+  return true
 end
 
 function MeshCache.saveWater(map, slot, buf, n, idx, m)
-  if not MeshCache.dir() then return end
-  local ok = pcall(function()
+  if not MeshCache.dir() then return false end
+  local path = fileFor(map, slot, "water")
+  local ok, result = pcall(function()
     local fp = fingerprint(map, slot .. "Water")
-    writeFile(fileFor(map, slot, "water"),
-              packPayload(fp, encodeIndexed(n, buf, m, idx)))
+    return writeFile(path, packPayload(fp, encodeIndexed(n, buf, m, idx)))
   end)
-  if not ok then os.remove(fileFor(map, slot, "water") .. ".tmp") end
+  if not ok then
+    os.remove(path .. ".tmp")
+    return recordSaveFailure("water", result)
+  end
+  if result ~= true then return recordSaveFailure("water") end
+  return true
 end
 
 -- The terrain and water for (map, slot), as data records, or nil on a
@@ -895,8 +1192,9 @@ end
 -- { grass = {n=.., buf=..}, flowers = {n=.., buf=..}, figures = {..} } --
 -- produced by ChunkMesher from the Structures quads.
 function MeshCache.saveAux(map, slot, flattened)
-  if not MeshCache.dir() then return end
-  local ok = pcall(function()
+  if not MeshCache.dir() then return false end
+  local path = fileFor(map, slot, "aux")
+  local ok, result = pcall(function()
     local fp = fingerprint(map, slot .. "Aux")
     local body = encodeIndexed(flattened.grass and flattened.grass.n or 0,
                                flattened.grass and flattened.grass.buf,
@@ -907,10 +1205,14 @@ function MeshCache.saveAux(map, slot, flattened)
                                   flattened.flowers and flattened.flowers.m or 0,
                                   flattened.flowers and flattened.flowers.idx)
     local figures = encodeFigures(flattened.figures or {})
-    writeFile(fileFor(map, slot, "aux"),
-              packPayload(fp, body .. flowers .. figures))
+    return writeFile(path, packPayload(fp, body .. flowers .. figures))
   end)
-  if not ok then os.remove(fileFor(map, slot, "aux") .. ".tmp") end
+  if not ok then
+    os.remove(path .. ".tmp")
+    return recordSaveFailure("aux", result)
+  end
+  if result ~= true then return recordSaveFailure("aux") end
+  return true
 end
 
 -- Load the aux streams: { grass, flowers, figures } data records, or nil.
@@ -1059,5 +1361,43 @@ MeshCache.mkdirCommands = mkdirCommands
 -- indexed terrain/water payloads (brick.11+)
 MeshCache.encodeIndexed = encodeIndexed
 MeshCache.decodeIndexed = decodeIndexed
+-- Diagnostics: populated by ready() on failure, cleared on success. Getter
+-- so callers always read the CURRENT failure (the local is reassigned).
+function MeshCache.getLastFailure()
+  return lastFailure
+end
+-- Identity components / diff helpers, exported for boot diagnostics.
+MeshCache.identityParts = identityParts
+MeshCache.identityDiff = identityDiff
+-- Per-session write-failure tracking (F5), for Prebuild's failure message.
+function MeshCache.saveError()
+  return lastSaveError
+end
+function MeshCache.saveFailureCount()
+  return saveFailures
+end
+
+-- Read the build.info sidecar written at build time (nil when absent).
+function MeshCache.readBuildInfo()
+  local dir = MeshCache.dir()
+  if not dir then return nil end
+  local text = readFile(dir .. "/" .. BUILD_INFO)
+  if not text then return nil end
+  local info = {}
+  for line in text:gmatch("[^\n]+") do
+    local k, v = line:match("^([^=]+)=(.*)$")
+    if k then info[k] = v end
+  end
+  return info
+end
+
+-- A build-time snapshot of what this cache was built under, for the
+-- CachePrebuild bootstrap log: the full identity and its components.
+function MeshCache.buildInfoSnapshot()
+  if not buildParts then return nil end
+  local info = { identity = buildIdentity }
+  for k, v in pairs(buildParts) do info[k] = tostring(v) end
+  return info
+end
 
 return MeshCache

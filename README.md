@@ -86,8 +86,10 @@ python3 tools/modkit.py pack mods/potato_voxel
 - **OPTIONS → PREBUILD CACHE** cooperatively builds every map's body and full
   terrain variant, including water and auxiliary meshes. The game checks the
   complete cache at boot and shows **READY** when every current job is present.
-  When the cache is incomplete, selecting **CONTINUE** or **NEW GAME** offers
-  to build it first; choosing NO starts normally. The progress screen can be
+  When the cache is incomplete, **CONTINUE** or **NEW GAME** offers to build it
+  after the save loads (the check runs against the save's actual options, so a
+  matching cache never prompts); choosing NO starts normally. An interrupted
+  build resumes from the jobs it already finished. The progress screen can be
   cancelled, and runtime GPU meshes are released after each map while the disk
   cache remains. The action is available on both desktop and the potato
   profile.

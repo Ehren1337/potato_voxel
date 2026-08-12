@@ -1,5 +1,35 @@
 # Changelog
 
+## [1.4.2] - 2026-08-12
+
+### Fixed
+
+- The map cache no longer asks to rebuild on every launch. The game was
+  checking the cache with default settings before your save loaded, so a
+  save that used a different VOID FILL looked "stale" every time -- even
+  when the cache matched your settings perfectly. The check now runs after
+  your save (and its options) are loaded, and the BUILD NOW? prompt appears
+  over the world instead of the title screen.
+- Interrupted builds now resume. If a build is cut short (the app was
+  backgrounded, the battery died, a crash), the next launch continues from
+  where it stopped instead of starting over or prompting forever.
+- The map cache now refreshes itself once when you update to 1.4.2 (the
+  cache now remembers more detail about your game data, so old files are
+  rebuilt a single time, in the background or on demand).
+- Windows: updating the cache info file no longer fails silently, which
+  could leave the game asking for a rebuild every launch.
+- When a build fails, the game now tells you WHY (a full SD card, a
+  read-only folder) instead of a generic "verification failed".
+- The cache folder is created more reliably: the game tries the normal
+  save-system folder first, then falls back to system commands, and
+  double-checks the folder can actually be written to before using it.
+  **CACHE STATUS** now shows which method was used (LOVE FS / MKDIR / NONE).
+- If the cache folder can't be set up, the game now retries instead of
+  quietly disabling the cache for the whole session.
+- Boot logging: when the cache is rejected, the game log now explains
+  exactly why, which makes "it rebuilds every time" reports much easier to
+  diagnose.
+
 ## [1.4.1] - 2026-08-12
 
 ### Fixed

@@ -72,10 +72,71 @@ function Prebuild.bootstrap(game)
   MeshCache.configure(data)
   local jobs = Prebuild.enumerate(data and data.maps)
   local ready, done = MeshCache.ready(jobs)
+  -- Not READY is no longer "start from zero": a build interrupted
+  -- mid-session (F3) left complete atomic payloads behind, and a rescan
+  -- of the actual files recovers exactly which jobs survived. Those
+  -- become the resume set -- start() skips them and only the missing
+  -- remainder gets rebuilt.
+  local completed = {}
+  if not ready then completed, done = MeshCache.scanComplete(jobs) end
   state = { running = false, cancelled = false, maps = jobs, index = 0,
             slot = nil, done = ready and #jobs or done, total = #jobs,
             game = nil, startedAt = nil, eta = nil, ready = ready,
-            failed = false, error = nil, completed = {} }
+            failed = false, error = nil, completed = completed }
+  -- Boot diagnostics: log the full cache identity, the resolved cache dir,
+  -- and -- when the cache was rejected -- exactly why, plus how it compares
+  -- to the build.info sidecar written at build time. This is the only window
+  -- into a persistent cache rejection on real hardware.
+  local parts = MeshCache.identityParts()
+  local build = MeshCache.readBuildInfo()
+  print("[PotatoVoxel] cache identity: " .. MeshCache.identity())
+  print("[PotatoVoxel]   format=" .. tostring(parts.format)
+    .. " version=" .. tostring(parts.version)
+    .. " activeVersion=" .. tostring(parts.activeVersion)
+    .. " profile=" .. tostring(parts.profile)
+    .. " dataKey=" .. tostring(parts.dataKey)
+    .. " voidFill=" .. tostring(parts.voidFill))
+  print("[PotatoVoxel] cache dir: " .. tostring(MeshCache.dir()))
+  print("[PotatoVoxel] cache ready: " .. tostring(ready) .. " (" .. done
+    .. "/" .. #jobs .. ")")
+  if build then
+    print("[PotatoVoxel] build.info: identity=" .. tostring(build.identity)
+      .. " version=" .. tostring(build.version)
+      .. " activeVersion=" .. tostring(build.activeVersion)
+      .. " profile=" .. tostring(build.profile)
+      .. " dataKey=" .. tostring(build.dataKey)
+      .. " voidFill=" .. tostring(build.voidFill)
+      .. " builtAt=" .. tostring(build.builtAt))
+    if ready then
+      print("[PotatoVoxel]   build identity matches live identity")
+    else
+      local diffs = MeshCache.identityDiff(build.identity, MeshCache.identity())
+      print("[PotatoVoxel]   build identity differs in: "
+        .. (#diffs > 0 and table.concat(diffs, ",") or "?"))
+    end
+  end
+  if not ready then
+    local failure = MeshCache.getLastFailure()
+    if failure then
+      print("[PotatoVoxel] cache rejected: " .. tostring(failure.reason))
+      if failure.expected then
+        print("[PotatoVoxel]   expected=" .. tostring(failure.expected))
+      end
+      if failure.actual then
+        print("[PotatoVoxel]   actual=" .. tostring(failure.actual))
+      end
+      if failure.diffs and #failure.diffs > 0 then
+        print("[PotatoVoxel]   diffs=" .. table.concat(failure.diffs, ","))
+      end
+      if failure.job then
+        print("[PotatoVoxel]   job=" .. tostring(failure.job))
+      end
+    end
+    if done > 0 then
+      print("[PotatoVoxel]   resumable: " .. done .. "/" .. #jobs
+        .. " jobs already complete")
+    end
+  end
   return ready
 end
 
@@ -112,7 +173,7 @@ local function finish(cancelled)
     state.ready = MeshCache.writeManifest(state.completed, state.total)
     if not state.ready then
       state.failed = true
-      state.error = "manifest write failed"
+      state.error = MeshCache.saveError() or "manifest write failed"
     end
   end
   state.running, state.cancelled = false, cancelled or false
@@ -148,10 +209,21 @@ function Prebuild.start(game)
   local jobs = Prebuild.enumerate(data and data.maps)
   if #jobs == 0 or not MeshCache.available() then return false end
   MeshCache.begin()
-  state = { running = true, cancelled = false, maps = jobs, index = 1,
-            slot = nil, done = 0, total = #jobs, game = game,
+  -- RESUME (F3): jobs the boot scan found complete are skipped, so a
+  -- prebuild interrupted mid-session finishes the remainder instead of
+  -- rebuilding everything from zero. A fresh build (empty completed)
+  -- starts at the first job as before.
+  local completed = state.completed or {}
+  local index = 1
+  for i, job in ipairs(jobs) do
+    local key = tostring(job.id) .. "/" .. tostring(job.slot)
+    if not completed[key] then index = i; break end
+    index = i + 1
+  end
+  state = { running = true, cancelled = false, maps = jobs, index = index,
+            slot = nil, done = index - 1, total = #jobs, game = game,
             startedAt = now(), eta = nil, ready = false,
-            failed = false, error = nil, completed = {} }
+            failed = false, error = nil, completed = completed }
   return true
 end
 
@@ -169,8 +241,43 @@ function Prebuild.wipe(game)
     ChunkMesher.invalidate()
     state.ready, state.cancelled, state.failed = false, false, false
     state.done, state.total, state.error = 0, #jobs, nil
+    state.completed = {}
   end
   return ok
+end
+
+local function countKeys(table_)
+  local count = 0
+  for _ in pairs(table_ or {}) do count = count + 1 end
+  return count
+end
+
+-- Re-evaluate readiness against the live identity and files, and update
+-- the resume set. Called after the engine applies a save's real options
+-- (CONTINUE's restoreSave / NEW GAME's onNewGame): the game.ready-time
+-- check ran under the skeleton save's defaults, and a player's VOID FILL
+-- choice would otherwise read as a stale cache on every launch (F1).
+function Prebuild.refresh(game)
+  if state.running then return end
+  local data = game and game.data
+  local jobs = Prebuild.enumerate(data and data.maps)
+  if #jobs ~= state.total then
+    -- the dataset changed under us (hot reload): full re-bootstrap
+    return Prebuild.bootstrap(game)
+  end
+  local ready, done = MeshCache.ready(jobs)
+  state.ready = ready
+  if ready then
+    state.done = #jobs
+    state.failed, state.error = false, nil
+    state.completed = {}
+  else
+    local completed = MeshCache.scanComplete(jobs)
+    state.completed = completed
+    state.done = countKeys(completed)
+  end
+  state.total = #jobs
+  return ready
 end
 
 -- Keep the options-row decision separate from the UI so the READY path can be
@@ -201,12 +308,18 @@ function Prebuild.update()
   if jobStatus == "pending" then return end
   if jobStatus ~= "complete" or not MeshCache.verifyJob(state.slot, job.slot) then
     state.failed = true
-    state.error = jobStatus or "cache verification failed"
+    state.error = jobStatus
+      or MeshCache.saveError()
+      or "cache verification failed"
     finish(false)
     return
   end
   state.completed[tostring(job.id) .. "/" .. tostring(job.slot)] =
     MeshCache.jobRecord(state.slot, job.slot)
+  -- Update the manifest per completed job (F3): an interrupted build now
+  -- leaves a manifest naming exactly the jobs whose files survived, so
+  -- the next boot resumes instead of prompting forever.
+  MeshCache.writeProgress(state.completed, state.total)
   releaseMap(job.id, state.game)
   state.done = state.done + 1
   state.index = state.index + 1
