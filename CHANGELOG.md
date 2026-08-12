@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.4.4] - 2026-08-12
+
+### Fixed
+
+- Mediatek/Mali devices: every voxel rung now uses the HIGH shadow path
+  (the sprite-layer map) instead of the flat contact-blob fallback. The
+  fallback path is what froze the screen on the last frame (the game kept
+  running behind it) and dropped the player's shadow on MEDIUM/LOW/POTATO/
+  CUSTOM -- the exact rungs that break are the ones HIGH's configuration
+  never touches, and users confirmed HIGH works. The decal pass is also
+  now crash-proofed so a failing decal can no longer freeze a frame on any
+  device.
+
 ## [1.4.3] - 2026-08-12
 
 ### Fixed

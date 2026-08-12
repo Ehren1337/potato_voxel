@@ -66,10 +66,21 @@ end
 -- animated actor layer, on desktop, Android, and the Brick. MEDIUM and lower
 -- keep the existing contact/blob decal fallback for actors. The world layer
 -- remains governed by the renderer's existing shadow gates.
+--
+-- One exception: Mali (Mediatek) GPUs break on the decal fallback path --
+-- frozen last frame, black frames, missing actor shadows -- while the
+-- sprite-layer map works. Every active rung gets the sprite layer there, so
+-- a Mediatek phone renders the actor shadow the same proven way on CUSTOM
+-- that it does on HIGH.
 BrickProfile.DESKTOP_HIGH_LEVEL = 1
 BrickProfile.DESKTOP_MEDIUM_LEVEL = 2
 
+local profileShadowMap = nil
+
 function BrickProfile.actorShadowMapEnabled(level)
+  if profileShadowMap and profileShadowMap.isMali() then
+    return (level or 0) > 0
+  end
   return level == BrickProfile.DESKTOP_HIGH_LEVEL
 end
 
@@ -105,6 +116,7 @@ function BrickProfile.apply(V)
   local ChunkMesher = V.require("ChunkMesher")
   local ShadowMap = V.require("ShadowMap")
   local Structures = V.require("Structures")
+  profileShadowMap = ShadowMap
 
   -- GEOMETRY DENSITY: the border forest wraps the map edge at the FULL
   -- 3-block depth (12 tiles -- the same width the flat renderer's
