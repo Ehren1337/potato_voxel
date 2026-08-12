@@ -161,6 +161,92 @@ if ffiOk and cacheDir then
   testLove.data = oldData
   _G.love = oldLove
   MeshCache.wipe({ { id = "A", slot = "body" } })
+
+  -- --- relaunch simulation: same data + options => READY, no rebuild ------
+  local function readManifestIdentity()
+    local f = io.open(cacheDir .. "/cache.info", "rb")
+    if not f then return nil end
+    local line = f:read()
+    f:close()
+    return line and line:match("^PVMC1\t([^\t]+)\t%d+$") or nil
+  end
+  local function readBuildInfoText()
+    local f = io.open(cacheDir .. "/build.info", "rb")
+    if not f then return nil end
+    local text = f:read("*a")
+    f:close()
+    return text
+  end
+
+  os.remove(cacheDir .. "/build.info")
+  local buildJob = { id = "A", slot = "body" }
+  MeshCache.configure({ maps = maps, tilesets = {} })
+  MeshCache.begin()
+  MeshCache.saveTerrain(fakeMap, "body", nil, 0)
+  MeshCache.saveWater(fakeMap, "body", nil, 0)
+  MeshCache.saveAux(fakeMap, "body", { figures = {} })
+  local builtRecord = MeshCache.jobRecord(fakeMap, "body")
+  T.check(MeshCache.writeManifest({ [builtRecord.key] = builtRecord }, 1),
+          "active build writes a manifest")
+  local builtIdentity = readManifestIdentity()
+  T.eq(builtIdentity, MeshCache.identity(),
+       "manifest identity equals the live identity after an unchanged build")
+  local buildInfo = readBuildInfoText()
+  T.check(buildInfo and buildInfo:find("identity=" .. builtIdentity, 1, true),
+          "build.info records the build identity")
+
+  -- A fresh configure() is the relaunch: same maps, same default options.
+  MeshCache.configure({ maps = maps, tilesets = {} })
+  T.eq(MeshCache.identity(), builtIdentity,
+       "relaunch recomputes the same cache identity")
+  T.check(MeshCache.ready({ buildJob }),
+          "relaunch reports READY from the existing manifest (no rebuild)")
+  T.check(MeshCache.getLastFailure() == nil,
+          "a READY cache leaves lastFailure unset")
+
+  -- --- begin()-time snapshot survives a mid-build identity drift ---------
+  local okTR, TileRenderer = pcall(require, "src.render.TileRenderer")
+  if okTR and TileRenderer then
+    local oldVoidFill = TileRenderer.voidFill
+    local driftedFill = oldVoidFill == "cactus" and "trees" or "cactus"
+    os.remove(cacheDir .. "/build.info")
+    MeshCache.configure({ maps = maps, tilesets = {} })
+    MeshCache.begin()
+    local snapshotIdentity = MeshCache.identity()
+    local snapshot = MeshCache.buildInfoSnapshot()
+    T.check(snapshot and snapshot.identity == snapshotIdentity,
+            "buildInfoSnapshot exposes the begin()-time identity")
+    -- Mid-build drift: a live identity component changes after begin().
+    TileRenderer.voidFill = driftedFill
+    MeshCache.saveTerrain(fakeMap, "body", nil, 0)
+    MeshCache.saveWater(fakeMap, "body", nil, 0)
+    MeshCache.saveAux(fakeMap, "body", { figures = {} })
+    T.check(MeshCache.writeManifest({ [builtRecord.key] = builtRecord }, 1),
+            "build finishes normally despite a mid-build identity drift")
+    local driftedManifestId = readManifestIdentity()
+    T.eq(driftedManifestId, snapshotIdentity,
+         "manifest carries the begin()-time identity, not the drifted one")
+    local driftedBuildInfo = readBuildInfoText()
+    T.check(driftedBuildInfo
+              and driftedBuildInfo:find("identity=" .. snapshotIdentity, 1, true),
+            "build.info carries the begin()-time identity")
+    -- Next launch: a fresh session drops the snapshot while the live
+    -- identity still carries the drifted voidFill, so ready() must report
+    -- the mismatch explicitly instead of a generic rejection.
+    MeshCache.configure({ maps = maps, tilesets = {} })
+    T.check(not MeshCache.ready({ buildJob }),
+            "drifted live identity rejects the cache")
+    local failure = MeshCache.getLastFailure()
+    T.check(failure and failure.reason == "identity_mismatch",
+            "rejection is reported as identity_mismatch")
+    T.eq(failure.actual, snapshotIdentity,
+         "identity_mismatch reports the manifest (actual) identity")
+    T.check(failure.diffs and failure.diffs[1] == "voidFill",
+            "identity_mismatch diff pinpoints the voidFill drift")
+    TileRenderer.voidFill = oldVoidFill
+    MeshCache.wipe({ buildJob })
+  end
+
   MeshCache.available = originalAvailable
 end
 

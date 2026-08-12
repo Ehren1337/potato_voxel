@@ -1,5 +1,24 @@
 # Changelog
 
+## [1.4.2] - 2026-08-12
+
+### Fixed
+
+- The map cache no longer rebuilds on every app launch (Android). The cache
+  identity now snapshots once at build start (`begin()`), so every payload
+  file and the manifest share a single build-session identity even if a live
+  identity component (like the VOID FILL setting) changes mid-build -- the
+  manifest can no longer be stamped with a different identity than the files
+  it describes. A relaunch with the same ROM and options reports READY from
+  the existing manifest, exactly as it did when the build finished.
+- The game now logs WHY a persisted cache was rejected at boot: the full cache
+  identity, the resolved cache dir, a `build.info` sidecar written at build
+  time (identity + components + timestamp), the per-component diff against
+  the live identity, and the exact rejection reason (`identity_mismatch`,
+  `no_manifest`, `corrupt_manifest`, `file_missing`, `total_mismatch`). Any
+  remaining cache-rejection reports on Android can now be pinned down from the
+  logcat output instead of guessed at.
+
 ## [1.4.1] - 2026-08-12
 
 ### Fixed

@@ -76,6 +76,56 @@ function Prebuild.bootstrap(game)
             slot = nil, done = ready and #jobs or done, total = #jobs,
             game = nil, startedAt = nil, eta = nil, ready = ready,
             failed = false, error = nil, completed = {} }
+  -- Boot diagnostics: log the full cache identity, the resolved cache dir,
+  -- and -- when the cache was rejected -- exactly why, plus how it compares
+  -- to the build.info sidecar written at build time. This is the only window
+  -- into a persistent cache rejection on real hardware.
+  local parts = MeshCache.identityParts()
+  local build = MeshCache.readBuildInfo()
+  print("[PotatoVoxel] cache identity: " .. MeshCache.identity())
+  print("[PotatoVoxel]   format=" .. tostring(parts.format)
+    .. " version=" .. tostring(parts.version)
+    .. " activeVersion=" .. tostring(parts.activeVersion)
+    .. " profile=" .. tostring(parts.profile)
+    .. " dataKey=" .. tostring(parts.dataKey)
+    .. " voidFill=" .. tostring(parts.voidFill))
+  print("[PotatoVoxel] cache dir: " .. tostring(MeshCache.dir()))
+  print("[PotatoVoxel] cache ready: " .. tostring(ready) .. " (" .. done
+    .. "/" .. #jobs .. ")")
+  if build then
+    print("[PotatoVoxel] build.info: identity=" .. tostring(build.identity)
+      .. " version=" .. tostring(build.version)
+      .. " activeVersion=" .. tostring(build.activeVersion)
+      .. " profile=" .. tostring(build.profile)
+      .. " dataKey=" .. tostring(build.dataKey)
+      .. " voidFill=" .. tostring(build.voidFill)
+      .. " builtAt=" .. tostring(build.builtAt))
+    if ready then
+      print("[PotatoVoxel]   build identity matches live identity")
+    else
+      local diffs = MeshCache.identityDiff(build.identity, MeshCache.identity())
+      print("[PotatoVoxel]   build identity differs in: "
+        .. (#diffs > 0 and table.concat(diffs, ",") or "?"))
+    end
+  end
+  if not ready then
+    local failure = MeshCache.getLastFailure()
+    if failure then
+      print("[PotatoVoxel] cache rejected: " .. tostring(failure.reason))
+      if failure.expected then
+        print("[PotatoVoxel]   expected=" .. tostring(failure.expected))
+      end
+      if failure.actual then
+        print("[PotatoVoxel]   actual=" .. tostring(failure.actual))
+      end
+      if failure.diffs and #failure.diffs > 0 then
+        print("[PotatoVoxel]   diffs=" .. table.concat(failure.diffs, ","))
+      end
+      if failure.job then
+        print("[PotatoVoxel]   job=" .. tostring(failure.job))
+      end
+    end
+  end
   return ready
 end
 
