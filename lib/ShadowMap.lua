@@ -164,7 +164,12 @@ local SHADER = [[
     vec4 c = lightVP * (model * vertex_position);
     // the projection is orthographic, so w is 1 and clip z IS the depth,
     // linear in world units along the sun line
-    vDepth = c.z * 0.5 + 0.5;
+    // A degenerate fit can put NaN into the matrix. NaN compares false in
+    // GLSL, so it would sail through every downstream guard and poison the
+    // packed map -- a depth of NaN reads as "everything is shadowed" on
+    // Mali-family GPUs, which is a black screen. Store the far depth
+    // (cast nothing) instead.
+    vDepth = (c.z == c.z) ? (c.z * 0.5 + 0.5) : 1.0;
     return c;
   }
 #endif
@@ -465,6 +470,15 @@ function ShadowMap.fitKey(cx, cy, vw, vh)
   return math.floor(l / tx), math.floor(b / ty)
 end
 
+-- Whether a fitted box can be projected at all. Exported so the suite can
+-- probe the exact guard: zero, negative or NaN extents (a camera mid-tween,
+-- a half-initialised view) would otherwise write inf/NaN into clipVP and
+-- uvVP, and every fragment the main pass looked up would read a poisoned
+-- depth -- the black-screen-on-Mediatek report.
+function ShadowMap._degenerate(w, h, near, far)
+  return not (w > 0 and h > 0 and far > near)
+end
+
 local function fit(cx, cy, vw, vh)
   local l, r, b, t, zn, zf, view = boxCorners(cx, cy, vw, vh)
 
@@ -486,6 +500,11 @@ local function fit(cx, cy, vw, vh)
   -- and the slack keeps geometry taller than HEIGHT from being clipped
   -- clean out of the pass instead of merely casting a truncated shadow
   local near, far = -zf - 64, -zn + 64
+  -- A degenerate frustum (NaN or non-positive extents) must NOT update the
+  -- matrices the main pass reads: the previous fit stays live, the caller
+  -- skips the pass, and the frame renders flat-lit instead of poisoned.
+  -- NaN compares false, so the plain > tests above reject it too.
+  if ShadowMap._degenerate(w, h, near, far) then return false end
   local proj = Mat4.ortho(l, r, b, t, near, far)
   -- flip clip-space Y for the same reason the camera does: we bypass
   -- LOVE's transform_projection, and canvas coordinates run Y DOWN, so
@@ -505,6 +524,7 @@ local function fit(cx, cy, vw, vh)
   -- the stored depth spans the frustum, so a world-pixel bias is that
   -- fraction of it
   ShadowMap.bias = ShadowMap.slack / math.max(1, far - near)
+  return true
 end
 
 -- How much of the compare's forgiveness a snugged caster takes back, 0..1.
@@ -584,7 +604,7 @@ function ShadowMap.begin(cx, cy, vw, vh, sprites)
     -- The canvas is then (re)made at that edge -- the rung's whole point is
     -- how many texels the box is divided into, so a 1536 fit on a 1024
     -- canvas would be a 1024 map wearing a 1536 fit's snap and bias.
-    fit(cx, cy, vw, vh)
+    if not fit(cx, cy, vw, vh) then return false end
     if getCanvas(ShadowMap.res) == nil then return false end
   end
   local c = sprites and spriteCanvas or canvas
@@ -670,6 +690,22 @@ function ShadowMap.finish(sig, sprites)
     lastSig = sig
     ready = true
   end
+end
+
+-- Unconditionally restore the GL state a pass changes, after an error
+-- anywhere inside begin..finish. A pass that dies mid-draw leaves the
+-- shadow canvas bound, and every later frame renders the WORLD into that
+-- 1024px offscreen map -- a black screen, exactly the Mediatek report.
+-- Callers pcall-wrap their pass and call this from the error handler;
+-- harmless (and cheap) when no pass is open.
+function ShadowMap.abort()
+  drawing, drawingSprites = false, false
+  ready, spritesReady = false, false
+  pcall(love.graphics.setShader)
+  pcall(love.graphics.setDepthMode)
+  pcall(love.graphics.setCanvas)
+  pcall(love.graphics.setBlendMode, prevBlend or "alpha", prevAlphaMode)
+  pcall(love.graphics.setColor, 1, 1, 1, 1)
 end
 
 -- Drop the GPU objects (window resize, hot reload).

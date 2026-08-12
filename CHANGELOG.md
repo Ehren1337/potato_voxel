@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.4.3] - 2026-08-12
+
+### Fixed
+
+- Black screen with shadows enabled on Mediatek/Mali Android devices. Two
+  failure paths are closed: a shadow pass that dies mid-draw can no longer
+  leave its offscreen canvas bound (the world was rendering into the shadow
+  map, which is the black frame), and NaN values from a degenerate light
+  fit can no longer poison the shadow math (NaN comparisons silently pass
+  GLSL bounds checks, then black out every fragment they touch). Both now
+  fall back to a flat-lit frame for that moment instead of a black screen.
+
 ## [1.4.2] - 2026-08-12
 
 ### Fixed
