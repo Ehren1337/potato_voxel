@@ -39,7 +39,13 @@ local Budget = V.require("BuildBudget")
 local ffi = nil
 do
   local ok, mod = pcall(require, "ffi")
-  if ok then ffi = mod end
+  if ok then
+    ffi = mod
+    -- The portable (SD-card) cache dir sits outside love.filesystem's root
+    -- and io.* cannot create parent directories, so the tree is made with a
+    -- direct libc call -- no shell, no os.execute. Declared once here.
+    pcall(ffi.cdef, "int mkdir(const char *path, unsigned int mode);")
+  end
 end
 
 -- The engine's save-root resolver. On the Brick (portable mode on) this
@@ -61,6 +67,7 @@ local MeshCache = {}
 local dataKey = "unconfigured"
 local dirty = false
 local compression = "unknown"
+local codec = nil          -- "lz4"/"zstd"/"MIX" behind the compressed files
 local MANIFEST = "cache.info"
 local BUILD_INFO = "build.info"
 -- Populated by ready() whenever it returns false, so a caller (the boot
@@ -136,7 +143,12 @@ local saveFailures = 0
 -- isolates adjacent same-class props; all derived meshes must be regenerated.
 -- 17: cache headers include the active ROM/data identity, so a Red/Blue/
 -- Yellow switch or a changed map dataset can never reuse old geometry.
-MeshCache.GEOMETRY_VERSION = 17
+-- 18: terrain/water payloads become QUANTIZED -- 11 bytes/vertex (int16
+-- position, u16 uv, u8 shade) instead of the 24-byte 6-float stream, ~54%
+-- smaller before the entropy codec. Aux (grass/flowers/figures) keeps the
+-- float layout. Every terrain/water file written before this bump must be
+-- discarded.
+MeshCache.GEOMETRY_VERSION = 18
 
 -- A small deterministic revision for the inputs that can change terrain
 -- output without changing the mesher. It is intentionally not a checksum:
@@ -264,6 +276,7 @@ function MeshCache.configure(data)
   dataKey = datasetRevision(data)
   dirty = false
   compression = "unknown"
+  codec = nil
   -- A new configuration starts a fresh session: drop any snapshot from a
   -- previous build so live identity() is authoritative until begin() runs.
   buildIdentity = nil
@@ -278,6 +291,13 @@ function MeshCache.compressionStatus()
   return compression
 end
 
+-- The codec behind the compressed payloads: "lz4", "zstd", "MIX" (a cache
+-- spanning codecs), or nil when nothing is compressed. Set by
+-- updateCompression when ready()/writeManifest scans the headers.
+function MeshCache.codec()
+  return codec
+end
+
 MeshCache.identity = identity
 
 -- ---------------------------------------------------------- availability
@@ -285,33 +305,17 @@ MeshCache.identity = identity
 local dirTried = false
 local dirTriedAt = 0            -- os.clock() of the last attempt
 local cacheDir = false          -- resolved once; false when unusable
-local dirBackend = nil          -- how the dir was created: "love" or "mkdir"
+local dirBackend = nil          -- how the dir was created: "love" or "ffi"
 
--- The shell commands that create the cache directory tree. Windows cmd has
--- no `mkdir -p`: it cannot create missing parents and errors when the
--- target already exists, so emit one guarded `if not exist ... mkdir ...`
--- per component below the drive root (each level idempotent -- creating a
--- missing level or skipping an existing one both exit cleanly). Everywhere
--- else a single POSIX `mkdir -p` (stderr silenced) is enough. Exported so
--- the headless suite can assert the exact commands without running cmd.exe.
-local function mkdirCommands(dir, sep)
-  if sep ~= "\\" then
-    local q = dir:gsub('"', '\\"')
-    return { 'mkdir -p "' .. q .. '" 2>/dev/null' }
-  end
-  local commands = {}
-  local acc = ""
-  for part in dir:gmatch("[^\\]+") do
-    if part ~= "" then
-      acc = acc == "" and part or (acc .. "\\" .. part)
-      if acc:match("^%a:\\") then
-        local q = acc:gsub('"', '\\"')
-        commands[#commands + 1] =
-          'if not exist "' .. q .. '" mkdir "' .. q .. '"'
-      end
-    end
-  end
-  return commands
+-- Create one directory level through libc (no shell). An already-existing
+-- level returns non-zero (EEXIST) and is not an error -- the caller treats
+-- this as best-effort and the write probe below decides. A host without the
+-- POSIX mkdir symbol (or without ffi) simply gets false and the fallback is
+-- skipped; portable-mode caching is already ffi-gated at available().
+local function mkdirOne(path)
+  if not (ffi and ffi.C) then return false end
+  local ok, rc = pcall(function() return ffi.C.mkdir(path, 493) end) -- 0755
+  return ok and rc == 0
 end
 
 function MeshCache.available()
@@ -350,11 +354,11 @@ end
 -- then verified with a real io write probe, so a folder that can be
 -- created but not written to is caught here instead of mid-build.
 --
--- A FAILURE is retried, not cached forever: one early os.execute hiccup
--- (a mid-boot SD-card mount, a shell under load) used to disable the
--- cache for the whole session. A success is cached for the session; a
--- failure only suppresses retries for one second, so the next boot check
--- or save re-attempts the mkdir instead of silently giving up.
+-- A FAILURE is retried, not cached forever: one early directory-creation
+-- hiccup (a mid-boot SD-card mount) used to disable the cache for the
+-- whole session. A success is cached for the session; a failure only
+-- suppresses retries for one second, so the next boot check or save
+-- re-attempts the mkdir instead of silently giving up.
 function MeshCache.dir()
   if cacheDir then return cacheDir end
   local clock = os.clock
@@ -395,23 +399,24 @@ function MeshCache.dir()
       return d
     end
   end
-  -- 2) mkdir fallback -- the only path in portable mode, and the retry
-  -- path when love.filesystem was unavailable or the folder unwritable.
-  -- io.* cannot create missing parents, so mkdir the tree like the
-  -- engine's portable filesystem does. Failure stays a silent no-op.
-  for _, command in ipairs(mkdirCommands(d, sep)) do
-    local ok = os.execute(command)
-    if not (ok == true or ok == 0) then return nil end
-  end
+  -- 2) libc mkdir fallback -- the only path in portable mode (the SD card
+  -- is outside love.filesystem's root), and the retry path when
+  -- love.filesystem was unavailable or the folder unwritable. Best-effort
+  -- per level; the write probe is what decides. Failure stays a silent
+  -- no-op.
+  mkdirOne(base .. sep .. "mod-derived")
+  mkdirOne(base .. sep .. "mod-derived" .. sep .. "potato_voxel")
+  mkdirOne(base .. sep .. "mod-derived" .. sep .. "potato_voxel"
+                    .. sep .. "meshes")
   if not probeWritable(d) then return nil end
   cacheDir = d
-  dirBackend = "mkdir"
+  dirBackend = "ffi"
   return d
 end
 
 -- Which backend created the cache directory: "love" (love.filesystem),
--- "mkdir" (shell commands), or nil (unresolved/unavailable). Shown in the
--- CACHE STATUS details box.
+-- "ffi" (libc mkdir, portable mode), or nil (unresolved/unavailable).
+-- Shown in the CACHE STATUS details box.
 function MeshCache.dirBackend()
   return dirBackend
 end
@@ -458,6 +463,7 @@ end
 function MeshCache.begin()
   dirty = true
   compression = "unknown"
+  codec = nil
   -- Snapshot the identity at the START of a build session. Every payload
   -- file and the manifest written by this session share this one identity,
   -- even if a live component (e.g. voidFill) changes mid-build. This removes
@@ -508,14 +514,23 @@ end
 
 -- Binary layout, little-endian throughout:
 --   raw format: "DSM" + format byte (1) + u32 fp-len + fp bytes + payload
---   LZ4 format: same header, then codec + raw length + packed length + hash
---   mesh payload:   u32 vertex count n, then n*6 floats
+--   compressed format: same header, then codec byte (1=lz4, 2=zstd) +
+--     raw length + packed length + hash, then the packed bytes
+--   mesh payload (terrain/water, v18):  u32 vertex count n, then n*11
+--     quantized bytes (i16 x/y/z, u16 u/v, u8 shade), u32 index count m,
+--     then m u32 indices
+--   aux/figures payload:               u32 n, then n*6 floats (unchanged)
 --   figures payload: u8 count, then per figure: u32 n, n*6 floats,
 --                    then f32 wx, f32 wz, f32 y, f32 w
 local MAGIC = "DSM"
 local RAW_FORMAT = 1
 local COMPRESSED_FORMAT = 2
 local LZ4_CODEC = 1
+local ZSTD_CODEC = 2
+-- codec byte -> love.data format name. ZSTD is reserved: the engine ships
+-- no zstd codec yet, but a file written by a build that does (or a later
+-- runtime) reads and is reported correctly here.
+local CODEC_NAMES = { [LZ4_CODEC] = "lz4", [ZSTD_CODEC] = "zstd" }
 local MAX_PAYLOAD = 512 * 1024 * 1024
 
 local function f32(v)
@@ -543,11 +558,11 @@ local function readU32(s, offset)
        + s:byte(offset + 2) * 65536 + s:byte(offset + 3) * 16777216
 end
 
-local function header(fp, format, rawLen, packedLen, checksum)
+local function header(fp, format, rawLen, packedLen, checksum, codec)
   local out = MAGIC .. string.char(format) .. u32(#fp) .. fp
   if format == COMPRESSED_FORMAT then
-    out = out .. string.char(LZ4_CODEC) .. u32(rawLen) .. u32(packedLen)
-         .. u32(checksum)
+    out = out .. string.char(codec or LZ4_CODEC) .. u32(rawLen)
+         .. u32(packedLen) .. u32(checksum)
   end
   return out
 end
@@ -574,7 +589,8 @@ local function parseHeader(s, totalLen)
     meta.packedLen = readU32(s, offset + 5)
     meta.checksum = readU32(s, offset + 9)
     offset = offset + 13
-    if meta.codec ~= LZ4_CODEC or length - offset + 1 ~= meta.packedLen then
+    if meta.codec == nil or CODEC_NAMES[meta.codec] == nil
+       or length - offset + 1 ~= meta.packedLen then
       return nil
     end
   end
@@ -610,7 +626,9 @@ local function unpackPayload(s, offset, meta)
   if meta.rawLen > MAX_PAYLOAD or meta.packedLen > #body then return nil end
   local data = love and love.data
   if not (data and data.decompress) then return nil end
-    local ok, raw = pcall(data.decompress, "string", "lz4", body)
+  local codecName = CODEC_NAMES[meta.codec]
+  if not codecName then return nil end
+  local ok, raw = pcall(data.decompress, "string", codecName, body)
   -- ponytail: no per-byte checksum -- a Lua loop over a 10-25MB payload is a
   -- 100ms+ hitch on every cold map transition. Truncation is caught by the
   -- packed-length check in parseHeader and the raw-length check here; corrupt
@@ -625,9 +643,15 @@ end
 local function packPayload(fp, body)
   local data = love and love.data
   if data and data.compress and #body >= 1024 then
-    local ok, packed = pcall(data.compress, "string", "lz4", body)
+    local ok, packed = pcall(data.compress, "string", "zstd", body)
     if ok and type(packed) == "string" and #packed < #body then
-      return header(fp, COMPRESSED_FORMAT, #body, #packed, 0) .. packed
+      return header(fp, COMPRESSED_FORMAT, #body, #packed, 0, ZSTD_CODEC)
+             .. packed
+    end
+    ok, packed = pcall(data.compress, "string", "lz4", body)
+    if ok and type(packed) == "string" and #packed < #body then
+      return header(fp, COMPRESSED_FORMAT, #body, #packed, 0, LZ4_CODEC)
+             .. packed
     end
   end
   return header(fp, RAW_FORMAT) .. body
@@ -638,6 +662,7 @@ local function repackRaw(path, fp, body, meta)
   local packed = packPayload(fp, body)
   if packed:byte(4) == COMPRESSED_FORMAT then
     compression = "unknown"
+    codec = nil
     pcall(writeFile, path, packed)
   end
 end
@@ -682,9 +707,9 @@ local function encodeMesh(n, srcPtr)
   return table.concat(parts)
 end
 
--- INDEXED payload: the vertex stream above, then a u32 vertex map
--- (m entries). Terrain and water meshes are stored this way (brick.11);
--- aux payloads never are (encodeMesh stays unindexed for them).
+-- INDEXED payload (float): the vertex stream above, then a u32 vertex map
+-- (m entries). Aux payloads (grass/flowers) are stored this way; terrain
+-- and water use the quantized encodeQuant instead (v18).
 local function encodeIndexed(n, srcPtr, m, idxPtr)
   local parts = { encodeMesh(n, srcPtr), u32(m or 0) }
   if not idxPtr or m == nil or m == 0 then return table.concat(parts) end
@@ -719,7 +744,7 @@ local function decodeMesh(s)
   return { n = n, str = s, ptr = floatsPtr(s, 4) }
 end
 
--- Decode an INDEXED mesh payload (terrain/water, brick.11+): the vertex
+-- Decode an INDEXED float mesh payload (aux, brick.11+): the vertex
 -- stream as decodeMesh reads it, then u32 index count + the u32 vertex
 -- map. Returns { n, str, ptr, m, istr, iptr } (m = index count; iptr a
 -- uint32_t* into the map), or nil when corrupt. Files written before
@@ -737,6 +762,142 @@ local function decodeIndexed(s)
   if n == 0 then return { n = 0, m = 0 } end
   local rec = { n = n, str = s, ptr = floatsPtr(s, 4), m = m }
   if m > 0 then rec.istr = s; rec.iptr = u32Ptr(s, voff + 4) end
+  return rec
+end
+
+-- ------------------------------------------------------------ quantization
+--
+-- The modern real-time-game answer to mesh storage: quantize each vertex
+-- attribute to the smallest width that carries it, instead of six 32-bit
+-- floats. The voxel world makes this near-lossless -- positions are integer
+-- pixels, texture coords sample a small atlas, and shade is baked ambient
+-- occlusion with 0.216-unit steps:
+--
+--   position  int16 x3   (exact: the grid is integer px, well inside range)
+--   texcoord  u16   x2   (0..65535 over [0,1]; sub-texel on a 128px atlas)
+--   shade     u8         (0..255 over [0,1]; sub-band for the AO steps)
+--
+-- 11 bytes/vertex vs 24 (~54% smaller) BEFORE the entropy codec, with no
+-- codec dependency and no shell -- it is plain integer packing, so it works
+-- on every platform the cache already runs on. Decode expands back to the
+-- same 6-float stream the GPU upload path consumes; nothing downstream
+-- knows the disk format changed. Terrain and water only (GEOMETRY_VERSION
+-- 18); aux payloads keep the float layout.
+local QUANT_STRIDE = 11
+
+local function putU16(b, p, v)
+  b[p] = v % 256
+  b[p + 1] = math.floor(v / 256) % 256
+end
+
+local function putI16(b, p, v)
+  putU16(b, p, v < 0 and (v + 65536) or v)
+end
+
+local function readU16(ptr, off)
+  return ptr[off] + ptr[off + 1] * 256
+end
+
+local function readI16(ptr, off)
+  local w = readU16(ptr, off)
+  return w >= 32768 and (w - 65536) or w
+end
+
+-- Encode a quantized INDEXED payload: u32 n, n*11 quantized vertex bytes,
+-- u32 m, m u32 indices -- the same shape encodeIndexed writes for floats.
+local function encodeQuant(n, srcPtr, m, idxPtr)
+  local parts = { u32(n or 0) }
+  if srcPtr and n and n > 0 then
+    local CHUNK = 16384
+    local vbytes = n * QUANT_STRIDE
+    local buf = ffi.new("uint8_t[?]", vbytes)
+    local src = ffi.cast("const float*", srcPtr)
+    local w, vi = 0, 0
+    while vi < n do
+      local c = math.min(CHUNK, n - vi)
+      for i = 0, c - 1 do
+        local base = (vi + i) * 6
+        local x = math.floor(src[base] + 0.5)
+        local y = math.floor(src[base + 1] + 0.5)
+        local z = math.floor(src[base + 2] + 0.5)
+        local u = math.floor(src[base + 3] * 65535 + 0.5)
+        local v = math.floor(src[base + 4] * 65535 + 0.5)
+        local sh = math.floor(src[base + 5] * 255 + 0.5)
+        if x < -32768 then x = -32768 elseif x > 32767 then x = 32767 end
+        if y < -32768 then y = -32768 elseif y > 32767 then y = 32767 end
+        if z < -32768 then z = -32768 elseif z > 32767 then z = 32767 end
+        if u < 0 then u = 0 elseif u > 65535 then u = 65535 end
+        if v < 0 then v = 0 elseif v > 65535 then v = 65535 end
+        if sh < 0 then sh = 0 elseif sh > 255 then sh = 255 end
+        putI16(buf, w, x)
+        putI16(buf, w + 2, y)
+        putI16(buf, w + 4, z)
+        putU16(buf, w + 6, u)
+        putU16(buf, w + 8, v)
+        buf[w + 10] = sh
+        w = w + QUANT_STRIDE
+      end
+      vi = vi + c
+      Budget.check()
+    end
+    parts[#parts + 1] = ffi.string(buf, vbytes)
+  end
+  parts[#parts + 1] = u32(m or 0)
+  if idxPtr and m and m > 0 then
+    local CHUNK = 65536
+    local off = 0
+    local remaining = m
+    while remaining > 0 do
+      local c = math.min(CHUNK, remaining)
+      local bytes = c * 4
+      local ibuf = ffi.new("char[?]", bytes)
+      ffi.copy(ibuf, idxPtr + off, bytes)
+      parts[#parts + 1] = ffi.string(ibuf, bytes)
+      off = off + c
+      remaining = remaining - c
+      Budget.check()
+    end
+  end
+  return table.concat(parts)
+end
+
+-- Decode a quantized payload into { n, buf, m, istr, idx } -- buf is a
+-- float[?] ffi buffer (the expanded 6-float stream, which meshFromData
+-- already accepts as the fresh-build shape) and idx a uint32_t* into the
+-- string. nil when corrupt.
+local function decodeQuant(s)
+  if not s or #s < 8 then return nil end
+  local n = readU32(s, 1)
+  local vbytes = n * QUANT_STRIDE
+  if n > 0 and #s < 4 + vbytes + 4 then return nil end
+  local fbuf
+  if n > 0 then
+    local CHUNK = 16384
+    fbuf = ffi.new("float[?]", n * 6)
+    local src = ffi.cast("const uint8_t*", ffi.cast("const char*", s))
+    local vi = 0
+    while vi < n do
+      local c = math.min(CHUNK, n - vi)
+      for i = 0, c - 1 do
+        local r = 4 + (vi + i) * QUANT_STRIDE
+        local fo = (vi + i) * 6
+        fbuf[fo] = readI16(src, r)
+        fbuf[fo + 1] = readI16(src, r + 2)
+        fbuf[fo + 2] = readI16(src, r + 4)
+        fbuf[fo + 3] = readU16(src, r + 6) / 65535
+        fbuf[fo + 4] = readU16(src, r + 8) / 65535
+        fbuf[fo + 5] = src[r + 10] / 255
+      end
+      vi = vi + c
+      Budget.check()
+    end
+  end
+  local voff = 4 + vbytes
+  local m = readU32(s, voff + 1)
+  if m > 0 and #s < voff + 4 + m * 4 then return nil end
+  if n == 0 then return { n = 0, m = m } end
+  local rec = { n = n, buf = fbuf, m = m }
+  if m > 0 then rec.istr = s; rec.idx = u32Ptr(s, voff + 4) end
   return rec
 end
 
@@ -780,7 +941,7 @@ local function payloadFingerprint(path, fp, kind, prefix)
   local body = unpackPayload(s, off, meta)
   if not body then return nil end
   if kind ~= "aux" then
-    return decodeIndexed(body) and got or nil
+    return decodeQuant(body) and got or nil
   end
   local grass = decodeIndexed(body)
   if not grass then return nil end
@@ -828,30 +989,34 @@ local function safeValidHeader(path, fp)
 end
 
 local function safeFormat(path, fp)
-  local ok, format, rawLen = pcall(function()
+  local ok, format, rawLen, codecName = pcall(function()
     local s, totalLen = readHeader(path)
     if not s then return nil end
     local got, offset, meta = parseHeader(s, totalLen)
     if got ~= fp then return nil end
     local rawLen = meta.format == COMPRESSED_FORMAT
                   and meta.rawLen or (totalLen - offset + 1)
-    return meta.format, rawLen
+    return meta.format, rawLen, CODEC_NAMES[meta.codec]
   end)
-  return ok and format or nil, ok and rawLen or nil
+  return ok and format or nil, ok and rawLen or nil, ok and codecName or nil
 end
 
 local function updateCompression(records, dir)
   local total, compressed = 0, 0
+  local codecNames = {}
   for _, record in pairs(records or {}) do
     for _, pair in ipairs({
       { record.terrain, record.terrainFp },
       { record.water, record.waterFp },
       { record.aux, record.auxFp },
     }) do
-      local format, rawLen = safeFormat(dir .. "/" .. pair[1], pair[2])
+      local format, rawLen, codecName = safeFormat(dir .. "/" .. pair[1], pair[2])
       if rawLen and rawLen >= 1024 then
         total = total + 1
-        if format == COMPRESSED_FORMAT then compressed = compressed + 1 end
+        if format == COMPRESSED_FORMAT then
+          compressed = compressed + 1
+          if codecName then codecNames[codecName] = true end
+        end
       end
     end
   end
@@ -863,6 +1028,17 @@ local function updateCompression(records, dir)
     compression = "raw"
   else
     compression = "mixed"
+  end
+  -- The codec behind the compressed payloads: one name when they all
+  -- agree, "MIX" when a cache spans codecs, nil when nothing is compressed.
+  local names = {}
+  for name in pairs(codecNames) do names[#names + 1] = name end
+  if #names == 1 then
+    codec = names[1]
+  elseif #names > 1 then
+    codec = "MIX"
+  else
+    codec = nil
   end
 end
 
@@ -1136,7 +1312,7 @@ function MeshCache.saveTerrain(map, slot, buf, n, idx, m)
   local path = fileFor(map, slot, "terrain")
   local ok, result = pcall(function()
     local fp = fingerprint(map, slot)
-    return writeFile(path, packPayload(fp, encodeIndexed(n, buf, m, idx)))
+    return writeFile(path, packPayload(fp, encodeQuant(n, buf, m, idx)))
   end)
   if not ok then
     os.remove(path .. ".tmp")
@@ -1151,7 +1327,7 @@ function MeshCache.saveWater(map, slot, buf, n, idx, m)
   local path = fileFor(map, slot, "water")
   local ok, result = pcall(function()
     local fp = fingerprint(map, slot .. "Water")
-    return writeFile(path, packPayload(fp, encodeIndexed(n, buf, m, idx)))
+    return writeFile(path, packPayload(fp, encodeQuant(n, buf, m, idx)))
   end)
   if not ok then
     os.remove(path .. ".tmp")
@@ -1185,7 +1361,7 @@ function MeshCache.loadMeshData(path, fp)
   end
   local body = unpackPayload(s, off, meta)
   if body then repackRaw(path, fp, body, meta) end
-  return body and decodeIndexed(body) or nil
+  return body and decodeQuant(body) or nil
 end
 
 -- Persist the aux (grass/flowers/figures) vertex streams. `flattened` is
@@ -1256,6 +1432,7 @@ end
 function MeshCache.invalidate(mapId)
   dirty = true
   compression = "unknown"
+  codec = nil
   local dir = MeshCache.dir()
   if not dir then return end
   os.remove(dir .. "/" .. MANIFEST)
@@ -1268,28 +1445,31 @@ function MeshCache.invalidate(mapId)
   end
 end
 
-local function listFiles(dir)
-  if not io.popen then return {} end
-  local quoted = dir:gsub('"', '\\"')
-  local command = package.config:sub(1, 1) == "\\"
-    and ('dir /b "' .. quoted .. '" 2>nul')
-    or ('ls -1 "' .. quoted .. '" 2>/dev/null')
-  local ok, pipe = pcall(io.popen, command, "r")
-  if not ok or not pipe then return {} end
-  local names = {}
-  for name in pipe:lines() do names[#names + 1] = name end
-  pipe:close()
-  return names
+local function listFiles()
+  -- Directory listing without a shell: love.filesystem enumerates the
+  -- folder when the cache lives under its root; the portable (SD-card)
+  -- folder is outside it and returns nothing, which is fine -- wipe()'s
+  -- direct pass below already removes every file the current job set
+  -- names, so the listing only catches stale files from maps no longer
+  -- present in the data.
+  if love and love.filesystem and love.filesystem.getDirectoryItems then
+    local ok, items = pcall(love.filesystem.getDirectoryItems,
+                            "mod-derived/potato_voxel/meshes")
+    if ok and type(items) == "table" then return items end
+  end
+  return {}
 end
 
 function MeshCache.wipe(jobs)
   dirty = true
   compression = "unknown"
+  codec = nil
   local dir = MeshCache.dir()
   if not dir then return false end
   os.remove(dir .. "/" .. MANIFEST)
-  -- The direct pass also works on platforms without io.popen. The directory
-  -- pass catches stale files from maps no longer present in the current data.
+  -- The direct pass also works where the directory listing cannot reach
+  -- (portable mode). The directory pass catches stale files from maps no
+  -- longer present in the current data.
   for _, job in ipairs(jobs or {}) do
     local prefix = tostring(job.id):gsub("[^%w_]", "_")
     for _, slot in ipairs({ "body", "full" }) do
@@ -1298,7 +1478,7 @@ function MeshCache.wipe(jobs)
       end
     end
   end
-  for _, name in ipairs(listFiles(dir)) do
+  for _, name in ipairs(listFiles()) do
     if name:match("%.terrain$") or name:match("%.water$")
        or name:match("%.aux$") or name:match("%.tmp$") then
       os.remove(dir .. "/" .. name)
@@ -1356,8 +1536,6 @@ end
 -- serialized bytes; decodeMesh reads them back.
 MeshCache.encodeMesh = encodeMesh
 MeshCache.decodeMesh = decodeMesh
--- mkdir command builder for MeshCache.dir, exported for tests
-MeshCache.mkdirCommands = mkdirCommands
 -- indexed terrain/water payloads (brick.11+)
 MeshCache.encodeIndexed = encodeIndexed
 MeshCache.decodeIndexed = decodeIndexed

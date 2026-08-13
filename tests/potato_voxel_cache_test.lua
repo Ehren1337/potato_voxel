@@ -57,23 +57,8 @@ MeshCache.configure({ maps = maps, tilesets = {} })
 T.check(firstIdentity ~= MeshCache.identity(),
         "map data changes the cache identity")
 
-local posixMkdir = MeshCache.mkdirCommands(
-  "/home/user/.local/share/love/game/mod-derived/potato_voxel/meshes", "/")
-T.eq(type(posixMkdir), "table", "mkdir commands come back as a list")
-T.eq(#posixMkdir, 1, "POSIX tree creation is a single command")
-T.eq(posixMkdir[1],
-     'mkdir -p "/home/user/.local/share/love/game/mod-derived/potato_voxel/meshes" 2>/dev/null',
-     "POSIX uses mkdir -p with silenced stderr")
-local winMkdir = MeshCache.mkdirCommands(
-  "C:\\LOVE\\game\\mod-derived\\potato_voxel\\meshes", "\\")
-T.eq(#winMkdir, 5, "Windows creates each component below the drive root")
-T.eq(winMkdir[1], 'if not exist "C:\\LOVE" mkdir "C:\\LOVE"',
-     "Windows guards the drive-level folder")
-T.eq(winMkdir[2], 'if not exist "C:\\LOVE\\game" mkdir "C:\\LOVE\\game"',
-     "Windows guards each intermediate folder")
-T.eq(winMkdir[5],
-     'if not exist "C:\\LOVE\\game\\mod-derived\\potato_voxel\\meshes" mkdir "C:\\LOVE\\game\\mod-derived\\potato_voxel\\meshes"',
-     "Windows deepest component is the cache dir itself")
+T.check(MeshCache.mkdirCommands == nil,
+        "directory creation is shell-free (love.filesystem / libc mkdir)")
 
 local record = MeshCache.jobRecord({
   id = "A", tileset = { image = "tileset.png", trueColor = false },
@@ -141,7 +126,7 @@ local ffiOk, ffi = pcall(require, "ffi")
 local cacheDir = MeshCache.dir()
 if ffiOk and cacheDir then
   T.check(MeshCache.dirBackend() == "love"
-            or MeshCache.dirBackend() == "mkdir",
+            or MeshCache.dirBackend() == "ffi",
           "dir resolution records which backend created the folder")
   T.check(MeshCache.probeWritable(cacheDir),
           "the resolved cache dir passes a real io write probe")
@@ -185,7 +170,10 @@ if ffiOk and cacheDir then
   local packed = {}
   local serial = 0
   testLove.data = {
-    compress = function(_, _, body)
+    compress = function(_, format, body)
+      -- Simulate the shipped runtime: no zstd codec, lz4 only. A format
+      -- that is not lz4 returns nil so packPayload falls back to lz4.
+      if format ~= "lz4" then return nil end
       serial = serial + 1
       local key = "packed" .. serial
       packed[key] = body
@@ -195,8 +183,8 @@ if ffiOk and cacheDir then
   }
   _G.love = testLove
   MeshCache.configure({ maps = maps, tilesets = {} })
-  local vertices = ffi.new("float[?]", 64 * 6)
-  MeshCache.saveTerrain(fakeMap, "body", vertices, 64)
+  local vertices = ffi.new("float[?]", 128 * 6)
+  MeshCache.saveTerrain(fakeMap, "body", vertices, 128)
   local compressed = io.open(cacheDir .. "/A.body.terrain", "rb")
   local compressedFormat = compressed and compressed:read(4):byte(4) or nil
   if compressed then compressed:close() end
@@ -204,7 +192,7 @@ if ffiOk and cacheDir then
   MeshCache.saveWater(fakeMap, "body", nil, 0)
   MeshCache.saveAux(fakeMap, "body", { figures = {} })
   local loaded = MeshCache.loadTerrain(fakeMap, "body")
-  T.check(loaded ~= nil and loaded.n == 64,
+  T.check(loaded ~= nil and loaded.n == 128,
           "compressed cache payload loads through the normal decoder")
   local oldDecompress = testLove.data.decompress
   testLove.data.decompress = function()
@@ -214,9 +202,32 @@ if ffiOk and cacheDir then
           "compressed cache reports READY from headers")
   T.eq(MeshCache.compressionStatus(), "compressed",
        "cache status identifies compressed payloads")
+  T.eq(MeshCache.codec(), "lz4",
+       "cache status identifies the codec (lz4 fallback without zstd)")
   T.check(MeshCache.ready({ { id = "A", slot = "body" } }),
           "manifest READY check uses bounded payload headers")
   testLove.data.decompress = oldDecompress
+
+  -- A runtime WITH zstd: the same payload compressed as zstd writes codec
+  -- byte 2, and codec() reports "zstd" -- the READY (ZSTD) label path.
+  testLove.data.compress = function(_, format, body)
+    if format ~= "zstd" then return nil end
+    serial = serial + 1
+    local key = "zpacked" .. serial
+    packed[key] = body
+    return key
+  end
+  MeshCache.saveTerrain(fakeMap, "body", vertices, 128)
+  MeshCache.saveWater(fakeMap, "body", nil, 0)
+  MeshCache.saveAux(fakeMap, "body", { figures = {} })
+  local zloaded = MeshCache.loadTerrain(fakeMap, "body")
+  T.check(zloaded ~= nil and zloaded.n == 128,
+          "zstd-compressed payload loads through the codec-aware decoder")
+  T.check(MeshCache.ready({ { id = "A", slot = "body" } }),
+          "zstd cache reports READY from headers")
+  T.eq(MeshCache.codec(), "zstd",
+       "cache status identifies the zstd codec")
+
   testLove.data = oldData
   _G.love = oldLove
   MeshCache.wipe({ { id = "A", slot = "body" } })

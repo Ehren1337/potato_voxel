@@ -173,6 +173,60 @@ if brick then
              "a big pack compresses into the container")
      T.eq(Pack.decompress(packed), raw, "a compressed pack round-trips")
    end
+   -- A species whose send-out entrance reads as a collapse (StadiumRig's
+   -- load-time scan marks it) must not be sent out to the sound of it:
+   -- the entrance request falls back to the standby loop, which is the
+   -- same fallback a species with no entrance slot already gets.
+   local StadiumMon = exports.lib.require("StadiumMon")
+   local function fakeMon(collapse)
+     local mon = StadiumMon.new("player")
+     mon.model = {
+       ctx = { [1] = 0, [4] = 1 },
+       anims = {
+         { seconds = 1, aux = -1 },
+         { seconds = 2, aux = -1 },
+       },
+       collapseEntrance = collapse,
+     }
+     mon:play("idle")
+     return mon
+   end
+   local clean = fakeMon(false)
+   T.check(clean:request("entrance"),
+           "a normal entrance request is accepted")
+   T.eq(clean.state, "entrance", "and plays the entrance state")
+   local collapse = fakeMon(true)
+   T.check(collapse:request("entrance"),
+           "a collapse-marked entrance request still lands")
+   T.eq(collapse.state, "idle",
+        "but arrives on its standby loop instead of the collapse")
+   T.eq(collapse.anim, 1, "the standby loop is the one that plays")
+   -- the anchor must not over-correct past the excursion that caused it:
+   -- a Pokemon that hops up and comes back is dragged below its tile on
+   -- the return by the lagged offset, which is the "hurt" the collapse
+   -- scan keys on.  A one-bone rig, hopped, then returned.
+   local StadiumRig = exports.lib.require("StadiumRig")
+   local am = {
+     rootScale = 1, height = 100, boneCount = 1,
+     bindCX = 0, bindCY = 0, bindCZ = 0, anchorOk = true,
+     boneW = { [1] = 1 }, boneWTotal = 1,
+   }
+   local function fakeRig()
+     local r = { model = am, pivotM = {}, drawM = {} }
+     for i = 1, 12 do r.pivotM[i], r.drawM[i] = 0, 0 end
+     return r
+   end
+   local rig = fakeRig()
+   rig.drawM[8] = 200                    -- hop a full body-height up
+   StadiumRig.anchor(rig, 0.75, 1 / 60)
+   StadiumRig.anchor(rig, 0.75, 1 / 60)
+   rig.drawM[8], rig.pivotM[8] = 0, 0    -- and the hop comes back
+   StadiumRig.anchor(rig, 0.75, 1 / 60)
+   T.eq(rig.drawM[8], 0,
+        "anchor clamps the offset to the current excursion, so a returned "
+        .. "hop is not dragged below the tile it came back to")
+   T.eq(rig.pivotM[8], 0,
+        "the pivot chain gets the same clamp as the draw chain")
    local Prebuild = exports.lib.require("CachePrebuild")
   local jobs = Prebuild.enumerate({ B = { id="B", width=3, height=2, connections={} }, A = { id="A", width=4, height=5, connections={} } })
   T.eq(#jobs, 4, "prebuild enumerates body and full variants")
@@ -304,17 +358,35 @@ if MeshCache and MeshCache.encodeMesh then
                       tileset = { image = "tilesets/sample.png", trueColor = false },
                       renderer = { gbcAtlas = true } }
     local rtBuf = ffi.new("float[?]", n * 6)
-    for i = 0, n * 6 - 1 do rtBuf[i] = (i + 1) * 0.5 end
+    for i = 0, n - 1 do
+      rtBuf[i * 6] = (i % 4) * 8                 -- x: integer px (exact)
+      rtBuf[i * 6 + 1] = math.floor(i / 4) * 4   -- y: integer height (exact)
+      rtBuf[i * 6 + 2] = (i % 3) * 8             -- z: integer px (exact)
+      rtBuf[i * 6 + 3] = ((i % 128) + 0.5) / 128 -- u: atlas texel centre
+      rtBuf[i * 6 + 4] = ((i % 48) + 0.5) / 48   -- v
+      rtBuf[i * 6 + 5] = 0.5 + (i % 10) / 20     -- shade: baked AO band
+    end
     MeshCache.saveTerrain(fakeMap, "full", rtBuf, n)
     local rtTerrain, rtWater = MeshCache.loadTerrain(fakeMap, "full")
     T.check(rtTerrain ~= nil and rtTerrain.n == n,
             "loadTerrain reads back the written mesh (header+payload offset)")
     if rtTerrain then
       local match = true
-      for i = 0, n * 6 - 1 do
-        if math.abs(rtTerrain.ptr[i] - (i + 1) * 0.5) > 1e-4 then match = false break end
+      for i = 0, n - 1 do
+        -- positions are integer pixels and round-trip exactly
+        if rtTerrain.buf[i * 6] ~= rtBuf[i * 6]
+           or rtTerrain.buf[i * 6 + 1] ~= rtBuf[i * 6 + 1]
+           or rtTerrain.buf[i * 6 + 2] ~= rtBuf[i * 6 + 2] then
+          match = false break
+        end
+        -- uv quantizes to u16, shade to u8 -- sub-visible error only
+        if math.abs(rtTerrain.buf[i * 6 + 3] - rtBuf[i * 6 + 3]) > 0.01
+           or math.abs(rtTerrain.buf[i * 6 + 4] - rtBuf[i * 6 + 4]) > 0.01
+           or math.abs(rtTerrain.buf[i * 6 + 5] - rtBuf[i * 6 + 5]) > 0.01 then
+          match = false break
+        end
       end
-      T.check(match, "loadTerrain stream is byte-identical to what was saved")
+      T.check(match, "loadTerrain round-trips quantized positions/uv/shade")
     end
     -- The AUX round-trip at scale. flattenQuads counts FLOATS while the
     -- payloads are vertex-counted; feeding k in as n made encodeMesh read

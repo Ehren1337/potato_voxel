@@ -486,6 +486,18 @@ StadiumRig.ANCHOR_STEADY = 0.5
 -- this module is below it and a require would be circular. Position 1 of
 -- StadiumPack.CONTEXT, which is the format's own contract.
 local IDLE_SLOT = 1
+-- And which one the send-out entrance is. Position 4 of the same contract.
+local ENTRANCE_SLOT = 4
+
+-- How deep an entrance may carry the body before it stops being an entrance
+-- and reads as a collapse (see measureBind's scan). Compared against the
+-- species' own standing height.
+StadiumRig.COLLAPSE_RATIO = 0.65
+
+-- The anchor limit the collapse scan poses with, in body-heights. The game
+-- value lives in StadiumMon.TRAVEL, and this module sits below StadiumMon,
+-- so the number is repeated here rather than required.
+local COLLAPSE_LIMIT = 0.75
 
 -- How much of the model each bone actually carries. Cached on the shared
 -- model: it is a fact about the mesh, not about this instance.
@@ -521,6 +533,22 @@ local function centre(self, n)
     end
   end
   return x / total, y / total, z / total
+end
+
+-- The highest bone origin in the pose, in the model's raw units: the "how
+-- tall is this Pokemon right now" number. Not the centre, because the body
+-- can stay centred while the whole Pokemon tips -- a flop reads as a
+-- collapse and the centre would not see it. The max is what the eye agrees
+-- with: a Pokemon whose top drops to half its standing height reads as
+-- crumpled, whatever its limbs are doing.
+local function bodyTop(self, n)
+  local d = self.drawM
+  local hi = -1e30
+  for b = 1, n do
+    local y = d[(b - 1) * 12 + 8]
+    if y > hi then hi = y end
+  end
+  return hi
 end
 
 -- Where the BIND pose puts it -- the spot every animation is measured
@@ -586,6 +614,44 @@ function StadiumRig:measureBind()
                        .. "not anchoring it, the measurement cannot be "
                        .. "trusted", tostring(model.species), worst)
       end
+    end
+  end
+
+  -- ------- and whether the send-out entrance reads as a collapse
+  --
+  -- The entrance is what plays when a Pokemon is sent out, and for most of
+  -- the set it is a flourish that ends on the standby pose. For a big
+  -- minority it is a drop: the body falls to well under its standing height
+  -- for a sustained stretch (Squirtle retreats into its shell, Goldeen lies
+  -- flat), which on a fixed tile at send-out reads as "hurt" -- and a
+  -- Pokemon arriving hurt is worse than arriving plainly. A species marked
+  -- here plays its standby loop at send-out instead of the entrance, the
+  -- same fallback a species with no entrance slot at all already gets (see
+  -- StadiumMon.play).
+  --
+  -- Measured WITH the anchor, because that is the picture the player sees
+  -- and the anchor is part of it: an entrance that hops beyond the limit is
+  -- dragged back on the way down (see anchor's clamp), which only deepens
+  -- the drop. Walked once here, like the idle above -- a few hundred poses
+  -- on a model that is about to be posed sixty times a second anyway.
+  local entr = model.ctx and model.ctx[ENTRANCE_SLOT]
+  local eanim = (entr and entr ~= 0xFFFF) and (entr + 1) or nil
+  local erec = eanim and model.anims and model.anims[eanim]
+  if erec and erec.frames and erec.frames > 1 then
+    self:pose(nil, 0, false)
+    local bindTop = bodyTop(self, model.boneCount)
+    local minTop = bindTop
+    self.anchorX, self.anchorY, self.anchorZ = nil, nil, nil
+    for f = 0, erec.frames - 1 do
+      self:pose(eanim, f, false)
+      if model.bindCX then self:anchor(COLLAPSE_LIMIT, 1 / 60) end
+      local t = bodyTop(self, model.boneCount)
+      if t < minTop then minTop = t end
+    end
+    -- and leave the anchor cold, so the real send-out starts from nowhere
+    self.anchorX, self.anchorY, self.anchorZ = nil, nil, nil
+    if bindTop > 0 and minTop / bindTop < StadiumRig.COLLAPSE_RATIO then
+      model.collapseEntrance = true
     end
   end
   -- and leave the bind pose behind, not the last frame of the idle
@@ -675,13 +741,22 @@ function StadiumRig:anchor(limit, dt)
     ox, oy, oz = dx * k, dy * k, dz * k
   end
 
-  -- and then toward it rather than straight to it (see ANCHOR_HALF_LIFE),
-  -- and never faster than ANCHOR_RATE
+  -- and then toward it rather than straight to it (see ANCHOR_HALF_LIFE)
   if dt and dt > 0 then
     local half = StadiumRig.ANCHOR_HALF_LIFE
     local a = (half > 0) and (1 - 0.5 ^ (dt / half)) or 1
     if a > 1 then a = 1 end
     local px, py, pz = self.anchorX or ox, self.anchorY or oy, self.anchorZ or oz
+    -- never correct further than the current excursion asks for. A lagged
+    -- offset that outlives the excursion it answered drags a hopping
+    -- Pokemon below the tile it just returned to -- which is the collapse
+    -- the entrance scan (see measureBind) keys on. This only ever shrinks
+    -- the correction, so the within-limit guarantee the anchor exists for
+    -- is untouched: the body is never pushed farther from the bind than
+    -- the pose itself has carried it.
+    if math.abs(ox) < math.abs(px) then px = ox end
+    if math.abs(oy) < math.abs(py) then py = oy end
+    if math.abs(oz) < math.abs(pz) then pz = oz end
     ox = px + (ox - px) * a
     oy = py + (oy - py) * a
     oz = pz + (oz - pz) * a

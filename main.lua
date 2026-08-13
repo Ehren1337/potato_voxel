@@ -912,8 +912,9 @@ end
 -- Build the complete PotatoVoxel-owned row set for the dedicated submenu.
 local function cacheReadyLabel(status)
   if status ~= "READY" then return status end
+  local codec = MeshCache.codec()
+  if codec then return "READY " .. codec:upper() end
   local mode = MeshCache.compressionStatus()
-  if mode == "compressed" then return "READY CMP" end
   if mode == "mixed" then return "READY MIX" end
   if mode == "raw" then return "READY RAW" end
   return "READY"
@@ -924,17 +925,21 @@ local function showCacheStatus(game)
   local status = CachePrebuild.status()
   local label = status
   if status == "READY" then
-    local mode = MeshCache.compressionStatus()
-    label = mode == "compressed" and "READY (COMPRESSED)"
-            or mode == "mixed" and "READY (MIXED)"
-            or mode == "raw" and "READY (RAW)"
-            or "READY"
+    local codec = MeshCache.codec()
+    if codec then
+      label = "READY (" .. codec:upper() .. ")"
+    else
+      local mode = MeshCache.compressionStatus()
+      label = mode == "mixed" and "READY (MIXED)"
+              or mode == "raw" and "READY (RAW)"
+              or "READY"
+    end
   end
-  -- which backend created the cache dir: the love.filesystem tree or the
-  -- mkdir shell fallback -- so a support report names the active path
+  -- which backend created the cache dir: love.filesystem or the libc
+  -- mkdir -- so a support report names the active path
   local backend = MeshCache.dirBackend()
   local backendLabel = backend == "love" and "LOVE FS"
-      or backend == "mkdir" and "MKDIR"
+      or backend == "ffi" and "FFI MKDIR"
       or "NONE"
   game.stack:push(TextBox.new(game,
     ("%s\fGEOMETRY %d\fDIR: %s"):format(label, MeshCache.GEOMETRY_VERSION,
