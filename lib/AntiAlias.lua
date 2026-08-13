@@ -229,7 +229,8 @@ function AntiAlias.resolve(canvas, w, h, slot)
   -- the scene canvas filters nearest for its usual 1:1 blit; the taps want
   -- linear, put back below so every other pass finds what it expects
   pcall(canvas.setFilter, canvas, "linear", "linear")
-  love.graphics.setColor()
+  -- white, explicit: LÖVE 11.5 setColor has no zero-argument form
+  love.graphics.setColor(1, 1, 1, 1)
   -- replace, not alpha-blend: this is an image-processing copy, and the alpha
   -- the shader worked out has to land as itself rather than be composited
   -- against whatever the target held

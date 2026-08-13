@@ -126,6 +126,54 @@ if brick then
   T.check(#ForestAtmos.setting.values >= 2, "FOREST FX ladder stays available")
   T.eq(AntiAlias.setting.values[1], 0, "AA defaults off")
   T.eq(#AntiAlias.setting.values, 3, "AA ladder stays available")
+  -- LÖVE 11.5 regression: the AA fold used to reset the draw colour with a
+  -- bare love.graphics.setColor(), which LÖVE rejects with "bad argument #1
+  -- to 'setColor' (number expected, got no value)". The throw rode the voxel
+  -- pipeline's draw path back up and the error handling disabled voxel for
+  -- the whole session. The fold must reset to explicit white -- and it must
+  -- survive a strict setColor stub that models LÖVE 11.5 exactly.
+  do
+    local oldLove = _G.love
+    local colorArgs
+    local targetCanvas
+    local function strictSetColor(...)
+      if select("#", ...) == 0 then
+        error("bad argument #1 to 'setColor' (number expected, got no value)")
+      end
+      colorArgs = { n = select("#", ...), ... }
+    end
+    _G.love = {
+      graphics = {
+        newCanvas = function(w, h)
+          local c = { w = w, h = h }
+          function c.getDimensions() return w, h end
+          function c.setFilter() end
+          function c.release() end
+          targetCanvas = c
+          return c
+        end,
+        newShader = function() return nil end,
+        getBlendMode = function() return "alpha", "alphamultiply" end,
+        setColor = strictSetColor,
+        setBlendMode = function() end,
+        setCanvas = function() end,
+        clear = function() end,
+        draw = function() end,
+        setShader = function() end,
+      },
+    }
+    local src = {}
+    function src.getDimensions() return 160, 160 end
+    function src.setFilter() end
+    local folded = AntiAlias.resolve(src, 37, 21, "aa-setColor-regression")
+    T.check(folded == targetCanvas,
+            "AA fold survives a strict LÖVE 11.5 setColor stub")
+    T.eq(colorArgs and colorArgs.n or 0, 4,
+         "the fold resets colour with explicit RGBA arguments")
+    T.eq(colorArgs and colorArgs[1] or 0, 1,
+         "the fold's colour reset is white")
+    _G.love = oldLove
+  end
   T.eq(WorldCurve.setting.values[1], 0, "V-CURVE defaults off")
   T.eq(#WorldCurve.setting.values, 4, "V-CURVE ladder stays available")
   T.eq(VoxelGrid.setting.values[1], false, "V-GRID defaults off")

@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.4.8] - 2026-08-13
+
+### Fixed
+
+- The anti-aliasing fold reset the draw colour with a bare
+  `love.graphics.setColor()` call, and LÖVE 11.5 has no zero-argument form of
+  `setColor` -- it throws `bad argument #1 to 'setColor' (number expected,
+  got no value)`. The throw rode the voxel pipeline's draw path back up, and
+  the error handling disabled the whole voxel mode for the session: the game
+  kept running but the overworld drew flat. The fold now resets to explicit
+  white `setColor(1, 1, 1, 1)` -- the v1.4.4 behaviour -- so the
+  supersampling pass can no longer take the mode down with it.
+
 ## [1.4.7] - 2026-08-13
 
 ### Fixed
