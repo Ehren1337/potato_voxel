@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.4.7] - 2026-08-13
+
+### Fixed
+
+- The mesh cache folder is now created correctly on a fresh install. The
+  shell-free directory creation only made the cache's own subfolders, so
+  when the save directory itself was brand new the cache was disabled for
+  the whole session (it read as "UNAVAILABLE" until a restart). It now
+  creates every missing level, from the root down, before writing.
+
 ## [1.4.6] - 2026-08-13
 
 ### Performance
