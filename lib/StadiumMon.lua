@@ -250,6 +250,12 @@ function StadiumMon:slotAnim(name)
   if not slot then return nil end
   local index = model.ctx[slot]
   if not index or index == StadiumPack.NONE then return nil end
+  -- a species whose entrance reads as a collapse (StadiumRig's scan, run at
+  -- load) is not sent out to the sound of it: it arrives on its standby
+  -- loop, which is exactly the fallback play() hands a missing entrance on
+  -- to. The entrance is the one slot with a verdict -- every other slot is
+  -- played as authored.
+  if name == "entrance" and model.collapseEntrance then return nil end
   return index + 1
 end
 

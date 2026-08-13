@@ -77,10 +77,14 @@ python3 tools/modkit.py pack mods/potato_voxel
   the save dir; delete it (or the whole `mod-derived` tree) to force a
   rebuild. `MeshCache.GEOMETRY_VERSION` must be bumped whenever geometry
   output changes — the cache fingerprint does not cover every geometry
-  knob. Large payloads use LZ4 compression when the runtime supports it;
-  raw payloads remain readable as a fallback. This reduces storage and cache
-  read cost, not steady-state GPU draw cost. Existing raw entries are repacked
-  lazily as they are loaded; running PREBUILD CACHE migrates the full set.
+  knob. Terrain and water payloads are quantized before compression:
+  positions as 16-bit pixels, texture coords as 16-bit, shade as 8-bit —
+  11 bytes a vertex instead of the 24-byte float stream (about 54% smaller),
+  with no visible change on the voxel grid. Large payloads then use LZ4
+  compression when the runtime supports it; raw payloads remain readable as
+  a fallback. This reduces storage and cache read cost, not steady-state GPU
+  draw cost. Existing raw entries are repacked lazily as they are loaded;
+  running PREBUILD CACHE migrates the full set.
   Boot-time READY checks read only bounded headers and file sizes; full
   decompression and checksum validation are deferred until a map is used.
 - **OPTIONS → PREBUILD CACHE** cooperatively builds every map's body and full

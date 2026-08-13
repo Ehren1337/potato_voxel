@@ -1,5 +1,58 @@
 # Changelog
 
+## [1.4.6] - 2026-08-13
+
+### Performance
+
+- Terrain and water meshes are now stored quantized: 11 bytes a vertex
+  (16-bit position, 16-bit texture coordinates, 8-bit shade) instead of the
+  24-byte six-float stream -- about 54% smaller before compression. Cache
+  files shrink and a cold map load reads and decompresses far less from
+  storage. Positions are integer pixels and come back exactly; texture
+  coordinates and shade round to 1/65535 and 1/255, both far finer than the
+  voxel grid or the baked ambient-occlusion steps can show. The mesh that
+  reaches the GPU is unchanged, so there is no visual difference and no
+  steady-state draw cost.
+
+### Changed
+
+- The mesh cache no longer uses shell commands to set itself up. The cache
+  folder is created through LÖVE's filesystem where it can reach it, and
+  through a direct library call on portable (SD-card) installs, with a real
+  write test before use -- so the cache works where shell access is
+  restricted or unavailable. WIPE CACHE lists files through the filesystem
+  API instead of a shell listing.
+
+- **CACHE STATUS** now names the compression method: **READY (LZ4)**,
+  **READY (ZSTD)**, **READY (RAW)**, or **READY (MIXED)**. The cache tries
+  zstd first when the runtime provides it, and reports whichever codec it
+  actually used.
+
+### Added
+
+- The cache format now records its compression codec per file, so a cache
+  written by one build stays readable by another and the status can name the
+  real method. Updating to 1.4.6 refreshes the cache once (the geometry
+  version moved to 18), in the background or on demand.
+
+## [1.4.5] - 2026-08-13
+
+### Fixed
+
+- Stadium models no longer play a hurt/faint-looking animation when sent
+  out. Two causes, both in the send-out entrance. The anchor that pins a
+  Pokemon to its tile over-corrected when an entrance hopped: the lagged
+  offset outlived the hop and dragged the body below the tile on the way
+  back down, which is a collapse no matter what the animation said. It is
+  clamped to the excursion that caused it, so a returned hop is not
+  dragged past the tile it came back to. And species whose entrance is a
+  genuine drop to well under standing height (Squirtle into its shell,
+  Goldeen flat on the ground -- 48 of the 151) no longer play it at all:
+  the entrance is measured once at load, through the anchor the player
+  actually sees, and a species that reads as hurt on arrival now arrives
+  on its standby loop instead. The standbys and the entrances that still
+  read as entrances are untouched.
+
 ## [1.4.4] - 2026-08-12
 
 ### Fixed
