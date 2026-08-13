@@ -307,15 +307,22 @@ local dirTriedAt = 0            -- os.clock() of the last attempt
 local cacheDir = false          -- resolved once; false when unusable
 local dirBackend = nil          -- how the dir was created: "love" or "ffi"
 
--- Create one directory level through libc (no shell). An already-existing
--- level returns non-zero (EEXIST) and is not an error -- the caller treats
--- this as best-effort and the write probe below decides. A host without the
--- POSIX mkdir symbol (or without ffi) simply gets false and the fallback is
--- skipped; portable-mode caching is already ffi-gated at available().
-local function mkdirOne(path)
+-- Create every missing level of `d` through libc (no shell), walking from
+-- the filesystem root like `mkdir -p`. An already-existing level returns
+-- non-zero (EEXIST) and is not an error -- best-effort per level, and the
+-- write probe below decides. A host without the POSIX mkdir symbol (or
+-- without ffi) simply skips; portable-mode caching is ffi-gated at
+-- available(). POSIX only in practice: portable mode (the one place the
+-- fallback runs) is Brick/Android, and desktop resolves the directory
+-- through love.filesystem before this is reached.
+local function mkdirTree(d, sep)
   if not (ffi and ffi.C) then return false end
-  local ok, rc = pcall(function() return ffi.C.mkdir(path, 493) end) -- 0755
-  return ok and rc == 0
+  local acc = ""
+  for part in d:gmatch("[^" .. sep .. "]+") do
+    acc = acc == "" and (sep .. part) or (acc .. sep .. part)
+    pcall(function() return ffi.C.mkdir(acc, 493) end) -- 0755
+  end
+  return true
 end
 
 function MeshCache.available()
@@ -401,13 +408,11 @@ function MeshCache.dir()
   end
   -- 2) libc mkdir fallback -- the only path in portable mode (the SD card
   -- is outside love.filesystem's root), and the retry path when
-  -- love.filesystem was unavailable or the folder unwritable. Best-effort
-  -- per level; the write probe is what decides. Failure stays a silent
-  -- no-op.
-  mkdirOne(base .. sep .. "mod-derived")
-  mkdirOne(base .. sep .. "mod-derived" .. sep .. "potato_voxel")
-  mkdirOne(base .. sep .. "mod-derived" .. sep .. "potato_voxel"
-                    .. sep .. "meshes")
+  -- love.filesystem was unavailable or the folder unwritable. Walks the
+  -- whole tree from the root (the base save dir itself may be missing on a
+  -- fresh install); the write probe is what decides. Failure stays a
+  -- silent no-op.
+  mkdirTree(d, sep)
   if not probeWritable(d) then return nil end
   cacheDir = d
   dirBackend = "ffi"
