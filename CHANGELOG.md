@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.5.2] - 2026-08-14
+
+### Fixed
+
+- The pinned DUSK and DAWN settings now have shadows. Both pins parked the
+  clock exactly ON the horizon, where the designed shadow fade (the last
+  12 degrees of elevation) had already taken the shadow strength to zero --
+  so a dusk or dawn look rendered the long clamped shadows at zero opacity:
+  a completely flat-lit world. The pins now stop at the last fully-lit
+  moment -- the edge of the fade, where strength is exactly full and the
+  shear is clamped to the 1.5x stretch cap -- so dusk and dawn read as the
+  long-shadow golden hour they are. The RUNNING cycle keeps its soft
+  shadowless handoff gap at the true horizon, and the sky palettes are
+  unchanged (the pins land inside the golden/dawn blends).
+
 ## [1.5.1] - 2026-08-14
 
 ### Fixed

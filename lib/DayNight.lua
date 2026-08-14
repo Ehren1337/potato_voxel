@@ -6,7 +6,9 @@
 -- dial, not separate looks -- or lets it run (CYCLE), in which case the pin
 -- the player left is where the cycle picks up. Everything below is a pure
 -- function of the clock, so the pinned settings and the running cycle can
--- never drift apart: DUSK is simply the cycle stopped at sunset.
+-- never drift apart: DUSK is the cycle stopped at the last fully-lit
+-- moment of sunset (the shadow-fade edge -- see RISE_RAMP), because a pin
+-- on the exact horizon reads as "no shadows at all".
 --
 -- THE SUN's noon is this mod's existing sun, exactly: shear (-0.85, -0.55),
 -- hanging in the southeast about 45 degrees up. That is the DAY setting and
@@ -57,8 +59,10 @@ DayNight.CYCLE = 1200         -- seconds around the whole dial
 DayNight.DAY_LEN = 600        -- the sun's half; the moon has the rest
 DayNight.BLEND = 75           -- seconds of palette blend either side of a twilight
 
--- where the pinned settings stop the clock
-DayNight.T = { dawn = 0, day = 300, dusk = 600, night = 900 }
+-- where the pinned settings stop the clock. dawn/dusk are computed
+-- below (they sit at the shadow-fade edge, not on the horizon -- see
+-- RISE_RAMP); day is noon and night is the moon at mid-night.
+DayNight.T = { day = 300, night = 900 }
 
 DayNight.KEY = "daytime"
 DayNight.LABEL = "DAYTIME"
@@ -109,6 +113,19 @@ DayNight.ALPHA_SUN = 0.40     -- the existing midday shadow weight
 DayNight.ALPHA_MOON = 0.26    -- moonlight is a softer press
 DayNight.FADE_DEG = 12        -- shadows fade out over the last degrees of a rise/set
 
+-- Where the pinned DUSK and DAWN settings stop the clock: NOT on the
+-- horizon. The shadow strength fades to nothing over the last FADE_DEG
+-- degrees of elevation, so a pin parked exactly at sunrise/sunset reads
+-- as a world with NO shadows at all -- the long dusk shadows the pin is
+-- FOR, times zero opacity. The pins sit at the last fully-lit moment
+-- instead (el == FADE_DEG, where strength is exactly 1 and the shear is
+-- clamped to K_MAX): long shadows, a low sun, a golden sky. The RUNNING
+-- cycle keeps its soft shadowless handoff gap at the true horizon.
+local RISE_RAMP = DayNight.DAY_LEN / math.pi
+                * math.asin(DayNight.FADE_DEG / EL_NOON)
+DayNight.T.dawn = RISE_RAMP
+DayNight.T.dusk = DayNight.DAY_LEN - RISE_RAMP
+
 -- disc PLACEMENT only: the true elevation would put the noon sun far above
 -- any frame, so the arc the discs ride is squashed toward the horizon. The
 -- shadows always use the true elevation.
@@ -122,8 +139,8 @@ end
 
 -- The body lighting the world at clock `t`: bearing and elevation in
 -- degrees, and whether it is the moon. The t == DAY_LEN boundary belongs to
--- the SUN, so the pinned DUSK setting is the sun half-set in the northwest,
--- not the moon rising.
+-- the SUN, so the pinned DUSK setting is the sun low in the northwest (at
+-- the shadow-fade edge), not the moon rising.
 function DayNight.bodyAt(t)
   t = t % DayNight.CYCLE
   if t <= DayNight.DAY_LEN then
@@ -205,9 +222,11 @@ DayNight.MOON_COLORS = { { 240, 244, 248 }, { 224, 232, 240 },
                          { 168, 184, 208 }, { 120, 136, 168 } }
 
 -- The dial as keyframes: a repeated name is a plateau, a change is a
--- BLEND-wide ramp. Laid out so DUSK and DAWN proper land exactly on their
--- pinned times, and so the evening approaches dusk THROUGH the golden-hour
--- waypoint rather than straight across the grey between blue and gold. The
+-- BLEND-wide ramp. The DUSK and DAWN pins land inside the golden/dawn
+-- blends (they sit at the shadow-fade edge, BLEND-seconds shy of the
+-- horizon keyframes), so a pinned dusk reads as the golden hour it is.
+-- The evening approaches dusk THROUGH the golden-hour waypoint rather
+-- than straight across the grey between blue and gold. The
 -- morning side needs no waypoint of its own: dawn's pinks into day's blues
 -- share a family and blend clean.
 local DIAL
