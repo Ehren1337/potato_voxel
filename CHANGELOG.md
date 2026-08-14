@@ -14,6 +14,13 @@
 - Cache loading now does less duplicate work, so revisiting maps is less likely
   to cause a long pause.
 
+### Performance note
+
+- This release has a known performance hit while the new precaching system is
+  being optimized. Cache building and some map changes may still take longer
+  than they will in a future update. The new system is a work in progress, and
+  later releases will focus on reducing that overhead.
+
 ## [1.5.4] - 2026-08-14
 
 ### Fixed
