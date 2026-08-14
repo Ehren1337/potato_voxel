@@ -53,3 +53,15 @@ jobs:
       - name: modkit validate
         working-directory: engine
         run: python3 tools/modkit.py validate mods/potato_voxel --base auto
+
+      # Shadow-math gates: the cadence probe (fit/snap cadence plus the
+      # full sun-cycle coverage sweep) and the deterministic shadow golden
+      # (the real fit/slack/bias/snug numbers across the cycle). Both are
+      # engine-independent and run in the mod checkout.
+      - name: Shadow cadence probe
+        working-directory: mod
+        run: luajit tests/shadow_cadence_probe.lua
+
+      - name: Shadow golden
+        working-directory: mod
+        run: luajit tests/shadow_golden.lua

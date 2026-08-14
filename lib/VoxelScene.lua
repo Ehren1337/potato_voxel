@@ -15,6 +15,11 @@ local V = ...
 local Mat4 = V.require("Mat4")
 local Voxel3D = V.require("Voxel3D")
 local ShadowMap = V.require("ShadowMap")
+local ShadowCast = V.require("ShadowCast")
+-- a session logs its shadow failure once, naming the gate that shut the
+-- pass off -- "shadows not appearing" reports otherwise arrive with no
+-- more to go on than the symptom
+local shadowUnavailableLogged = false
 local BrickProfile = V.require("BrickProfile")
 local ChunkMesher = V.require("ChunkMesher")
 local SpriteBillboards = V.require("SpriteBillboards")
@@ -843,7 +848,14 @@ end
 -- fit), so shadow edges land identically wherever they come from.
 local function castShadows(state, terrain, nbMesh, posed, cx, cy, vw, vh,
                            atlasFor, water, nbWater, battleCards, battleToken)
-  if not ShadowMap.available() then return end
+  if not ShadowMap.available() then
+    if not shadowUnavailableLogged then
+      shadowUnavailableLogged = true
+      pcall(print, "[PotatoVoxel] shadows unavailable: "
+                   .. tostring(ShadowMap.unavailableReason()))
+    end
+    return
+  end
 
   -- world layer: camera, view, pitch, sun, the head, and the meshes
   -- themselves. A sprite layer needs the same FIT, so it stamps the
@@ -872,32 +884,15 @@ local function castShadows(state, terrain, nbMesh, posed, cx, cy, vw, vh,
     -- the frame falls back to flat-lit instead of black.
     local ok, err = pcall(function()
       if not ShadowMap.begin(cx, cy, vw, vh, false) then return end
-      ShadowMap.draw(terrain, atlasFor(state.map), nil)
-      for i, nb in ipairs(state.neighbors or {}) do
-        ShadowMap.draw(nbMesh[i], atlasFor(nb.map),
-                       Mat4.translate(nb.ox, 0, nb.oy))
-      end
-      -- The water surface, which the terrain mesh no longer carries (it is its
-      -- own reflective pass now -- see Water). The sun still has to see it, or
-      -- the map the light records has a hole at every lake and the frustum's
-      -- far plane answers for the surface a shoreline tree's shadow falls on.
-      ShadowMap.draw(water, atlasFor(state.map), nil)
-      for i, nb in ipairs(state.neighbors or {}) do
-        ShadowMap.draw(nbWater and nbWater[i], atlasFor(nb.map),
-                       Mat4.translate(nb.ox, 0, nb.oy))
-      end
-      -- flower billboards live outside the terrain mesh (they draw after the
-      -- characters, pulled -- see render), but the sun still sees them: a
-      -- handful of cutouts per meadow, unlike the grass left out below.
-      -- Every thin card from here down is SNUGGED toward the sun along its own
-      -- ray (ShadowMap.snug) so its shadow keeps contact with its feet instead
-      -- of starting a bias-width away.
-      ShadowMap.draw(ChunkMesher.flowers(state.map), atlasFor(state.map),
-                     ShadowMap.snug(nil))
-      for _, nb in ipairs(state.neighbors or {}) do
-        ShadowMap.draw(ChunkMesher.flowers(nb.map), atlasFor(nb.map),
-                       ShadowMap.snug(Mat4.translate(nb.ox, 0, nb.oy)))
-      end
+      -- terrain, neighbour bodies, the water surfaces the sun has to see
+      -- through to the lake beds, and the snugged flower cards -- the one
+      -- shared world-layer run (lib/ShadowCast.lua)
+      ShadowCast.terrainAndWater(ShadowMap, ChunkMesher, {
+        map = state.map, atlasFor = atlasFor,
+        terrain = terrain, water = water,
+        neighbors = state.neighbors or {},
+        nbMesh = nbMesh, nbWater = nbWater,
+      })
       -- From here down it is the CAST, marked as such in the map (see
       -- ShadowMap.sprites) so water can decline them: everything the world casts
       -- still shades a lake, a silhouette of somebody standing beside it does
@@ -913,8 +908,12 @@ local function castShadows(state, terrain, nbMesh, posed, cx, cy, vw, vh,
           ShadowMap.draw(mesh, atlasFor(nb.map), ShadowMap.snug(caster))
         end)
       end
-      -- the STADIUM models: geometry, not cut-outs (see BattleScene.castShadows
-      -- for why they are un-snugged and outside the sprite flag)
+      ShadowMap.sprites(false)
+      -- the STADIUM models: geometry, not cut-outs -- un-snugged, and drawn
+      -- OUTSIDE the sprite flag exactly as the battle pass draws them, so
+      -- water receives them like every other world caster (the battle
+      -- arena always behaved this way; the overworld drew them inside the
+      -- flag and lakes declined the arena's own shadow)
       pcall(function()
         local stageArena, stageY = V.require("OverworldBattle").stage()
         if stageArena and stageArena.discs then
@@ -922,7 +921,6 @@ local function castShadows(state, terrain, nbMesh, posed, cx, cy, vw, vh,
         end
         V.require("Stadium").cast(ShadowMap)
       end)
-      ShadowMap.sprites(false)
       ShadowMap.finish(worldSig, false)
     end)
     if not ok then

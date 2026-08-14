@@ -1,4 +1,4 @@
-﻿-- Overworld battles: one frame of the arena, as geometry.
+-- Overworld battles: one frame of the arena, as geometry.
 --
 -- The same world the free-roam mode draws, from a placed camera instead of
 -- the orbit, at the WINDOW's own pixel resolution -- not the GB's. The
@@ -35,6 +35,7 @@ local V = ...
 local Mat4 = V.require("Mat4")
 local Voxel3D = V.require("Voxel3D")
 local ShadowMap = V.require("ShadowMap")
+local ShadowCast = V.require("ShadowCast")
 local SpriteBillboards = V.require("SpriteBillboards")
 local ChunkMesher = V.require("ChunkMesher")
 local TerrainAtlas = V.require("TerrainAtlas")
@@ -345,24 +346,13 @@ local function castShadows(state, arena, terrain, nbMesh, cx, cy, vw, vh,
       end)
       pcall(function() V.require("Stadium").cast(ShadowMap) end)
     else
-      ShadowMap.draw(terrain, atlasFor(host), nil)
-      for i, nb in ipairs(neighbors) do
-        ShadowMap.draw(nbMesh[i], atlasFor(nb.map),
-                       Mat4.translate(nb.ox, 0, nb.oy))
-      end
-      -- Water is a separate surface pass, but still belongs in the world
-      -- shadow layer so lakes receive terrain and building shadows.
-      ShadowMap.draw(water, atlasFor(host), nil)
-      for i, nb in ipairs(neighbors) do
-        ShadowMap.draw(nbWater and nbWater[i], atlasFor(nb.map),
-                       Mat4.translate(nb.ox, 0, nb.oy))
-      end
-      ShadowMap.draw(ChunkMesher.flowers(host), atlasFor(host),
-                     ShadowMap.snug(nil))
-      for _, nb in ipairs(neighbors) do
-        ShadowMap.draw(ChunkMesher.flowers(nb.map), atlasFor(nb.map),
-                       ShadowMap.snug(Mat4.translate(nb.ox, 0, nb.oy)))
-      end
+      -- the one shared world-layer run (lib/ShadowCast.lua)
+      ShadowCast.terrainAndWater(ShadowMap, ChunkMesher, {
+        map = host, atlasFor = atlasFor,
+        terrain = terrain, water = water,
+        neighbors = neighbors,
+        nbMesh = nbMesh, nbWater = nbWater,
+      })
       -- Stadium models are real geometry, not cut-out sprite cards.
       pcall(function() V.require("Stadium").cast(ShadowMap) end)
     end

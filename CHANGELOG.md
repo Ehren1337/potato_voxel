@@ -1,5 +1,83 @@
 # Changelog
 
+## [1.5.1] - 2026-08-14
+
+### Fixed
+
+- Sunset and moonrise shadows now appear on the far side of view. The sun
+  frustum's caster margin was only paid on the noon-sun side, so once the
+  day/night rig swung the sun past its noon bearing, the tall casters that
+  throw INTO view from off-screen (border trees past the horizon) were
+  never drawn into the map -- a hard shadowless band every evening. The
+  margin is now symmetric in both axes (the box grows a little and the
+  adaptive ladder absorbs it), verified by the new cycle sweep.
+- The overworld's Stadium arena no longer loses its shadow on water: the
+  arena was drawn inside the sprite flag in the overworld (water declines
+  sprite casters) but outside it in battles, so a lakeside fight only
+  shaded the water in the battle pass. Both scenes now share ONE
+  world-layer draw (lib/ShadowCast.lua) and draw the arena outside the
+  flag, exactly as battles always did.
+- Dawn/dusk shadows are capped at 1.5x a caster's height instead of 2x
+  (DayNight.K_MAX), which is what the "stretching" reports were seeing.
+
+### Added
+
+- tests/shadow_golden.lua: a deterministic golden over the shadow pass's
+  real fit/snap/slack/bias/snug numbers across the sun cycle, every rung
+  and two view sizes (64 digests). It is the capture half of the shadow
+  screenshot pipeline minus the GPU -- the engine has no headless capture
+  path -- and CI runs it. `--bless` re-blesses deliberately.
+- The shadow cadence probe now sweeps the full sun cycle (9 bearings x 4
+  shear magnitudes x 4 rungs x 2 views, 7200 coverage samples) asserting
+  the frustum covers every caster whose shadow lands on visible ground,
+  the snap matches the real fit, and the fit never produces NaN.
+- The suite now lints every shipped module for the forward-local bug
+  class (a function touching a name before its `local` declaration reads
+  a nil GLOBAL -- the BrickProfile Mali exception shipped exactly that
+  once). Zero false positives across main.lua, lib/ and data/.
+
+## [1.5.0] - 2026-08-14
+
+### Fixed
+
+- The player and NPCs now cast real sunlight shadows on EVERY voxel rung.
+  The sprite-layer actor map used to be a HIGH-only feature, so MEDIUM, LOW
+  and POTATO -- the rungs most of this potato build actually runs -- showed
+  fixed contact blobs under the characters while the world around them
+  carried sun shadows. The layer's canvas was already allocated on every
+  rung and the cast pass is a handful of quads, so the gate was saving
+  almost nothing; the blob decal now survives only as the no-shadow-map
+  fallback. Battles keep the blob decal below HIGH except on Mali, where
+  the decal path is the broken one and the actor map already proved itself
+  on every rung.
+- The shadow comparison's depth slack now tracks how low the sun sits.
+  The slope term was calibrated at the noon sun; under a dawn/dusk or
+  moonlit shear the lit-surface depth ramps grow and the old constant let
+  the acne bands through (the "stretching" streaks at golden hour). The
+  slack scales with the shear's magnitude -- doubled at the dawn/dusk
+  clamp, unchanged at noon -- and the snugged caster root rides the same
+  number, so shadows still start at the feet.
+- When the sun pass cannot run, the game now says WHY instead of quietly
+  dropping to flat lighting: the session log names the exact gate (no
+  canvas/depth API, shader failed to compile, canvas could not be
+  allocated or bound, degenerate frustum), and the reason is available to
+  the DEBUG HUD. "Shadows not appearing" reports can now carry the reason
+  straight into the issue tracker.
+
+## [1.4.9] - 2026-08-14
+
+### Fixed
+
+- Entering a map whose meshes were already prebuilt no longer flashes the
+  BUILDING VOXELS cover. A cache hit used to ride the same asynchronous job
+  queue as a fresh build: on large maps the queued load sliced through
+  several 12ms pump budgets, outlived the warp fade, and showed the cover
+  over terrain the disk cache had all along. A cold destination now loads
+  its prebuilt payload synchronously on the entry frame -- bounded
+  read/decompress/decode work the fade already covers -- so the world is
+  there when the fade lifts. Real builds, seam crossings and the
+  prebuilder keep the asynchronous path.
+
 ## [1.4.8] - 2026-08-13
 
 ### Fixed
