@@ -1028,6 +1028,7 @@ local function releaseEntry(c)
   releaseFigures(c.figures)
   c.figures = nil
   c.stale = nil
+  c.noDisk = nil
 end
 
 -- ---------------------------------------------------------- async builds
@@ -1284,6 +1285,51 @@ function ChunkMesher.request(map, bodyOnly, masks, urgent, force)
   -- time the player crosses into it, or the full build would wrongly
   -- go urgent.
   local c = entry(map.id)
+  -- Cold-entry cache fast path: a destination with a VALID prebuilt
+  -- payload loads it right here, synchronously, on the entry frame. The
+  -- read + decompress + decode is bounded work the warp fade already
+  -- covers -- and taking it out of the job queue is what makes a
+  -- prebuilt map enter without the BUILDING VOXELS cover: a queued load
+  -- sliced through 12ms pump budgets and outlived the fade on large
+  -- maps, flashing the cover over terrain the cache had all along. The
+  -- async queue still owns real builds, seam crossings (a body mesh
+  -- stands in there, so the full cooks at idle) and the prebuilder
+  -- (force). One attempt per entry: a rejected payload falls through to
+  -- the job, which rebuilds and rewrites it, and noDisk stops later
+  -- frames from re-attempting the same synchronous read.
+  if not force and not bodyOnly and MeshCache.available()
+     and c[slot] == nil and c.body == nil and not c.noDisk then
+    local tdata, wdata = MeshCache.loadTerrain(map, slot)
+    if tdata and wdata then
+      local mesh = meshFromData(tdata)
+      local water = meshFromData(wdata)
+      swapSlot(c, slot, mesh or false)
+      swapSlot(c, waterSlot(slot), water or false)
+      if c.stale then c.stale[slot] = nil end
+      -- the aux pair rides along now rather than hitching the first
+      -- visible frame (ChunkMesher.get loads it on demand otherwise)
+      local aux = MeshCache.loadAux(map, slot)
+      if aux then
+        local grass = meshFromData(aux.grass)
+        local flowers = meshFromData(aux.flowers)
+        local figures = {}
+        for _, fd in ipairs(aux.figures) do
+          local m = meshFromData(fd)
+          if m then
+            figures[#figures + 1] = { mesh = m, wx = fd.wx, wz = fd.wz,
+                                      y = fd.y, w = fd.w }
+          end
+        end
+        swapSlot(c, "grass", grass or false)
+        swapSlot(c, "flowers", flowers or false)
+        releaseFigures(c.figures)
+        c.figures = figures or false
+        if c.stale then c.stale.aux = nil end
+      end
+      return c[slot] or nil
+    end
+    c.noDisk = true
+  end
   if force then
     -- Force the job to validate/load the disk payloads or rebuild them.
     -- Mark aux too: a populated in-memory slot can otherwise skip

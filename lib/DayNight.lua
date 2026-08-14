@@ -102,7 +102,9 @@ local TH_RISE, TH_SET = -70, 250            -- north of east / north of west
 local TH_MRISE, TH_MMID, TH_MSET = -20, -90, -160
 local EL_MOON = 40
 
-DayNight.K_MAX = 2.0          -- shear clamp: a shadow at most twice its height
+DayNight.K_MAX = 1.5          -- shear clamp: a shadow at most 1.5x its height
+-- (2.0 read as "stretching" in dawn/dusk reports; the comparison slack now
+--  tracks whatever shear this chooses -- see ShadowMap._slackFor)
 DayNight.ALPHA_SUN = 0.40     -- the existing midday shadow weight
 DayNight.ALPHA_MOON = 0.26    -- moonlight is a softer press
 DayNight.FADE_DEG = 12        -- shadows fade out over the last degrees of a rise/set

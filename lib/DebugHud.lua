@@ -144,6 +144,22 @@ function DebugHud.statsLines()
   end)
   lines[#lines + 1] = ("PotatoVoxel %s"):format(version)
   lines[#lines + 1] = (("canvas fold %s"):format(upKind))
+  -- shadow lines: the pass's own state, so a "shadows not appearing"
+  -- screenshot carries the diagnosis -- or the exact reason the sun pass
+  -- is off at all. Each line stays inside the 17-glyph interior.
+  pcall(function()
+    local ShadowMap = V.require("ShadowMap")
+    if ShadowMap.available() then
+      local active = ShadowMap.active(false) and "on" or "off"
+      lines[#lines + 1] = ("shadow %s %dp"):format(active, ShadowMap.res)
+      if ShadowMap.beginFailure then
+        lines[#lines + 1] = ("sFail " .. ShadowMap.beginFailure):sub(1, 17)
+      end
+    else
+      local why = ShadowMap.unavailableReason() or "?"
+      lines[#lines + 1] = ("shadow off " .. why):sub(1, 17)
+    end
+  end)
   return lines
 end
 

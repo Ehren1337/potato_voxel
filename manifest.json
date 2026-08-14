@@ -1,7 +1,7 @@
 {
   "id": "potato_voxel",
   "name": "PotatoVoxel",
-  "version": "1.4.8",
+  "version": "1.5.1",
   "api": 2,
   "entry": "main.lua",
   "profile": "content",
@@ -23,5 +23,5 @@
   ],
   "affects_link": false,
   "github": "ShaneMcGovernIE/potato_voxel",
-  "description": "PotatoVoxel (fork of Dramatic Shape): the overworld as a 3D voxel diorama, retuned for low-end devices. Same diorama, with the settings that would otherwise cost a handheld its frame budget: the VOXEL ladder is a set of quality MODES (OFF / HIGH / MEDIUM / LOW / POTATO / CUSTOM) -- picking a mode applies its tuned defaults to the quality knobs (WATER, FOREST FX, AA, V-CURVE, V-GRID, 3D-BTL, SHADOWS), and touching any knob flips the mode to CUSTOM. A RENDER SCALE knob (100% / 75% / 50% / 33%) is the single biggest frame-budget lever, set by the modes and adjustable on its own; disk mesh cache. HIGH keeps the full two-layer actor shadow map; MEDIUM and lower use contact/blob actor shadows. One build for every device -- no desktop environment switch."
+  "description": "PotatoVoxel (fork of Dramatic Shape): the overworld as a 3D voxel diorama, retuned for low-end devices. Same diorama, with the settings that would otherwise cost a handheld its frame budget: the VOXEL ladder is a set of quality MODES (OFF / HIGH / MEDIUM / LOW / POTATO / CUSTOM) -- picking a mode applies its tuned defaults to the quality knobs (WATER, FOREST FX, AA, V-CURVE, V-GRID, 3D-BTL, SHADOWS), and touching any knob flips the mode to CUSTOM. A RENDER SCALE knob (100% / 75% / 50% / 33%) is the single biggest frame-budget lever, set by the modes and adjustable on its own; disk mesh cache. Every rung casts the player and NPCs through the two-layer actor shadow map (the contact/blob decal remains only when the shadow map itself cannot run). One build for every device -- no desktop environment switch."
 }

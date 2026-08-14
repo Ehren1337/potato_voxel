@@ -57,31 +57,38 @@ function BrickProfile.battleRenderScale()
   return BrickProfile.renderScale()
 end
 
+-- Set by apply() at boot (it is the only module that may legally know
+-- the renderer yet); DECLARED BEFORE the functions below -- a Lua local
+-- only binds from its declaration onward, and a function defined above it
+-- would silently read a nil GLOBAL of the same name instead.
+local profileShadowMap = nil
+
 function BrickProfile.battleActorShadowMap(level)
-  return level == 1
+  -- Mali GPUs break on the decal fallback path -- frozen last frame, black
+  -- frames, missing actor shadows -- while the sprite-layer map works, so
+  -- ACTIVE battles take the actor map on every rung there. Everywhere else
+  -- the arena stays blob-decals below HIGH: the battle cards animate every
+  -- frame, and the rung ladder exists to spend less on exactly that. OFF
+  -- (level 0) has no shadows anywhere, Mali included.
+  level = level or 0
+  return level == BrickProfile.DESKTOP_HIGH_LEVEL
+     or (level > 0 and profileShadowMap and profileShadowMap.isMali())
 end
 
--- Moving actors are the expensive, frequently changing half of the real
--- shadow-map path. HIGH always uses the full two-layer map, including the
--- animated actor layer, on desktop, Android, and the Brick. MEDIUM and lower
--- keep the existing contact/blob decal fallback for actors. The world layer
--- remains governed by the renderer's existing shadow gates.
---
--- One exception: Mali (Mediatek) GPUs break on the decal fallback path --
--- frozen last frame, black frames, missing actor shadows -- while the
--- sprite-layer map works. Every active rung gets the sprite layer there, so
--- a Mediatek phone renders the actor shadow the same proven way on CUSTOM
--- that it does on HIGH.
+-- Moving actors are the frequently changing half of the real shadow-map
+-- path. Every active rung now casts the player and NPCs through the sprite
+-- layer: the layer's canvas is already allocated on every rung and the cast
+-- pass is a handful of quads, so the old HIGH-only gate was saving almost
+-- nothing while leaving MEDIUM/LOW/POTATO players -- the majority of this
+-- potato build -- with contact blobs instead of the sunlight shadows the
+-- world around them gets. The contact/blob decal remains only as the
+-- no-shadow-map fallback (see VoxelScene.drawScene). The world layer stays
+-- governed by the renderer's existing shadow gates.
 BrickProfile.DESKTOP_HIGH_LEVEL = 1
 BrickProfile.DESKTOP_MEDIUM_LEVEL = 2
 
-local profileShadowMap = nil
-
 function BrickProfile.actorShadowMapEnabled(level)
-  if profileShadowMap and profileShadowMap.isMali() then
-    return (level or 0) > 0
-  end
-  return level == BrickProfile.DESKTOP_HIGH_LEVEL
+  return (level or 0) > 0
 end
 
 -- Active Brick rungs keep the cheap actor contact/blob fallback. The old

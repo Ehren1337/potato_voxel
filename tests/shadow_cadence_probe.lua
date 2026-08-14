@@ -72,13 +72,14 @@ end
 local function specCorners(cx, cy, vw, vh)
   local f = ShadowMap.sunDir()
   local view = Mat4.lookAt({ 0, 0, 0 }, f, { 0, 0, -1 })
-  local reach = ShadowMap.HEIGHT
-                * math.max(math.abs(ShadowMap.KX), math.abs(ShadowMap.KZ)) + 24
+  local reachX = math.abs(ShadowMap.KX) * ShadowMap.HEIGHT + 24
+  local reachZ = math.abs(ShadowMap.KZ) * ShadowMap.HEIGHT + 24
   local north = groundReach(vh)
   local spread = north * 0.5
-  local xs = { cx - vw / 2 - spread, cx + vw / 2 + spread + reach }
+  local xs = { cx - vw / 2 - spread - reachX,
+               cx + vw / 2 + spread + reachX }
   local ys = { -32, ShadowMap.HEIGHT }
-  local zs = { cy - north, cy + vh / 2 + reach }
+  local zs = { cy - north - reachZ, cy + vh / 2 + reachZ }
   local l, r, b, t
   for _, x in ipairs(xs) do
     for _, y in ipairs(ys) do
@@ -155,6 +156,88 @@ for _, vwvh in ipairs({ { 400, 200 }, { 640, 240 } }) do
   runScenario(("%dx%d west"):format(vw, vh), vw, vh, -STEP, 0)
   runScenario(("%dx%d north"):format(vw, vh), vw, vh, 0, -STEP)
 end
+
+-- --- sun-cycle sweep ---------------------------------------------------------
+-- The day/night rig swings the shear across bearings and magnitudes (the
+-- dawn/dusk clamp now sits at 1.5x height). Two invariants must hold at
+-- EVERY point of the cycle, on every rung and view size:
+--
+--   1. coverage: a max-height caster whose shadow lands on ground the
+--      camera can see stands INSIDE the box, whatever the sun's bearing --
+--      a sunset flips the shear's sign, and a one-sided caster margin
+--      leaves a shadowless band every evening.
+--   2. the real fitKey stays exactly the snap fit() performs (specCorners
+--      mirrors the real box math), and the real fit never produces NaN.
+local BEARINGS = { -70, -20, 0, 45, 90, 135, 180, 225, 250 }
+local SHEARS = { 0.2, 1.01, 1.5, 2.0 }   -- 2.0 guards a future clamp loosening
+local SWEEP_VIEWS = { { 400, 200 }, { 640, 240 } }
+
+ShadowMap.SIZES = { 512, 768, 1024 }     -- the Brick ladder, as apply() sets it
+
+local sweepCount = 0
+for _, k in ipairs(SHEARS) do
+  for _, deg in ipairs(BEARINGS) do
+    local th = math.rad(deg)
+    ShadowMap.KX = -math.cos(th) * k
+    ShadowMap.KZ = -math.sin(th) * k
+    for level = 1, 4 do
+      Voxel.level = level
+      ShadowMap.BRICK_HIGH_RES = (level == 1) and 1536 or nil
+      for _, vwvh in ipairs(SWEEP_VIEWS) do
+        local vw, vh = vwvh[1], vwvh[2]
+        local cx, cy = 137.5, 89.25
+        local l, r, b, t = specCorners(cx, cy, vw, vh)
+        local w, h = r - l, t - b
+        local res = ShadowMap._resolutionFor(w, h, level)
+        local fkx, fky = ShadowMap.fitKey(cx, cy, vw, vh)
+        local tx, ty = w / res, h / res
+        ok(math.floor(l / tx) == fkx and math.floor(b / ty) == fky,
+           ("sweep k=%.2f th=%d L%d %dx%d fitKey matches the snap")
+           :format(k, deg, level, vw, vh))
+        ok(res == math.floor(res) and res >= 256 and res <= 2048,
+           ("sweep k=%.2f th=%d L%d %dx%d resolution rung is sane")
+           :format(k, deg, level, vw, vh))
+        -- the real fit must succeed and write finite matrices
+        local fitOk = ShadowMap._fit(cx, cy, vw, vh)
+        ok(fitOk == true, ("sweep k=%.2f th=%d L%d %dx%d fit succeeds")
+           :format(k, deg, level, vw, vh))
+        local finite = true
+        for _, e in ipairs(ShadowMap.clipVP) do
+          if e ~= e or e == math.huge or e == -math.huge then finite = false end
+        end
+        ok(finite, ("sweep k=%.2f th=%d L%d %dx%d clipVP is finite")
+           :format(k, deg, level, vw, vh))
+        -- coverage: sample shadow points across the visible ground; the
+        -- caster that threw each must sit inside the box's world AABB
+        local north = groundReach(vh)
+        local spread = north * 0.5
+        local reachX = math.abs(ShadowMap.KX) * ShadowMap.HEIGHT + 24
+        local reachZ = math.abs(ShadowMap.KZ) * ShadowMap.HEIGHT + 24
+        local xs = { cx - vw / 2 - spread - reachX,
+                     cx + vw / 2 + spread + reachX }
+        local zs = { cy - north - reachZ, cy + vh / 2 + reachZ }
+        -- the shadow target samples walk the VISIBLE ground only: the
+        -- margin strips of the box exist to hold CASTERS, and a shadow
+        -- landing inside a margin strip is off-screen by construction
+        local qx0, qx1 = cx - vw / 2 - spread, cx + vw / 2 + spread
+        for gi = 0, 4 do
+          local qx = qx0 + (qx1 - qx0) * gi / 4
+          for gj = 0, 4 do
+            local qz = cy - north + (north + vh / 2) * gj / 4
+            local px = qx - ShadowMap.KX * ShadowMap.HEIGHT
+            local pz = qz - ShadowMap.KZ * ShadowMap.HEIGHT
+            ok(px >= xs[1] and px <= xs[2] and pz >= zs[1] and pz <= zs[2],
+               ("sweep k=%.2f th=%d L%d %dx%d caster covered (g%d,%d)")
+               :format(k, deg, level, vw, vh, gi, gj))
+            sweepCount = sweepCount + 1
+          end
+        end
+      end
+    end
+  end
+end
+io.write(("cycle sweep: %d coverage samples across %d shear/rung/view combos\n")
+         :format(sweepCount, #SHEARS * #BEARINGS * 4 * #SWEEP_VIEWS))
 
 -- --- report -----------------------------------------------------------------
 io.write("\nprobe complete: " .. passed .. " passed, " .. failed .. " failed\n")

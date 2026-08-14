@@ -317,20 +317,43 @@ getBlank = function()
   return blank or nil
 end
 
+local unavailable = nil    -- why available() last answered false
+
 -- Whether the sun pass can run at all. False headless, without shaders, or
 -- where the canvas cannot be made -- VoxelScene then keeps the flat decal
--- shadows, which need nothing but a quad.
+-- shadows, which need nothing but a quad. A false answer is sticky for the
+-- session (a driver does not grow a capability mid-session) and records
+-- WHY, so a "shadows not appearing" report names the gate instead of the
+-- player guessing.
 function ShadowMap.available()
+  if unavailable then return false end
   if love.system and love.system.getOS and love.system.getOS() == "iOS" then
+    unavailable = "shadows are disabled on iOS"
     return false
   end
   if not (love.graphics and love.graphics.newCanvas
           and love.graphics.setDepthMode) then
+    unavailable = "no canvas/depth-mode graphics API"
     return false
   end
   -- the smallest rung is enough to answer the question; fit() picks the
   -- one this frame actually wants
-  return getShader() ~= nil and getCanvas(ShadowMap.SIZES[1]) ~= nil
+  if getShader() == nil then
+    unavailable = "the shadow shader did not compile"
+    return false
+  end
+  if getCanvas(ShadowMap.SIZES[1]) == nil then
+    unavailable = "the shadow canvas could not be allocated"
+    return false
+  end
+  return true
+end
+
+-- Why the sun pass cannot run, for diagnostics; nil while it can. A player
+-- report can carry this string straight into the issue tracker.
+function ShadowMap.unavailableReason()
+  if ShadowMap.available() then return nil end
+  return unavailable
 end
 
 -- The map to sample, or the blank stand-in. Never nil once the main pass
@@ -439,16 +462,26 @@ local function boxCorners(cx, cy, vw, vh)
   local f = sunDir()
   local view = Mat4.lookAt({ 0, 0, 0 }, f, { 0, 0, -1 })
 
-  local reach = ShadowMap.HEIGHT
-                * math.max(math.abs(ShadowMap.KX), math.abs(ShadowMap.KZ)) + 24
+  -- The caster margin, paid on BOTH sides of each axis. The day/night rig
+  -- swings the sun across the sky, and a sunset (or moonrise) flips the
+  -- shear's sign: shadows that fell northwest at noon fall southeast at
+  -- dusk. A caster margin paid only on the noon side (east/south) left the
+  -- off-screen casters of the other side un-drawn, so a tall border tree
+  -- just past the horizon threw its sunset shadow into view and the map
+  -- had no record of it -- a hard shadowless band each evening. The
+  -- symmetric margin costs a little resolution (the box grows) and covers
+  -- every bearing the rig can choose.
+  local reachX = math.abs(ShadowMap.KX) * ShadowMap.HEIGHT + 24
+  local reachZ = math.abs(ShadowMap.KZ) * ShadowMap.HEIGHT + 24
   local north = groundReach(vh)
   -- the view widens with distance, so the far ground spans more than the
   -- near ground does; half the depth is a serviceable stand-in for the
   -- frustum's true spread and costs a good deal less resolution
   local spread = north * 0.5
-  local xs = { cx - vw / 2 - spread, cx + vw / 2 + spread + reach }
+  local xs = { cx - vw / 2 - spread - reachX,
+               cx + vw / 2 + spread + reachX }
   local ys = { -32, ShadowMap.HEIGHT }         -- -32 covers recessed water
-  local zs = { cy - north, cy + vh / 2 + reach }
+  local zs = { cy - north - reachZ, cy + vh / 2 + reachZ }
 
   local l, r, b, t, zn, zf
   for _, x in ipairs(xs) do
@@ -502,6 +535,22 @@ function ShadowMap._degenerate(w, h, near, far)
   return not (w > 0 and h > 0 and far > near)
 end
 
+-- The comparison slack (world pixels) a fitted map needs for a texel of
+-- `texel` world pixels under a sun whose shear is (kx, kz). BIAS covers the
+-- packed depth's quantisation; the SLOPE term covers the worst lit surface's
+-- depth ramp across a texel -- and that ramp grows as the sun sinks toward
+-- the horizon: a roof pitched away from a grazing sun ramps far faster than
+-- under the noon the calibration was measured at. The shear magnitude IS the
+-- cotangent of the elevation, so the noon shear (hypot 1.01) scales by 1
+-- and the dawn/dusk clamp (2.0) doubles the slope term. Kept pure so the
+-- suite can hold the calibration, and never narrower than noon -- an even
+-- higher sun only flattens the ramps.
+function ShadowMap._slackFor(texel, kx, kz)
+  local grazing = math.sqrt((kx or 0) * (kx or 0) + (kz or 0) * (kz or 0))
+  grazing = math.max(1, grazing / 1.01)
+  return ShadowMap.BIAS + ShadowMap.SLOPE * (texel or 0) * grazing
+end
+
 local function fit(cx, cy, vw, vh)
   local l, r, b, t, zn, zf, view = boxCorners(cx, cy, vw, vh)
 
@@ -542,13 +591,16 @@ local function fit(cx, cy, vw, vh)
   ShadowMap.extent = { r - l, t - b, far - near }
   -- the slack the comparison needs, against the coarser of the two texel
   -- axes (the box is asymmetric, and one number has to cover both)
-  ShadowMap.slack = ShadowMap.BIAS
-                    + ShadowMap.SLOPE * math.max(w, h) / res
+  ShadowMap.slack = ShadowMap._slackFor(math.max(w, h) / res,
+                                        ShadowMap.KX, ShadowMap.KZ)
   -- the stored depth spans the frustum, so a world-pixel bias is that
   -- fraction of it
   ShadowMap.bias = ShadowMap.slack / math.max(1, far - near)
   return true
 end
+-- the real fit, exported for the golden test -- same _-seam convention as
+-- _resolutionFor/_degenerate/_slackFor
+ShadowMap._fit = fit
 
 -- How much of the compare's forgiveness a snugged caster takes back, 0..1.
 -- Short of 1 on purpose: at exactly 1 the card's own fragments compare
@@ -616,25 +668,44 @@ end
 -- the default is the WORLD layer (terrain, water, flowers, figures).
 -- The two layers share the same fitted box, so only a world begin
 -- re-fits; a sprite begin reuses the current fit.
+-- Why begin() last returned false (transient -- cleared by the next
+-- successful begin), for diagnostics. Policy gates (the sprite layer being
+-- off on a rung) are not failures and leave this alone.
+ShadowMap.beginFailure = nil
+
 function ShadowMap.begin(cx, cy, vw, vh, sprites)
   if sprites and (not ShadowMap.SPRITE_LAYER or not actorLayerActive) then
     return false
   end
   local sh = getShader()
-  if not sh then return false end
+  if not sh then
+    ShadowMap.beginFailure = "the shadow shader did not compile"
+    return false
+  end
   if not sprites then
     -- fit first: it is what decides which resolution rung this view wants.
     -- The canvas is then (re)made at that edge -- the rung's whole point is
     -- how many texels the box is divided into, so a 1536 fit on a 1024
     -- canvas would be a 1024 map wearing a 1536 fit's snap and bias.
-    if not fit(cx, cy, vw, vh) then return false end
-    if getCanvas(ShadowMap.res) == nil then return false end
+    if not fit(cx, cy, vw, vh) then
+      ShadowMap.beginFailure = "the light frustum is degenerate this frame"
+      return false
+    end
+    if getCanvas(ShadowMap.res) == nil then
+      ShadowMap.beginFailure = "the shadow canvas could not be allocated"
+      return false
+    end
   end
   local c = sprites and spriteCanvas or canvas
-  if not c or c == false then return false end
+  if not c or c == false then
+    ShadowMap.beginFailure = sprites and "the sprite shadow canvas is unavailable"
+                             or "the shadow canvas is unavailable"
+    return false
+  end
   local ok = pcall(love.graphics.setCanvas, { c, depth = true })
   if not ok then
     pcall(love.graphics.setCanvas)
+    ShadowMap.beginFailure = "the shadow canvas could not be bound"
     return false
   end
   prevBlend, prevAlphaMode = love.graphics.getBlendMode()
@@ -658,6 +729,7 @@ function ShadowMap.begin(cx, cy, vw, vh, sprites)
     drawing = true
     ready = false
   end
+  ShadowMap.beginFailure = nil
   return true
 end
 
@@ -738,6 +810,8 @@ function ShadowMap.invalidate()
   drawing, drawingSprites = false, false
   ready, spritesReady = false, false
   lastSig, lastSpriteSig = nil, nil
+  unavailable = nil
+  ShadowMap.beginFailure = nil
 end
 
 return ShadowMap

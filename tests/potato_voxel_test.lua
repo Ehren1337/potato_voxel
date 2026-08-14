@@ -47,8 +47,8 @@ if brick then
   T.eq(ShadowMap.BRICK_HIGH_RES, 1536, "HIGH uses a 1536 shadow map")
   T.eq(ShadowMap._resolutionFor(100, 100, 1), 1536, "HIGH shadow map is fixed")
   T.eq(brick.actorShadowMapEnabled(1), true, "HIGH keeps both shadow layers")
-  for level = 2, 4 do T.eq(brick.actorShadowMapEnabled(level), false, "lower modes use contact shadows") end
-  for level = 1, 4 do T.eq(brick.shadowsEnabled(level), true, "active modes keep contact shadows") end
+  for level = 1, 4 do T.eq(brick.actorShadowMapEnabled(level), true, "every active mode casts actor sun shadows") end
+  for level = 1, 4 do T.eq(brick.shadowsEnabled(level), true, "active modes keep shadows on") end
   T.eq(brick.shadowsEnabled(0), false, "OFF disables shadows")
   local ShadowSettings = exports.lib.require("ShadowSettings")
   T.eq(ShadowSettings.enabledSetting.values[1], true, "SHADOWS defaults to on")
@@ -114,12 +114,48 @@ if brick then
             "Mali: CUSTOM keeps the actor shadow map")
     T.check(not brick.actorShadowMapEnabled(0),
             "Mali: OFF still disables it")
+    T.check(brick.battleActorShadowMap(2),
+            "Mali: MEDIUM battles also avoid the broken decal path")
+    T.check(not brick.battleActorShadowMap(0),
+            "Mali: OFF battles have no actor map")
   end
   if loveG then loveG.getRendererInfo = oldRendererInfo end
   ShadowMap._maliReset()
   T.check(not ShadowMap.isMali(), "a non-Mali renderer is not detected")
-  T.check(not brick.actorShadowMapEnabled(2),
-          "non-Mali: MEDIUM keeps the decal fallback")
+  T.check(brick.actorShadowMapEnabled(2),
+          "non-Mali: MEDIUM keeps the actor shadow map too")
+  T.check(brick.actorShadowMapEnabled(4),
+          "non-Mali: POTATO keeps the actor shadow map")
+  T.check(not brick.actorShadowMapEnabled(0),
+          "OFF disables the actor map")
+  T.check(not brick.battleActorShadowMap(2),
+          "non-Mali battles stay blob-decals below HIGH")
+  T.check(brick.battleActorShadowMap(1),
+          "HIGH battles keep the actor map")
+  -- The sun-grazing slack: the slope term scales with the shear's magnitude
+  -- (the cotangent of the sun's elevation), so a dawn/dusk or moonlit frame
+  -- keeps its acne margin instead of streaking. Noon is the calibration
+  -- point and must stay exactly the shipped value.
+  T.eq(ShadowMap._slackFor(1, 0, 0),
+       ShadowMap.BIAS + ShadowMap.SLOPE,
+       "the slack floor is the shipped noon calibration")
+  T.check(ShadowMap._slackFor(1, -0.85, -0.55)
+          > ShadowMap._slackFor(1, 0, 0),
+          "the shipped noon sun sits at (or above) the calibration floor")
+  T.check(ShadowMap._slackFor(1, -2.0, -0.0)
+          > ShadowMap._slackFor(1, -0.85, -0.55),
+          "a low sun widens the slope slack")
+  T.check(ShadowMap._slackFor(1, -1.19, 0)
+          > ShadowMap._slackFor(1, -0.85, -0.55),
+          "the moon widens the slope slack")
+  T.check(ShadowMap._slackFor(2, -0.85, -0.55)
+          > ShadowMap._slackFor(1, -0.85, -0.55),
+          "coarser texels take proportionally more slack")
+  -- diagnostics: a session without the sun pass must be able to say why
+  if not ShadowMap.available() then
+    T.check(type(ShadowMap.unavailableReason()) == "string",
+            "a disabled shadow pass names its reason")
+  end
   T.eq(Water.setting.values[1], "off", "WATER defaults off")
   T.eq(#Water.setting.values, 3, "WATER ladder stays available")
   T.eq(ForestAtmos.setting.values[1], "off", "FOREST FX defaults off")
@@ -487,9 +523,245 @@ if MeshCache and MeshCache.encodeMesh then
       end
       T.check(match, "loadAux grass index map is byte-identical")
     end
+    -- Cold-entry fast path: a destination with a VALID prebuilt payload
+    -- must load it synchronously inside request() -- no queued job, so the
+    -- BUILDING VOXELS cover never starts -- while a map with nothing on
+    -- disk still queues the async job (the cover path). This is the
+    -- large-map "prebuilt but still flashes the build screen" regression:
+    -- the job sliced the same load across 12ms pumps and outlived the
+    -- warp fade.
+    do
+      local ChunkMesher = exports.lib.require("ChunkMesher")
+      local rtLatch2
+      for i = 1, 12 do
+        if debug.getupvalue(MeshCache.dir, i) == "dirTried" then rtLatch2 = i end
+      end
+      local fpBase = "/tmp/dsm_fastpath"
+      os.execute('rm -rf "' .. fpBase .. '"')
+      MeshCache.portableBaseOverride = fpBase
+      if rtLatch2 then debug.setupvalue(MeshCache.dir, rtLatch2, false) end
+      local fastMap = { id = "FASTPATH_CITY",
+                        tileset = { image = "tilesets/sample.png", trueColor = false },
+                        renderer = { gbcAtlas = true } }
+      local fn = 16
+      local fBuf = ffi.new("float[?]", fn * 6)
+      for i = 0, fn - 1 do
+        fBuf[i * 6] = (i % 4) * 8
+        fBuf[i * 6 + 1] = 1
+        fBuf[i * 6 + 2] = (i % 4) * 8
+        fBuf[i * 6 + 3] = 0.25
+        fBuf[i * 6 + 4] = 0.25
+        fBuf[i * 6 + 5] = 0.75
+      end
+      MeshCache.saveTerrain(fastMap, "full", fBuf, fn)
+      MeshCache.saveWater(fastMap, "full", nil, 0, nil, 0)
+      local fQuads = {
+        { { 0, 0, 0 }, { 1, 0, 0 }, { 1, 1, 0 }, { 0, 1, 0 },
+          uv = { { 0, 1 }, { 1, 1 }, { 1, 0 }, { 0, 0 } }, shade = 0.5 },
+      }
+      local fBuf2 = ffi.new("float[?]", 4 * 6)
+      local fIdx = ffi.new("uint32_t[?]", 6)
+      local fK, fM = MeshCache.flattenQuads(fQuads, fBuf2, fIdx)
+      MeshCache.saveAux(fastMap, "full",
+                         { grass = { n = fK / 6, buf = fBuf2, m = fM,
+                                     idx = fIdx },
+                           flowers = nil, figures = {} })
+      -- fake GPU meshes so meshFromData's upload path runs headless,
+      -- and a data stub that satisfies MeshCache.available() while
+      -- keeping whatever codec the SDK has so compressed payloads still
+      -- round-trip
+      local oldLove = _G.love
+      local dataStub = {
+        newByteData = function(bytes)
+          local d = { ptr = ffi.new("uint8_t[?]", bytes) }
+          function d.getFFIPointer() return d.ptr end
+          function d.release() end
+          return d
+        end,
+      }
+      if oldLove and oldLove.data then
+        dataStub.compress = oldLove.data.compress
+        dataStub.decompress = oldLove.data.decompress
+      end
+      _G.love = {
+        data = dataStub,
+        graphics = {
+          newMesh = function()
+            local m = {}
+            function m.setVertices() end
+            function m.setVertexMap() end
+            function m.release() end
+            return m
+          end,
+        },
+      }
+      local mesh = ChunkMesher.request(fastMap, false, nil, true)
+      T.check(mesh ~= nil and mesh ~= false,
+              "cold entry with a cached payload loads it synchronously")
+      T.eq(ChunkMesher.pending(), 0,
+           "a synchronous cache load queues no build job")
+      T.check(ChunkMesher.pair(fastMap, false) ~= nil,
+              "the loaded pair answers from memory")
+      T.check(ChunkMesher.grass(fastMap) ~= nil,
+              "the aux grass rode the same fast path")
+      -- a map with nothing on disk still queues the async cover path
+      local coldMap = { id = "FASTPATH_MISS",
+                        tileset = { image = "tilesets/sample.png", trueColor = false },
+                        renderer = { gbcAtlas = true } }
+      T.check(ChunkMesher.request(coldMap, false, nil, true) == nil,
+              "a disk miss still defers to the async job")
+      T.eq(ChunkMesher.pending(), 1,
+           "the miss queues exactly one job")
+      T.check(ChunkMesher.request(coldMap, false, nil, true) == nil,
+              "the miss is not re-attempted synchronously")
+      T.eq(ChunkMesher.pending(), 1,
+           "the queued job is not duplicated by later frames")
+      _G.love = oldLove
+      os.execute('rm -rf "' .. fpBase .. '"')
+    end
     os.execute('rm -rf "' .. rtBase .. '"')
   end
 end
+
+  -- The forward-local lint (see lib/BrickProfile.lua): a function that
+  -- touches a name BEFORE the chunk's `local NAME =` declaration reads or
+  -- writes a GLOBAL of that name -- apply() wrote the local, the Mali gate
+  -- read a nil global, and the exception silently never fired. Scan every
+  -- shipped module: a bare touch of a name before its FIRST local
+  -- declaration fails the suite. Comments, [[ ]] long strings and
+  -- "quoted" strings are stripped first so text can never false-positive;
+  -- table keys, index keys and parameter lists are excluded from the
+  -- "touch" test.
+  do
+    -- main.lua is a file; lib/ and data/ are directories. io.open on a
+    -- DIRECTORY succeeds on macOS (only the read fails), so probing it as
+    -- a file would silently skip the whole tree -- exactly how the first
+    -- version of this lint missed the BrickProfile bug class.
+    local files = { "mods/potato_voxel/main.lua" }
+    for _, dir in ipairs({ "mods/potato_voxel/lib",
+                           "mods/potato_voxel/data" }) do
+      local p = io.popen('ls "' .. dir .. '"')
+      for f in p:lines() do files[#files + 1] = dir .. "/" .. f end
+      p:close()
+    end
+    local violations = {}
+    for _, path in ipairs(files) do
+      local f = io.open(path, "rb")
+      if f then
+        local src = f:read("*a") or ""
+        f:close()
+        -- strip in order: [[ ]] long strings first (their newlines are
+        -- KEPT -- a shader embedded in a long string must not shift the
+        -- lines below it), then PER LINE: quoted strings BEFORE comments --
+        -- a `--` inside a string literal is string content, and stripping
+        -- the comment first would unbalance the quotes and leak the text.
+        -- Line numbers stay the source's own throughout.
+        local stripped = src:gsub("%[%[(.-)%]%]", function(s) return s:gsub("[^\n]", " ") end)
+        local lines = {}
+        for line in (stripped .. "\n"):gmatch("(.-)\n") do
+          line = line:gsub('"[^"]*"', '""')
+          lines[#lines + 1] = line:gsub("%-%-[^\n]*", " ")
+        end
+        local declared = {}
+        -- is `name` a parameter of the function `pi` sits inside (or of a
+        -- for-loop header at or above it)? Those are locals, not touches.
+        -- is `name` bound in any scope enclosing line `pi` -- a parameter
+        -- of an enclosing function (nested closures included) or a
+        -- for-loop variable between it and `pi`? Those are locals, not
+        -- touches.
+        local function scoped(name, pi)
+          local k = pi
+          while k >= 1 do
+            local hdr = nil
+            for j = k, 1, -1 do
+              -- `local function f(...)` and the anonymous `function(...)`
+              -- form both start a scope
+              if lines[j]:match("%f[%w_]function[%s%(]") then hdr = j break end
+            end
+            if not hdr then return false end
+            local params = lines[hdr]:match("function[^%(]*%b()")
+            if not params then
+              -- the parameter list spans lines: join until it closes --
+              -- possibly BELOW the touch line (the touch may sit inside
+              -- the list itself)
+              local acc = lines[hdr]
+              for j = hdr + 1, math.min(hdr + 30, #lines) do
+                acc = acc .. " " .. lines[j]
+                params = acc:match("function[^%(]*%b()")
+                if params then break end
+              end
+            end
+            if params and params:find("%f[%w_]" .. name .. "%f[^%w_]") then
+              return true
+            end
+            for j = hdr, pi do
+              if lines[j]:match("^%s*for%s") and
+                 (lines[j]:match("for%s+[^=]-%f[%w_]" .. name
+                                  .. "%f[^%w_][^%n=]-in")
+                  or lines[j]:match("for%s+[%w_%s,]*%f[%w_]" .. name
+                                    .. "%f[^%w_]%s*=")) then
+                return true
+              end
+            end
+            k = hdr - 1   -- climb to the enclosing scope
+          end
+          return false
+        end
+        for li = 1, #lines do
+          -- `local a, b` without an initializer declares exactly like the
+          -- `=` form; capture both (the pattern also eats `local function`,
+          -- whose only captured name is "function" and is skipped below)
+          local decl = lines[li]:match("^%s*local%s+([%w_%s,]+)")
+          if decl then
+            -- every name the declaration binds: `local a, b = ...` declares
+            -- BOTH, and treating only the first as declared false-positives
+            -- the rest
+            for name in decl:gmatch("[%w_]+") do
+              if name ~= "function" and name ~= "_" and not declared[name] then
+                declared[name] = li
+                for pi = 1, li - 1 do
+                  local prior = lines[pi]
+                  -- a line-leading `name =` is a table key or an assignment
+                  -- target, not a read of the variable
+                  if prior:match("^%s*" .. name .. "%s*=") then goto continue end
+                  local pos = 1
+                  while true do
+                    local s = prior:find(name, pos, true)
+                    if not s then break end
+                    local j = s - 1
+                    while j >= 1 and prior:sub(j, j) == " " do j = j - 1 end
+                    local nonSpace = prior:sub(j, j)
+                    local pre = prior:sub(s - 1, s - 1)
+                    local post = prior:sub(s + #name, s + #name)
+                    -- a table key (the `{ k = v` and `..., k = v, ...`
+                    -- forms, whatever the spacing) is not a touch; everything
+                    -- else is judged on the token IMMEDIATELY before --
+                    -- `and profileShadowMap` is a standalone value, not a
+                    -- member of `and`
+                    local isKey = nonSpace == "," or nonSpace == "{"
+                    if not isKey
+                       and (pre == "" or not pre:match("[%w_%.:%(%[{%\"]"))
+                       and (post == "" or not post:match("[%w_]"))
+                       and not scoped(name, pi) then
+                      violations[#violations + 1] = path .. ":" .. pi
+                          .. " touches `" .. name .. "` before its first local at "
+                          .. li
+                      break
+                    end
+                    pos = s + #name
+                  end
+                  ::continue::
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+    for _, v in ipairs(violations) do print("FWD-LOCAL " .. v) end
+    T.eq(#violations, 0,
+         "no module touches a name before its first local declaration")
+  end
 
 run.release()
 T.finish("potato_voxel")
