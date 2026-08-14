@@ -20,6 +20,7 @@ if brick then
   local Structures = exports.lib.require("Structures")
   local OverworldBattle = exports.lib.require("OverworldBattle")
   local QualityMode = exports.lib.require("QualityMode")
+  local DayNight = exports.lib.require("DayNight")
   T.eq(#Voxel.ANGLES_DEG, 6, "VOXEL keeps OFF/HIGH/MEDIUM/LOW/POTATO/CUSTOM")
   T.eq(Voxel.ANGLE_LABELS[1], "OFF", "VOXEL OFF rung is retained")
   T.eq(Voxel.ANGLE_LABELS[2], "HIGH", "VOXEL HIGH rung is retained")
@@ -155,6 +156,30 @@ if brick then
   if not ShadowMap.available() then
     T.check(type(ShadowMap.unavailableReason()) == "string",
             "a disabled shadow pass names its reason")
+  end
+  -- DUSK/DAWN pins sit at the last fully-lit moment, not on the horizon:
+  -- a pin on the exact horizon rides the shadow fade down to strength
+  -- zero and reads as "no shadows in dusk/dawn"
+  T.check(DayNight.T.dawn > 0 and DayNight.T.dawn < DayNight.T.day,
+          "DAWN pins inside the day")
+  T.check(DayNight.T.dusk > DayNight.T.day
+          and DayNight.T.dusk < DayNight.DAY_LEN,
+          "DUSK pins inside the day")
+  T.check(DayNight.strengthAt(DayNight.T.dawn) > 1 - 1e-9,
+          "DAWN has full shadow strength")
+  T.check(DayNight.strengthAt(DayNight.T.dusk) > 1 - 1e-9,
+          "DUSK has full shadow strength")
+  T.check(DayNight.strengthAt(0) < 1e-9,
+          "the cycle's dawn horizon gap stays shadowless")
+  T.check(DayNight.strengthAt(DayNight.DAY_LEN) < 1e-9,
+          "the cycle's dusk horizon gap stays shadowless")
+  do
+    local dkx, dkz = DayNight.shearAt(DayNight.T.dusk)
+    T.check(math.sqrt(dkx * dkx + dkz * dkz) <= DayNight.K_MAX + 1e-9,
+            "DUSK shadows obey the stretch clamp")
+    local akx, akz = DayNight.shearAt(DayNight.T.dawn)
+    T.check(math.sqrt(akx * akx + akz * akz) <= DayNight.K_MAX + 1e-9,
+            "DAWN shadows obey the stretch clamp")
   end
   T.eq(Water.setting.values[1], "off", "WATER defaults off")
   T.eq(#Water.setting.values, 3, "WATER ladder stays available")
