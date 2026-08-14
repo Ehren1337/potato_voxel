@@ -191,7 +191,6 @@ local SHADER = [[
 
 ShadowMap._source = function() return SHADER end   -- named for the suite
 
-local shader = nil            -- nil = untried, false = unavailable
 local canvas = nil            -- nil = untried, false = unavailable
 local canvasRes = 0           -- the edge `canvas` was made at
 local spriteCanvas = nil      -- the CAST layer: sprites only (see below)
@@ -245,12 +244,10 @@ function ShadowMap._maliReset()
   maliDevice = nil
 end
 
+local ShaderCache = V.require("ShaderCache")
+
 local function getShader()
-  if shader == nil then
-    local ok, sh = pcall(love.graphics.newShader, SHADER)
-    shader = (ok and sh) or false
-  end
-  return shader or nil
+  return ShaderCache.get(SHADER)
 end
 
 -- The map canvas at edge `res`, rebuilt when the rung changes (a zoom
@@ -327,10 +324,6 @@ local unavailable = nil    -- why available() last answered false
 -- player guessing.
 function ShadowMap.available()
   if unavailable then return false end
-  if love.system and love.system.getOS and love.system.getOS() == "iOS" then
-    unavailable = "shadows are disabled on iOS"
-    return false
-  end
   if not (love.graphics and love.graphics.newCanvas
           and love.graphics.setDepthMode) then
     unavailable = "no canvas/depth-mode graphics API"

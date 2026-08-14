@@ -252,7 +252,7 @@ local function newModel(frag)
     tluts = {},             -- palettes: { count, data, dl }
     bones = {},             -- { parent, boneId, flags, chan, t, r, s }
     boneById = {},
-    prims = {},             -- { tex, tlut, mat, texAnim, cull, verts, tris }
+    prims = {},             -- { tex, tlut, mat, texAnim, cull, wrapS, wrapT, verts, tris }
     primsByKey = {},
     rootScale = { 1.0, 1.0, 1.0 },
     fx = {},                -- geo cmd 0x08 procedural effect nodes
@@ -398,13 +398,36 @@ function Model:walk(o, depth)
   end
 end
 
+-- The render tile's CMS/CMT values are the texture sampler state the N64
+-- applies to the S/T coordinates. They are kept as the original two-bit
+-- values: bit 0 selects mirrored wrapping and bit 1 selects clamping.
+function Model:tileWrap(mat)
+  if mat == nil then return 2, 2 end
+  local f = self.f
+  local s, t = 2, 2
+  for _ = 1, 16 do
+    local w0, w1 = f:u32(mat), f:u32(mat + 4)
+    local op = floor(w0 / 0x1000000)
+    if op == 0xF5 and floor(w1 / 0x1000000) % 8 == 0 then
+      s = floor(w1 / 0x100) % 4
+      t = floor(w1 / 0x40000) % 4
+    elseif op == 0xDF then
+      break
+    end
+    mat = mat + 8
+  end
+  return s, t
+end
+
 function Model:primFor(tex, tlut, mat, texAnim, cull)
   local key = tex .. "," .. tlut .. "," .. tostring(mat) .. ","
               .. texAnim .. "," .. cull
   local p = self.primsByKey[key]
   if p == nil then
+    local wrapS, wrapT = self:tileWrap(mat)
     p = { tex = tex, tlut = tlut, mat = mat, texAnim = texAnim, cull = cull,
-          verts = {}, nverts = 0, tris = {}, ntris = 0, remap = {} }
+          wrapS = wrapS, wrapT = wrapT, verts = {}, nverts = 0, tris = {},
+          ntris = 0, remap = {} }
     self.primsByKey[key] = p
     self.prims[#self.prims + 1] = p
   end
@@ -975,7 +998,8 @@ function StadiumFragment.extract(data, name)
         ni = ni + 3
       end
       prims[#prims + 1] = {
-        tex = ti, cull = p.cull, texAnim = p.texAnim, texMap = texMap,
+        tex = ti, cull = p.cull, wrapS = p.wrapS, wrapT = p.wrapT,
+        texAnim = p.texAnim, texMap = texMap,
         pos = pos, uv = uv, nrm = nrm, skin = skin, nverts = p.nverts,
         idx = idx, nidx = ni,
       }

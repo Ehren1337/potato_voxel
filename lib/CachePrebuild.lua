@@ -69,7 +69,7 @@ end
 
 function Prebuild.bootstrap(game)
   local data = game and game.data
-  MeshCache.configure(data)
+  MeshCache.configure(data, game)
   local jobs = Prebuild.enumerate(data and data.maps)
   local ready, done = MeshCache.ready(jobs)
   -- Not READY is no longer "start from zero": a build interrupted
@@ -83,7 +83,7 @@ function Prebuild.bootstrap(game)
             slot = nil, done = ready and #jobs or done, total = #jobs,
             game = nil, startedAt = nil, eta = nil, ready = ready,
             failed = false, error = nil, completed = completed }
-  -- Boot diagnostics: log the full cache identity, the resolved cache dir,
+  -- Boot diagnostics: log the full cache identity, the scoped cache backend,
   -- and -- when the cache was rejected -- exactly why, plus how it compares
   -- to the build.info sidecar written at build time. This is the only window
   -- into a persistent cache rejection on real hardware.
@@ -96,7 +96,7 @@ function Prebuild.bootstrap(game)
     .. " profile=" .. tostring(parts.profile)
     .. " dataKey=" .. tostring(parts.dataKey)
     .. " voidFill=" .. tostring(parts.voidFill))
-  print("[PotatoVoxel] cache dir: " .. tostring(MeshCache.dir()))
+  print("[PotatoVoxel] cache backend: " .. tostring(MeshCache.dir()))
   print("[PotatoVoxel] cache ready: " .. tostring(ready) .. " (" .. done
     .. "/" .. #jobs .. ")")
   if build then
@@ -159,7 +159,7 @@ end
 local function releaseMap(id, game)
   if liveMaps(game)[id] then return false end
   if ChunkMesher.release then ChunkMesher.release(id) end
-  local MapLoader = package.loaded["src.world.MapLoader"]
+  local MapLoader = require("src.world.MapLoader")
   local m = MapLoader and MapLoader.evict and MapLoader.cached(id)
   if m and MapLoader.evict then MapLoader.evict(id) end
   return true
@@ -191,14 +191,8 @@ local function now()
   return nil
 end
 
-local function android()
-  local system = love and love.system
-  if not (system and system.getOS) then return false end
-  local ok, os = pcall(system.getOS)
-  return ok and os == "Android"
-end
-
-Prebuild.isAndroid = android
+-- Platform queries are not exposed inside the sandbox.
+Prebuild.isAndroid = function() return false end
 
 function Prebuild.start(game)
   if state.running then
@@ -206,14 +200,20 @@ function Prebuild.start(game)
     return false
   end
   local data = game and game.data
+  -- The title screen starts with a save skeleton, then selected-playthrough
+  -- storage becomes available when OPTIONS opens. Reconfigure and rescan here
+  -- so resume records can never leak across that scope change.
+  MeshCache.configure(data, game)
   local jobs = Prebuild.enumerate(data and data.maps)
   if #jobs == 0 or not MeshCache.available() then return false end
+  local ready = MeshCache.ready(jobs)
+  local completed = {}
+  if not ready then completed = MeshCache.scanComplete(jobs) end
   MeshCache.begin()
   -- RESUME (F3): jobs the boot scan found complete are skipped, so a
   -- prebuild interrupted mid-session finishes the remainder instead of
   -- rebuilding everything from zero. A fresh build (empty completed)
   -- starts at the first job as before.
-  local completed = state.completed or {}
   local index = 1
   for i, job in ipairs(jobs) do
     local key = tostring(job.id) .. "/" .. tostring(job.slot)
@@ -230,6 +230,18 @@ end
 function Prebuild.cancel()
   if state.running then state.cancelled = true; return true end
   return false
+end
+
+-- The blocking progress screen owns the worker loop. Keep a worker error
+-- visible and recoverable instead of leaving the options row at BUILD 0/N
+-- with no explanation.
+function Prebuild.fail(err)
+  if not state.running then return false end
+  state.failed = true
+  state.error = tostring(err or "cache build failed")
+  print("[PotatoVoxel] cache build failed: " .. state.error)
+  finish(false)
+  return true
 end
 
 function Prebuild.wipe(game)
@@ -260,6 +272,7 @@ end
 function Prebuild.refresh(game)
   if state.running then return end
   local data = game and game.data
+  MeshCache.setGame(game)
   local jobs = Prebuild.enumerate(data and data.maps)
   if #jobs ~= state.total then
     -- the dataset changed under us (hot reload): full re-bootstrap
@@ -289,6 +302,17 @@ function Prebuild.activationDecision(status, running)
   return "start"
 end
 
+-- A completed mesher job can still fail cache verification when one of its
+-- payloads was not persisted. Never surface the mesher's successful status as
+-- the error text; prefer the storage detail and keep the failure retryable.
+function Prebuild.failureReason(jobStatus, verified, saveError)
+  if verified then return nil end
+  if jobStatus ~= "complete" then
+    return jobStatus or "cache build failed"
+  end
+  return saveError or "cache verification failed"
+end
+
 function Prebuild.update()
   if not state.running then return end
   if state.cancelled then finish(true); return end
@@ -306,11 +330,12 @@ function Prebuild.update()
   local bodyOnly = job.slot == "body"
   local jobStatus = ChunkMesher.jobStatus(job.id, bodyOnly)
   if jobStatus == "pending" then return end
-  if jobStatus ~= "complete" or not MeshCache.verifyJob(state.slot, job.slot) then
+  local verified = jobStatus == "complete"
+                 and MeshCache.verifyJob(state.slot, job.slot)
+  if not verified then
     state.failed = true
-    state.error = jobStatus
-      or MeshCache.saveError()
-      or "cache verification failed"
+    state.error = Prebuild.failureReason(jobStatus, verified,
+                                         MeshCache.saveError())
     finish(false)
     return
   end
@@ -333,7 +358,7 @@ end
 
 function Prebuild.status()
   if state.running then
-    return (android() and "B" or "BUILD ") .. ("%d/%d"):format(
+    return (Prebuild.isAndroid() and "B" or "BUILD ") .. ("%d/%d"):format(
       state.done, state.total)
   end
   if state.ready and MeshCache.isDirty() then state.ready = false end
@@ -346,6 +371,10 @@ end
 
 function Prebuild.progress()
   return state.done, state.total, state.running, state.eta
+end
+
+function Prebuild.error()
+  return state.error
 end
 
 function Prebuild.isReady()

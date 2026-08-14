@@ -15,11 +15,8 @@
 -- state, and nothing is wrapped or stamped. The panel is instrumentation
 -- for the player, not a feature that plays itself.
 --
--- When DS_PERF is already set (a benchmark run), the driver owns the
--- instrumentation -- it wraps the same four functions and stamps the frame
--- itself. DebugHud detects that (Perf.enabled is true at load) and only
--- DRAWS, never double-wraps or double-stamps, so a driver run with the row
--- on stays clean.
+-- When a benchmark driver owns the instrumentation, Perf.enabled is already
+-- true at load and this module only draws, never double-wraps or double-stamps.
 
 local V = ...
 
@@ -27,7 +24,7 @@ local ModSetting = V.require("ModSetting")
 
 local DebugHud = {}
 
--- the key under options.modOptions.DRAMATIC_SHAPE, shared by the row in
+-- the key under options.modOptions.potato_voxel, shared by the row in
 -- OPTIONS (the mod manager's page does not carry it: it is a viewer, not
 -- a knob, and the Brick's schema is deliberately empty)
 DebugHud.KEY = "debug"
@@ -41,7 +38,7 @@ function DebugHud.enabled()
 end
 
 -- Migrate the former option to OFF once. Existing users who had DEBUG enabled
--- must not keep the old value after the row is removed from the menu.
+-- must not keep a diagnostic overlay enabled after the row left the menu.
 local disabled = false
 function DebugHud.disable(game)
   if disabled then return end
@@ -56,9 +53,8 @@ end
 -- ------- instrumentation
 
 local armed = false
--- true when THIS module was the one to switch Perf on (DS_PERF was not
--- set). Only the owner stamps frames and calls drawStats, so a driver run
--- with the row on never double-counts.
+-- true when THIS module was the one to switch Perf on. Only the owner stamps
+-- frames and calls drawStats, so a driver run never double-counts.
 local ownsPerf = false
 
 function DebugHud.owns()
@@ -73,7 +69,7 @@ function DebugHud.arm()
   armed = true
   local Perf = V.require("Perf")
   if Perf.enabled then return end   -- the driver owns it; draw only
-  Perf.enabled = true
+  Perf.setEnabled(true)
   ownsPerf = true
   -- the same spans the bench driver wraps, with the same labels, so a
   -- panel read and a bench report talk about the same numbers
@@ -92,12 +88,12 @@ function DebugHud.frameHook()
   if on then
     DebugHud.arm()
     if ownsPerf then
-      Perf.enabled = true          -- re-affirm (a previous OFF cleared it)
+      Perf.setEnabled(true)        -- re-affirm (a previous OFF cleared it)
       Perf.frame()
       Perf.drawStats()
     end
   elseif ownsPerf then
-    Perf.enabled = false           -- nothing measured while the row is off
+    Perf.setEnabled(false)          -- nothing measured while the row is off
   end
 end
 
@@ -133,11 +129,11 @@ function DebugHud.statsLines()
     lines[#lines + 1] = ("tex %dMB"):format(math.floor(Perf.texturememory / 1048576))
   end
   -- identity lines: the version as loaded from the installed manifest and
-  -- the active canvas-fold mode -- the on-screen proof of which build is running
+  -- the active canvas-fold mode -- proof of which build is running
   local version, upKind = "?", "?"
   pcall(function()
-    local ok, body = love.filesystem.read("manifest.json")
-    if ok and body then
+    local body = V.mod:read("manifest.json")
+    if body then
       version = body:match('"version"%s*:%s*"([^"]+)"') or "?"
     end
     upKind = V.require("Upscale").kind() or "?"

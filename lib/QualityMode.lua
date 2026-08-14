@@ -30,7 +30,7 @@ local ShadowSettings = V.require("ShadowSettings")
 
 local QualityMode = {}
 
--- the key under options.modOptions.DRAMATIC_SHAPE, shared by the row in
+-- the key under options.modOptions.potato_voxel, shared by the row in
 -- OPTIONS and the mod manager's own settings page for this mod
 QualityMode.KEY = "renderScale"
 QualityMode.LABEL = "RENDER SCALE"

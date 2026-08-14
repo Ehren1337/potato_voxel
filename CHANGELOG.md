@@ -1,9 +1,77 @@
 # Changelog
 
+## [1.6.0] - 2026-08-14
+
+### Fixed
+
+- Cache controls are now hidden from the main menu. To build or manage the
+  cache, load a save first and use the in-game options. The cache can also be
+  built while loading into a save.
+- Moving between maps is smoother because cached map data loads in small steps
+  instead of stopping the game on the crossing frame.
+- Fixed stretched terrain and grass, black voids, broken shadows, and other
+  graphics glitches caused by bad cached mesh data.
+- Cache loading now does less duplicate work, so revisiting maps is less likely
+  to cause a long pause.
+
+## [1.5.4] - 2026-08-14
+
+### Fixed
+
+- PREBUILD CACHE, CACHE STATUS, and WIPE CACHE are now shown only after an
+  overworld playthrough is active. The title menu keeps the visual settings
+  without offering cache actions outside their valid lifecycle.
+- Entering an uncooked map no longer reads, decompresses, decodes, and uploads
+  its entire cached mesh synchronously inside the crossing-frame request.
+  Cached destinations now use the same cooperative worker as fresh builds.
+- Scoped cache reconstruction now yields between bounded `mod.storage`
+  records, and large vertex and index decoders yield throughout their loops.
+- Runtime cache loads decode each terrain, water, and auxiliary payload once
+  instead of validating it with a full decode and immediately decoding it a
+  second time for upload.
+
+## [1.5.3] - 2026-08-14
+
+### Fixed
+
+- Title boot no longer mistakes a non-empty launcher stack for restored
+  gameplay. The early cache probe stays unavailable instead of allocating a
+  temporary playthrough ID, so OPTIONS precaching and CONTINUE bind the same
+  selected save.
+- Cached grass, flowers, and authored figures now use dense Lua vertex rows.
+  The sparse sandbox layout collided every sixth vertex with an older row and
+  produced giant stretched triangles, black voids, and broken shadows.
+- A failed GPU vertex-map upload now rejects and releases the mesh instead of
+  drawing its quad vertices as corrupt unindexed triangles.
+- Cache geometry version 19 invalidates version 18's malformed auxiliary
+  meshes. One clean rebuild is required after updating.
+
 ## [1.5.2] - 2026-08-14
 
 ### Fixed
 
+- Title-screen precaching now binds `mod.storage:selected()` instead of
+  allocating cache data under the temporary boot save. A cache completed from
+  OPTIONS remains visible after CONTINUE.
+- Precache startup now rescans the newly bound storage scope, preventing resume
+  records from one playthrough from skipping jobs in another.
+- Precache auxiliary encoding now handles large table-backed flower fields,
+  preventing partial commits that surfaced as `FAILED complete`.
+- Precache failure reporting no longer masks cache verification or storage
+  errors with the mesher's successful `complete` status.
+- Precache cleanup no longer reads the sandbox-removed `package` global,
+  preventing a crash when a build finishes or fails.
+- The mesh precache now uses bounded, committed `mod.storage` records instead
+  of treating scoped storage like a raw filesystem. Large terrain, water, and
+  auxiliary payloads can resume after interruption, failed writes stay visible
+  on the cache screen, and existing unchunked records migrate lazily without
+  forcing a cold rebuild.
+- Stadium send-outs no longer play the hurt-looking entrance for the band of
+  species whose arrival dips to just under standing height -- the motion a
+  hit reaction makes. The entrance verdict's threshold moved from 0.65 to
+  0.8 of standing height, so a species that drops to anywhere near the
+  ground on arrival (Charmander among them) now arrives on its standby loop
+  instead, and the ones that still play an entrance are genuine flourishes.
 - The pinned DUSK and DAWN settings now have shadows. Both pins parked the
   clock exactly ON the horizon, where the designed shadow fade (the last
   12 degrees of elevation) had already taken the shadow strength to zero --

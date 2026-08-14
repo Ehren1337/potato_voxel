@@ -48,7 +48,7 @@ local ModSetting = V.require("ModSetting")
 
 local AntiAlias = {}
 
--- the key under options.modOptions.DRAMATIC_SHAPE, shared by the row in
+-- the key under options.modOptions.potato_voxel, shared by the row in
 -- OPTIONS and the mod manager's own settings page for this mod
 AntiAlias.KEY = "aa"
 AntiAlias.LABEL = "AA"
@@ -148,8 +148,8 @@ end
 -- The fold, and the whole of why it is a shader rather than a scaled draw
 -- with linear filtering on.
 --
--- The void this pass renders into is cleared to a TRANSPARENT BLACK, and at
--- the rungs below FULL a good deal of the frame is still that. Averaging a
+-- The void this pass renders into is cleared to a TRANSPARENT BLACK, and
+-- off the top quality modes a good deal of the frame is still that. Averaging a
 -- straight-alpha edge against it drags the result toward black as well as
 -- toward transparent, and then the engine's own composite multiplies by that
 -- alpha a second time -- so every silhouette against the void would come out
@@ -199,14 +199,10 @@ local SHADER = [[
 -- to remove. Tune by eye in-game; 0 is the plain box fold.
 AntiAlias.SHARP = 0.25
 
-local shader = nil            -- nil = untried, false = unavailable
+local ShaderCache = V.require("ShaderCache")
 
 local function getShader()
-  if shader == nil then
-    local ok, sh = pcall(love.graphics.newShader, SHADER)
-    shader = (ok and sh) or false
-  end
-  return shader or nil
+  return ShaderCache.get(SHADER)
 end
 
 -- Fold `canvas` down to `w` x `h` and hand back the result.

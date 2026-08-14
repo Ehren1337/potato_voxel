@@ -1,12 +1,9 @@
 -- Voxel world mode: the instrumentation core.
 --
--- Ships DARK. Every entry point is one boolean test away from doing
--- nothing, and the boolean is false unless a run explicitly asks for
--- measurement (DS_PERF in the environment, or a ds_perf.flag file in the
--- save directory for a device that has no environment to set). A mod that
--- measures itself in every player's session is a mod that costs every
--- player the measurement, so the default has to be off and the off path
--- has to be free.
+-- Ships DARK. Every entry point is one boolean test away from doing nothing,
+-- and the boolean is false unless a run explicitly asks for measurement. A
+-- mod that measures itself in every player's session is a mod that costs
+-- every player the measurement, so the default has to be off.
 --
 -- What it measures, and why those three things:
 --
@@ -26,29 +23,27 @@
 -- GPU-side saving shows up in the FRAME numbers rather than in the label
 -- for the pass that caused it, and both are reported.
 
+local V = ...
+
 local Perf = {}
 
 local clock = (love and love.timer and love.timer.getTime) or os.clock
+local storageGame = nil
+local lastFrame = nil
 
--- Read through pcall: the loader's sandbox does not hand a mod `os`, and
--- instrumentation must never be the reason the mod fails to load. Same
--- shape as OverworldBattle's DS_BATTLE_DEBUG probe.
-local function envFlag(name)
-  local ok, value = pcall(function() return os.getenv(name) end)
-  if not ok then return nil end
-  if value == nil or value == "" or value == "0" then return nil end
-  return value
+-- Environment and flag-file probes are unavailable to sandboxed mods. The
+-- diagnostics row can still arm this module explicitly for an in-game run.
+Perf.enabled = false
+
+function Perf.setEnabled(enabled)
+  Perf.enabled = enabled and true or false
+  if not Perf.enabled then lastFrame = nil end
+  return Perf.enabled
 end
 
-local function flagFile()
-  if not (love and love.filesystem and love.filesystem.getInfo) then
-    return false
-  end
-  local ok, info = pcall(love.filesystem.getInfo, "ds_perf.flag")
-  return ok and info ~= nil
+function Perf.setGame(game)
+  storageGame = game
 end
-
-Perf.enabled = (envFlag("DS_PERF") ~= nil) or flagFile()
 
 Perf.labels = {}      -- label -> { n, total, max }
 Perf.order = {}       -- insertion order, so a report reads chronologically
@@ -149,8 +144,6 @@ end
 -- Called once per RENDERED frame (the endFrame seam), not once per
 -- logic update: a scripted run can step the game many times per render,
 -- and a frame the player never saw cannot have hitched for them.
-
-local lastFrame = nil
 
 function Perf.frame()
   if not Perf.enabled then return end
@@ -315,19 +308,41 @@ function Perf.toJson(meta)
   return table.concat(parts, "")
 end
 
--- Written through love.filesystem (the save directory) rather than io:
--- a driver run and an Android session both have one, and neither is
--- guaranteed a writable working directory.
+local function storageApi()
+  local mod = V and V.mod
+  local storage = mod and mod.storage
+  if not (storage and storage.context and storage.write and storage.read
+          and storageGame) then
+    return nil
+  end
+  local ok, context = pcall(storage.context, storage, storageGame)
+  return ok and type(context) == "table" and storage or nil
+end
+
+local function storageKey(name)
+  local safe = tostring(name or "report")
+    :gsub("[^%w_/-]", "_")
+    :gsub("/+", "/")
+    :gsub("^/", "")
+    :gsub("/$", "")
+  if safe == "" then safe = "report" end
+  return "perf/" .. safe
+end
+
 function Perf.write(name, meta)
   local body = Perf.toJson(meta)
-  if love and love.filesystem then
-    pcall(love.filesystem.createDirectory, "ds_bench")
-    local ok = pcall(love.filesystem.write, "ds_bench/" .. name .. ".json", body)
-    if ok then
-      print("[perf] wrote " .. tostring(love.filesystem.getSaveDirectory())
-            .. "/ds_bench/" .. name .. ".json")
-      return true
-    end
+  local storage = storageApi()
+  if storage then
+    local key = storageKey(name)
+    local ok, result = pcall(storage.write, storage, storageGame, key,
+                              { body = body })
+    if ok and result == true then return true end
+  end
+  -- Storage is the durable replacement for the old host-file report. Logging
+  -- remains useful for a benchmark runner that is not attached to a game.
+  if V and V.mod and V.mod.log and V.mod.log.info then
+    V.mod.log:info("[perf] JSON %s: %s", tostring(name), body)
+    return false
   end
   print("[perf] JSON " .. name .. ": " .. body)
   return false

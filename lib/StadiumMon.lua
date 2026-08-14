@@ -166,7 +166,10 @@ StadiumMon.TRAVEL = 0.75
 -- the bar, which is how Gen 1 says "that hurt" and is already in the frame.
 local STATES = {
   idle = { slot = "idle", loop = true },
-  entrance = { slot = "entrance", loop = false, next = "idle" },
+  -- Stadium's battle table uses the animation labelled attack_default for the
+  -- send-out performance. The separate entrance context is not the clip the
+  -- battle plays when a Pokemon arrives.
+  entrance = { slot = "attack_default", loop = false, next = "idle" },
   faint = { slot = "faint", loop = false, hold = true },
   -- A move names its own animation out of the move table. `attack_default`
   -- is the fallback for one the table has nothing for -- which is what slot
@@ -195,6 +198,19 @@ end
 function StadiumMon:release()
   if self.rig then self.rig:release() end
   self.rig, self.model, self.species = nil, nil, nil
+end
+
+-- A new battler may reuse this side's rig when it has the same species as the
+-- one leaving. Clear every piece of per-battler animation state first: an
+-- outgoing attack/faint or send-out ramp must never outrank the replacement's
+-- entrance request.
+function StadiumMon:resetForArrival()
+  self.grow, self.grewOwn = nil, nil
+  self.done = false
+  self.visible, self.scale = false, 1
+  self.state, self.anim, self.time = "idle", nil, 0
+  self.loop, self.hold, self.aux = true, false, nil
+  if self.model then self:play("idle") end
 end
 
 -- ------- which species this side is showing
@@ -244,7 +260,10 @@ end
 -- ------- the state machine
 
 -- Which animation a context slot resolves to for this species, or nil.
-function StadiumMon:slotAnim(name)
+-- `avoidCollapse` is only used by the send-out state: attack_default is also
+-- the generic attack fallback, and a bad-looking arrival must not disable
+-- that actual attack.
+function StadiumMon:slotAnim(name, avoidCollapse)
   local model = self.model
   local slot = model and StadiumPack.SLOT[name]
   if not slot then return nil end
@@ -255,7 +274,9 @@ function StadiumMon:slotAnim(name)
   -- loop, which is exactly the fallback play() hands a missing entrance on
   -- to. The entrance is the one slot with a verdict -- every other slot is
   -- played as authored.
-  if name == "entrance" and model.collapseEntrance then return nil end
+  if avoidCollapse and name == "attack_default" and model.collapseEntrance then
+    return nil
+  end
   return index + 1
 end
 
@@ -266,7 +287,9 @@ function StadiumMon:play(state, animIndex, auxIndex)
   if not model then return false end
   local def = STATES[state] or STATES.idle
   local index = animIndex
-  if not index and def.slot then index = self:slotAnim(def.slot) end
+  if not index and def.slot then
+    index = self:slotAnim(def.slot, state == "entrance")
+  end
   if not index and def.fallback then index = self:slotAnim(def.fallback) end
   if not index then
     -- the species has nothing for this; the standby loop is always there
@@ -479,7 +502,7 @@ function StadiumMon:build()
   -- no clock of its own: the texture animation rides the frame pose() just
   -- resolved, which is what keeps a blink inside its standby loop and a
   -- fainted Pokemon's eyes shut once it has stopped moving
-  self.rig:textures(self.aux)
+  self.rig:textures(self.aux, self.loop)
   return true
 end
 

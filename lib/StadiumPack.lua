@@ -47,20 +47,30 @@ local floor = math.floor
 
 -- ------- where a pack comes from
 --
--- Two places, asked in this order.
---
--- CACHE_DIR is in the save directory and is what actually ships: the mod
--- carries no models (they are Pokemon Stadium's data), so StadiumInstall
--- builds them out of the player's own ROM on first run and writes them here.
---
--- DIR is inside the mod, and exists for a developer checkout that has run
--- tools/stadium_pack.py -- which is also how the oracle the Lua extractor is
--- tested against gets built. It is second because a locally built CURRENT
--- cache should win over whatever a checkout happens to have lying around --
--- current as judged by StadiumInstall's marker, so a cache an old extractor
--- built does not shadow a fresh set (see readPack).
-StadiumPack.CACHE_DIR = "potato_voxel/stadium"
+-- DIR is inside the mod and can be read through the scoped mod reader. Packs
+-- generated from a supplied ROM use the separate scoped-storage prefix.
+StadiumPack.CACHE_DIR = "stadium/packs"
 StadiumPack.DIR = "assets/stadium"
+local STORAGE_PREFIX = "stadium/packs"
+local storageGame = nil
+
+function StadiumPack.setGame(game)
+  storageGame = game
+end
+
+local function storageApi()
+  local mod = V and V.mod
+  local storage = mod and mod.storage
+  if not (storage and storage.read and storage.list and storageGame) then
+    return nil
+  end
+  local ok = pcall(storage.context, storage, storageGame)
+  return ok and storage or nil
+end
+
+local function storageKey(species)
+  return ("%s/%03d"):format(STORAGE_PREFIX, species)
+end
 
 -- ------- compression
 --
@@ -101,7 +111,7 @@ function StadiumPack.compress(body)
   return body
 end
 
--- Unwrap a pack read off disk. A raw DSM3 stream passes through untouched;
+-- Unwrap a pack read from the mod assets. A raw DSM3 stream passes through untouched;
 -- a compressed one is decompressed (nil if the container is corrupt or LZ4
 -- is missing, which the caller treats as "no pack").
 function StadiumPack.decompress(bytes)
@@ -116,28 +126,21 @@ function StadiumPack.decompress(bytes)
 end
 
 local function readPack(species)
-  local bytes = nil
-  -- The cache only counts when StadiumInstall's marker says it is a
-  -- complete, CURRENT build -- an old cache (a rev the extractor has since
-  -- fixed, a format that moved) must not shadow a fresh shipped set, and a
-  -- half-written folder must not be read at all. Required lazily: Install
-  -- requires this module at load, so the reverse edge cannot be taken then.
-  local rel = ("%s/%03d.dsm"):format(StadiumPack.CACHE_DIR, species)
-  if love and love.filesystem and love.filesystem.getInfo
-     and V.require("StadiumInstall").ready() then
-    local okInfo, info = pcall(love.filesystem.getInfo, rel, "file")
-    if okInfo and info then
-      local ok, got = pcall(love.filesystem.read, rel)
-      if ok and type(got) == "string" and #got > 4 then bytes = got end
+  local storage = storageApi()
+  if storage then
+    local ok, value = pcall(storage.read, storage, storageGame,
+                             storageKey(species))
+    if ok and type(value) == "table" and type(value.body) == "string"
+       and #value.body > 4 then
+      return StadiumPack.decompress(value.body)
     end
   end
-  if not bytes then
-    local mod = V.mod
-    if not (mod and mod.read) then return nil end
-    local ok, got = pcall(mod.read, mod,
-                          ("%s/%03d.dsm"):format(StadiumPack.DIR, species))
-    if ok and type(got) == "string" and #got > 4 then bytes = got end
-  end
+  local bytes = nil
+  local mod = V.mod
+  if not (mod and mod.read) then return nil end
+  local ok, got = pcall(mod.read, mod,
+                        ("%s/%03d.dsm"):format(StadiumPack.DIR, species))
+  if ok and type(got) == "string" and #got > 4 then bytes = got end
   if not bytes then return nil end
   return StadiumPack.decompress(bytes)
 end
@@ -298,10 +301,14 @@ local function readPrims(s, p, model)
     local prim = {}
     prim.tex, p = u16(s, p)
     prim.tex = prim.tex + 1
-    local cull, blend
-    cull, p = u8(s, p)
+    local rawCull, blend
+    rawCull, p = u8(s, p)
+    local encodedWrap = rawCull >= 0x80
+    if encodedWrap then rawCull = rawCull - 0x80 end
+    prim.cull = (rawCull % 2) == 1
+    prim.wrapS = encodedWrap and (floor(rawCull / 2) % 4) or 2
+    prim.wrapT = encodedWrap and (floor(rawCull / 8) % 4) or 2
     blend, p = u8(s, p)
-    prim.cull = cull ~= 0
     prim.additive = blend ~= 0
     prim.texAnim, p = i16(s, p)
 
@@ -581,7 +588,7 @@ function StadiumPack.keep(species)
   if species and cache[species] then touch(species) end
 end
 
--- Whether a pack for this species is on disk at all. Cheap enough to ask
+-- Whether a pack for this species is shipped at all. Cheap enough to ask
 -- before a battle commits to the mode, and the honest test: a mod
 -- installed without its assets folder must decline rather than error.
 function StadiumPack.available(species)

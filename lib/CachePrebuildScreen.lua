@@ -28,7 +28,14 @@ function Screen:update()
     if input:wasPressed("a") or input:wasPressed("b") then
       Prebuild.cancel()
       self:back()
+      return
     end
+
+    -- The blocking screen owns the build loop.  Advance exactly one
+    -- cooperative mesh slice per screen update so progress cannot depend on
+    -- the voxel render path (or leave the player staring at BUILD 0/N).
+    local ok, err = pcall(Prebuild.update)
+    if not ok then Prebuild.fail(err) end
     return
   end
 
@@ -58,6 +65,13 @@ function Screen:draw()
   elseif status == "READY" then
     Font.draw("CACHE READY", 16, 64)
     Font.draw("A: CONTINUE", 16, 88)
+  elseif status == "FAILED" then
+    Font.draw("FAILED", 16, 64)
+    local err = Prebuild.error and Prebuild.error()
+    if err then
+      Font.draw(tostring(err):gsub("[%c]", " "):sub(1, 18), 16, 80)
+    end
+    Font.draw("A/B: BACK", 16, 104)
   else
     Font.draw(status, 16, 64)
     Font.draw("A/B: BACK", 16, 88)

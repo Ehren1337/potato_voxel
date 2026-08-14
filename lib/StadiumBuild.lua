@@ -549,8 +549,12 @@ function StadiumBuild.pack(data, species, moveRows, ctx)
   for i = 1, #prims do
     local p = prims[i]
     w:u16(p.tex)
-    -- the display list's own cull mode: 1024 is G_CULL_BACK
-    w:u8((p.cull and p.cull ~= 0) and 1 or 0)
+    -- The low bit is the display list's cull mode (1024 is G_CULL_BACK).
+    -- Bit 7 marks the two four-state N64 CMS/CMT sampler values packed into
+    -- the otherwise-unused bits, so old DSM3 records remain readable.
+    local wrapS, wrapT = p.wrapS or 2, p.wrapT or 2
+    w:u8(0x80 + (p.cull and p.cull ~= 0 and 1 or 0)
+         + wrapS * 2 + wrapT * 8)
     w:u8((p.blend == "add") and 1 or 0)
     w:i16(p.texAnim or -1)
     -- sorted by the stream's own byte, which is what the reader keys on

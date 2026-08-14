@@ -59,14 +59,10 @@ local SHADER = [[
   }
 ]]
 
-local shader = nil            -- nil = untried, false = unavailable
+local ShaderCache = V.require("ShaderCache")
 
 local function getShader()
-  if shader == nil then
-    local ok, sh = pcall(love.graphics.newShader, SHADER)
-    shader = (ok and sh) or false
-  end
-  return shader or nil
+  return ShaderCache.get(SHADER)
 end
 
 local function canvasOf(w, h, filter)

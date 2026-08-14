@@ -122,6 +122,9 @@ end
 function Stadium.begin(arena)
   Stadium.finish()
   if not Stadium.enabled() then return false end
+  local install = V.require("StadiumInstall")
+  if install.setGame then install.setGame(game()) end
+  if StadiumPack.setGame then StadiumPack.setGame(game()) end
   -- a new fight gets its own first complaint: `reported` is a one-shot so the
   -- console is not filled sixty times a second, but latched for the whole
   -- process it would swallow every failure after the first one ever
@@ -365,18 +368,19 @@ function Stadium.update(dt, battle, groundY)
     -- change of species and setSpecies rebuilds everything -- but a trainer
     -- who leads with two Rattata sends the second one out onto the first
     -- one's dex number, so nothing downstream would notice. What it would
-    -- inherit is the state, and the state after a faint is `faint`, which
-    -- refuses every request there is (see StadiumMon.request -- a faint is
-    -- meant to be final). The new Pokemon would arrive lying on the ground.
+    -- inherit is the state: an attack or faint refuses a lower-ranked entrance
+    -- request (see StadiumMon.request), and the new Pokemon would arrive with
+    -- the previous occupant's pose.
     --
     -- The battler TABLE is the identity here rather than the species or the
     -- mon: it is the slot's occupant, and the engine replaces it on a switch,
     -- a send-out and a new battle alike.
     if session.at[side] ~= battler then
       session.at[side] = battler
-      -- a fresh arrival: this Pokemon has not grown out of its ball yet
-      if mon then mon.grow, mon.grewOwn = nil, nil end
-      if mon and mon.rig and mon.state == "faint" then mon:play("idle") end
+      -- a fresh arrival: this Pokemon has not grown out of its ball yet, and
+      -- it must not inherit an attack/faint state from the previous occupant
+      -- when both happen to share a species and therefore share the rig.
+      if mon then mon:resetForArrival() end
     end
     -- the collapse this side is owed, once its bar has finished emptying
     if session.faintPending and session.faintPending[side] then
@@ -697,12 +701,19 @@ function Stadium.report(err)
                  .. "and its opponent is unaffected", tostring(err))
 end
 
--- DS_STADIUM_DEBUG=1 prints what each side resolved to once a second, which
--- is how "nothing is on screen" gets told apart from "nothing was asked
--- for". Read through pcall: the loader's sandbox does not hand a mod `os`,
--- and a diagnostic must never be why the mod fails to load.
-local DEBUG = select(2, pcall(function() return os.getenv("DS_STADIUM_DEBUG") end))
-if DEBUG == nil or DEBUG == false then DEBUG = nil end
+-- External debug flags are unavailable to sandboxed mods. Keep this opt-in
+-- diagnostic dark unless a caller enables it through the module.
+local DEBUG = nil
+
+function Stadium.setDebug(enabled)
+  local previous = DEBUG and true or false
+  DEBUG = enabled and true or nil
+  return previous
+end
+
+function Stadium.debugEnabled()
+  return DEBUG and true or false
+end
 
 local debugAt = 0
 
