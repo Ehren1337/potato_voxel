@@ -125,13 +125,9 @@ end
 
 -- The shape profile ships with the mod; absent or broken simply means no
 -- building templates, and every building falls back to the volume path.
-local spec = nil
+local DataFile = V.require("DataFile")
 local function profile()
-  if spec == nil then
-    local ok, s = pcall(V.data, "voxel_heights")
-    spec = (ok and type(s) == "table") and s or false
-  end
-  return spec or nil
+  return DataFile.table("voxel_heights")
 end
 
 local models = {}          -- "<tileset>:<index>" -> prebuilt local quads

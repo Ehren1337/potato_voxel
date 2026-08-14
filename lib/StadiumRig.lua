@@ -65,6 +65,25 @@ local sin, cos, floor = math.sin, math.cos, math.floor
 -- binary angle (32768 = pi) to radians
 local ANG = math.pi / 32768
 
+-- N64 CMS/CMT are two-bit modes: bit 0 mirrors, bit 1 clamps. LÖVE's image
+-- wrap names are close enough to the hardware for the three modes used by
+-- Stadium. The sampler is applied immediately before each draw because one
+-- decoded texture can be used by primitives with different tile state.
+local function wrapMode(value)
+  value = value or 2
+  if value % 2 == 1 then return "mirroredrepeat" end
+  if value >= 2 then return "clamp" end
+  return "repeat"
+end
+
+local function applyWrap(part)
+  local image = part and part.texture
+  local prim = part and part.prim
+  if image and image.setWrap and prim then
+    pcall(image.setWrap, image, wrapMode(prim.wrapS), wrapMode(prim.wrapT))
+  end
+end
+
 -- ------- how a surface is lit
 --
 -- Voxel3D shades a face by its DIRECTION rather than by a light uniform:
@@ -486,13 +505,17 @@ StadiumRig.ANCHOR_STEADY = 0.5
 -- this module is below it and a require would be circular. Position 1 of
 -- StadiumPack.CONTEXT, which is the format's own contract.
 local IDLE_SLOT = 1
--- And which one the send-out entrance is. Position 4 of the same contract.
-local ENTRANCE_SLOT = 4
+-- And which one the send-out entrance is. Position 2 of the same contract:
+-- the battle's `attack_default` context is the arrival performance.
+local ENTRANCE_SLOT = 2
 
 -- How deep an entrance may carry the body before it stops being an entrance
--- and reads as a collapse (see measureBind's scan). Compared against the
--- species' own standing height.
-StadiumRig.COLLAPSE_RATIO = 0.65
+-- and reads as hurt (see measureBind's scan). Compared against the species'
+-- own standing height. 0.8 rather than anything tighter: the band between
+-- 0.65 and 0.8 is full of entrances that dip to just under standing for a
+-- beat -- the exact motion a hit reaction makes -- and a Pokemon arriving
+-- hurt is worse than arriving plainly (Charmander sits right in that band).
+StadiumRig.COLLAPSE_RATIO = 0.8
 
 -- The anchor limit the collapse scan poses with, in body-heights. The game
 -- value lives in StadiumMon.TRAVEL, and this module sits below StadiumMon,
@@ -617,17 +640,18 @@ function StadiumRig:measureBind()
     end
   end
 
-  -- ------- and whether the send-out entrance reads as a collapse
+  -- ------- and whether the send-out entrance reads as hurt
   --
   -- The entrance is what plays when a Pokemon is sent out, and for most of
   -- the set it is a flourish that ends on the standby pose. For a big
-  -- minority it is a drop: the body falls to well under its standing height
-  -- for a sustained stretch (Squirtle retreats into its shell, Goldeen lies
-  -- flat), which on a fixed tile at send-out reads as "hurt" -- and a
-  -- Pokemon arriving hurt is worse than arriving plainly. A species marked
-  -- here plays its standby loop at send-out instead of the entrance, the
-  -- same fallback a species with no entrance slot at all already gets (see
-  -- StadiumMon.play).
+  -- minority it drops: the body falls well under its standing height for a
+  -- stretch (Squirtle retreats into its shell, Goldeen lies flat), and a
+  -- band just above that dips to just under standing for a beat -- the
+  -- exact motion a hit reaction makes. Either one, on a fixed tile at
+  -- send-out, reads as "hurt" -- and a Pokemon arriving hurt is worse than
+  -- arriving plainly. A species marked here plays its standby loop at
+  -- send-out instead of the entrance, the same fallback a species with no
+  -- entrance slot at all already gets (see StadiumMon.play).
   --
   -- Measured WITH the anchor, because that is the picture the player sees
   -- and the anchor is part of it: an entrance that hops beyond the limit is
@@ -831,23 +855,22 @@ end
 -- The eyes, and everything else a material swaps per frame.
 --
 -- Sampled at the SKELETAL animation's own frame -- the one pose() just
--- resolved -- and CLAMPED past the end of the stream rather than wrapped.
--- Both halves of that matter, and getting either wrong is visible.
+-- resolved. A short stream layered over a LOOPING pose returns to its first
+-- texture after the one-shot finishes; a non-looping pose holds its final
+-- texture. Both halves of that matter, and getting either wrong is visible.
 --
 -- The frame is the skeleton's because in the game a single counter drives
 -- both; the data says so plainly, since 507 of the 691 paired animations in
 -- the set have a texture animation exactly as long as the skeletal one it
 -- rides with.
 --
--- The clamp is what the game's own sampler does (func_80017540 indexes the
--- stream and holds the last entry past its end), and it is the whole
--- difference between a blink and a twitch. Rattata's standby loop is forty
--- frames and its blink is FIVE -- `6 8 7 8 6`, open through closed and back.
--- Wrapped on the blink's own length that plays six times a second, which is
--- what it looked like. Clamped, the eye blinks once at the top of the loop
--- and stays open for the remaining thirty-five frames, so it blinks about
--- once a second and a half.
-function StadiumRig:textures(aux)
+-- The source sampler clamps one-shot texture streams (func_80017540), but
+-- its owner resets that state when a looping battle animation starts another
+-- cycle. That reset is important for models such as Clefairy: the seven-frame
+-- idle eye stream ends on a partial-lid texture, which is not its neutral face.
+-- Do not wrap the stream on its own length; return to its first entry only
+-- after a looping skeletal clip has exhausted it.
+function StadiumRig:textures(aux, looping)
   local model = self.model
   local anim = aux and model.auxAnims and model.auxAnims[aux] or nil
   local frame = self.frameAt or 0
@@ -858,14 +881,20 @@ function StadiumRig:textures(aux)
       local stream = anim.channels[prim.texAnim + 1]
       local n = stream and #stream or 0
       if n > 0 then
-        local at = frame + 1
-        if at > n then at = n end
+        local at
+        if looping and frame >= n then
+          at = 1
+        else
+          at = frame + 1
+          if at > n then at = n end
+        end
         if at < 1 then at = 1 end
         local mapped = prim.texMap[stream[at]]
         if mapped then index = mapped end
       end
     end
     part.texture = StadiumPack.image(model, index)
+    applyWrap(part)
   end
 end
 
@@ -902,6 +931,7 @@ function StadiumRig:draw(matrix, pull)
       additive = additive or {}
       additive[#additive + 1] = part
     elseif part.texture then
+      applyWrap(part)
       Voxel3D.draw(part.mesh, part.texture, matrix, pull, nil, false)
     end
   end
@@ -909,6 +939,7 @@ function StadiumRig:draw(matrix, pull)
     Voxel3D.blend("add")
     for _, part in ipairs(additive) do
       if part.texture then
+        applyWrap(part)
         Voxel3D.draw(part.mesh, part.texture, matrix, pull, nil, false)
       end
     end
@@ -925,6 +956,7 @@ end
 function StadiumRig:caster(shadowMap, matrix)
   for _, part in ipairs(self.parts) do
     if part.texture and not part.prim.additive then
+      applyWrap(part)
       shadowMap.draw(part.mesh, part.texture, matrix)
     end
   end

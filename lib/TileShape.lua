@@ -215,16 +215,12 @@ local mntCache = {}       -- tileset id -> parsed mounted masks, or false
 local bgCache = {}        -- tileset id -> prop background shades, or false
 
 -- The shape profile ships with the mod (data/voxel_heights.lua) and is read
--- through the mod's own file loader rather than package.path: a mod's
--- directory is not on it, and may live inside a mounted .love archive that
--- plain require cannot reach either.  Absent or broken degrades to the
--- derived defaults, which is a rougher-looking world rather than no world.
+-- through DataFile (the mod's own file loader rather than package.path).
+-- Absent or broken degrades to the derived defaults, which is a
+-- rougher-looking world rather than no world.
+local DataFile = V.require("DataFile")
 local function load()
-  if spec == nil then
-    local ok, s = pcall(V.data, "voxel_heights")
-    spec = (ok and type(s) == "table") and s or false
-  end
-  return spec or nil
+  return DataFile.table("voxel_heights")
 end
 
 function TileShape.heights()

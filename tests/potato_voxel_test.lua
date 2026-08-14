@@ -5,10 +5,21 @@ local Data = require("src.core.Data")
 Data:load()
 local run = T.sdk.loadMod("mods/potato_voxel", { data = Data })
 T.eq(#run.errors, 0, "loads clean")
+-- the settings surface (lib/VoxelSettings) registers everything it owns
+local screens = run.data.screens or {}
+T.check(screens["PotatoVoxelSettings"] ~= nil,
+        "the VOXEL SETTINGS screen is registered")
 local exports = run.loader.exports.potato_voxel
 T.check(exports ~= nil, "mod exports a table")
 local brick = exports and exports.brick
 T.check(brick ~= nil and brick.isBrick(), "the one build is the Brick build")
+-- the manager page defines every setting row; the two VR rows only join it
+-- on a platform that can do VR at all (the headless harness cannot)
+local schemas = run.loader.optionSchemas
+local vrSupported = exports and exports.lib.require("VR").supported()
+T.check(schemas and schemas.potato_voxel
+        and #schemas.potato_voxel == (vrSupported and 14 or 12),
+        "the manager page defines every setting row")
 if brick then
   local Voxel = exports.lib.require("VoxelState")
   local ShadowMap = exports.lib.require("ShadowMap")
@@ -21,6 +32,11 @@ if brick then
   local OverworldBattle = exports.lib.require("OverworldBattle")
   local QualityMode = exports.lib.require("QualityMode")
   local DayNight = exports.lib.require("DayNight")
+  local VoxelSettings = exports.lib.require("VoxelSettings")
+  T.check(type(VoxelSettings.rows) == "function",
+          "the settings module builds the submenu rows")
+  T.check(type(VoxelSettings.pinEngineFx) == "function",
+          "the settings module owns the engine-FX pin")
   T.eq(#Voxel.ANGLES_DEG, 6, "VOXEL keeps OFF/HIGH/MEDIUM/LOW/POTATO/CUSTOM")
   T.eq(Voxel.ANGLE_LABELS[1], "OFF", "VOXEL OFF rung is retained")
   T.eq(Voxel.ANGLE_LABELS[2], "HIGH", "VOXEL HIGH rung is retained")
@@ -290,7 +306,7 @@ if brick then
    local function fakeMon(collapse)
      local mon = StadiumMon.new("player")
      mon.model = {
-       ctx = { [1] = 0, [4] = 1 },
+       ctx = { [1] = 0, [2] = 1, [4] = 0 },
        anims = {
          { seconds = 1, aux = -1 },
          { seconds = 2, aux = -1 },
@@ -304,12 +320,40 @@ if brick then
    T.check(clean:request("entrance"),
            "a normal entrance request is accepted")
    T.eq(clean.state, "entrance", "and plays the entrance state")
+   T.eq(clean.anim, 2,
+        "the send-out uses the attack_default context animation")
    local collapse = fakeMon(true)
    T.check(collapse:request("entrance"),
            "a collapse-marked entrance request still lands")
    T.eq(collapse.state, "idle",
         "but arrives on its standby loop instead of the collapse")
    T.eq(collapse.anim, 1, "the standby loop is the one that plays")
+   -- A same-species replacement reuses the rig.  If the outgoing Pokemon was
+   -- still in its damage-looking attack state, the new one must not inherit
+   -- that state and block its own send-out entrance.
+   local replacement = fakeMon(false)
+   replacement:play("attack")
+   replacement.grow, replacement.grewOwn, replacement.done = 0.5, true, true
+   replacement:resetForArrival()
+   T.eq(replacement.state, "idle",
+        "a same-species replacement clears the outgoing animation state")
+   T.eq(replacement.anim, 1,
+        "a same-species replacement returns to the standby animation")
+   T.check(not replacement.grow and not replacement.grewOwn
+              and not replacement.done,
+            "a replacement clears the outgoing send-out and completion flags")
+   T.check(replacement:request("entrance"),
+           "a replacement can start its own send-out entrance")
+   T.eq(replacement.state, "entrance",
+        "the replacement entrance is not blocked by the old attack")
+   local trainerReplacement = fakeMon(false)
+   trainerReplacement.side = "enemy"
+   trainerReplacement:play("attack")
+   trainerReplacement:resetForArrival()
+   T.check(trainerReplacement:request("entrance"),
+           "a trainer replacement can start its own send-out entrance")
+   T.eq(trainerReplacement.state, "entrance",
+        "the trainer replacement does not inherit the old attack")
    -- the anchor must not over-correct past the excursion that caused it:
    -- a Pokemon that hops up and comes back is dragged below its tile on
    -- the return by the lagged offset, which is the "hurt" the collapse
@@ -336,9 +380,111 @@ if brick then
         .. "hop is not dragged below the tile it came back to")
    T.eq(rig.pivotM[8], 0,
         "the pivot chain gets the same clamp as the draw chain")
-   local Prebuild = exports.lib.require("CachePrebuild")
+  local Prebuild = exports.lib.require("CachePrebuild")
   local jobs = Prebuild.enumerate({ B = { id="B", width=3, height=2, connections={} }, A = { id="A", width=4, height=5, connections={} } })
   T.eq(#jobs, 4, "prebuild enumerates body and full variants")
+
+  -- Starting from the dedicated VOXEL SETTINGS submenu must enter the same
+  -- blocking progress screen as the post-load gate.  Before this regression
+  -- check, the row only flipped Prebuild.running and left the player looking
+  -- at a frozen 0/444 row with no screen that could drive or cancel it.
+  do
+    local old = {
+      status = Prebuild.status,
+      progress = Prebuild.progress,
+      activationDecision = Prebuild.activationDecision,
+      refresh = Prebuild.refresh,
+      start = Prebuild.start,
+    }
+    local starts, refreshes = 0, 0
+    Prebuild.status = function() return "PREBUILD" end
+    Prebuild.progress = function() return 0, 4, false, nil end
+    Prebuild.activationDecision = function() return "start" end
+    Prebuild.refresh = function() refreshes = refreshes + 1 end
+    Prebuild.start = function() starts = starts + 1; return true end
+    local stack = {}
+    function stack:push(screen) self.last = screen end
+    local screenGame = {
+      data = { maps = {} }, stack = stack,
+      overworld = { map = { id = "ROUTE_4" } },
+    }
+    local rows = VoxelSettings.rows(screenGame)
+    T.eq(refreshes, 1,
+         "voxel settings refresh cache state after title selection")
+    local prebuildRow
+    for _, row in ipairs(rows) do
+      if row.id == "potato_voxel:prebuild" then prebuildRow = row end
+    end
+    T.check(prebuildRow ~= nil, "prebuild row is present in voxel settings")
+    prebuildRow.activate(screenGame)
+    T.eq(starts, 1, "prebuild row starts its build")
+    T.check(stack.last ~= nil,
+            "prebuild row opens the blocking progress screen")
+    Prebuild.status = old.status
+    Prebuild.progress = old.progress
+    Prebuild.activationDecision = old.activationDecision
+    Prebuild.refresh = old.refresh
+    Prebuild.start = old.start
+
+    -- PREBUILD is playthrough work. The title's OPTIONS may still expose
+    -- graphics settings, but it must not offer a cache action before an
+    -- overworld has been restored.
+    local titleRows = VoxelSettings.rows({ data = { maps = {} }, stack = stack })
+    local titlePrebuild
+    for _, row in ipairs(titleRows) do
+      if row.id == "potato_voxel:prebuild" then titlePrebuild = row end
+    end
+    T.eq(titlePrebuild, nil,
+         "prebuild cache row is hidden outside active gameplay")
+  end
+
+  -- The blocking screen is the build driver.  If it only watches the
+  -- counter and leaves work to an unrelated render/input hook, the screen
+  -- can sit at BUILD 0/444 forever even though the worker was started.
+  do
+    local oldProgress, oldUpdate = Prebuild.progress, Prebuild.update
+    local updates = 0
+    Prebuild.progress = function() return 0, 4, true, nil end
+    Prebuild.update = function() updates = updates + 1 end
+  local Progress = exports.lib.require("CachePrebuildScreen")
+    local progressGame = {
+      input = { wasPressed = function() return false end },
+      stack = { pop = function() end },
+    }
+    Progress.new(progressGame):update()
+    T.eq(updates, 1, "blocking progress screen pumps one cache slice")
+    Prebuild.progress, Prebuild.update = oldProgress, oldUpdate
+  end
+
+  -- A storage failure must be visible on the blocking screen, not reduced to
+  -- another silent BUILD 0/N state.
+  do
+    local oldStatus, oldProgress, oldError =
+      Prebuild.status, Prebuild.progress, Prebuild.error
+    local Progress = exports.lib.require("CachePrebuildScreen")
+    local Font = require("src.render.Font")
+    local oldDraw = Font.draw
+    local drawn = {}
+    Prebuild.status = function() return "FAILED" end
+    Prebuild.progress = function() return 0, 4, false, nil end
+    Prebuild.error = function() return "terrain: write_failed" end
+    Font.draw = function(text, x, y)
+      drawn[#drawn + 1] = tostring(text)
+      return oldDraw(text, x, y)
+    end
+    local okDraw, drawError = pcall(function() Progress.new(progressGame):draw() end)
+    local sawFailure, sawDetail = false, false
+    for _, text in ipairs(drawn) do
+      if text == "FAILED" then sawFailure = true end
+      if text:find("write_fai", 1, true) then sawDetail = true end
+    end
+    T.check(okDraw, "cache screen draw succeeds: " .. tostring(drawError))
+    T.check(sawFailure, "cache screen renders the FAILED state")
+    T.check(sawDetail, "cache screen renders the storage error detail")
+    Font.draw = oldDraw
+    Prebuild.status, Prebuild.progress, Prebuild.error =
+      oldStatus, oldProgress, oldError
+  end
 end
 
 -- The MeshCache disk format: encode/decode must round-trip byte-identical
@@ -346,7 +492,40 @@ end
 -- pure-Lua halves the disk cache relies on. Guarded so a change that ever
 -- breaks ffi availability keeps the suite green rather than erroring.
 local MeshCache = exports and exports.lib and exports.lib.require("MeshCache")
-if MeshCache and MeshCache.encodeMesh then
+if MeshCache and MeshCache.flattenQuads and MeshCache.encodeIndexed then
+  local tableQuads = {
+    { { 0, 0, 0 }, { 1, 0, 0 }, { 1, 1, 0 }, { 0, 1, 0 },
+      uv = { { 0, 1 }, { 1, 1 }, { 1, 0 }, { 0, 0 } },
+      shade = 0.5 },
+  }
+  local tableBuf, tableIdx = {}, {}
+  local tableFloats, tableIndices =
+    MeshCache.flattenQuads(tableQuads, tableBuf, tableIdx)
+  local encodedOk = pcall(MeshCache.encodeIndexed, tableFloats / 6,
+                          tableBuf, tableIndices, tableIdx)
+  T.check(encodedOk,
+          "table-backed flattened aux quads encode without treating rows as scalars")
+end
+
+-- Never draw a mesh whose vertex map failed to upload. LOVE otherwise keeps
+-- the mesh unindexed and groups each three sequential quad corners into a
+-- triangle, creating the giant stretched planes seen with a damaged cache.
+do
+  local Voxel3D = exports.lib.require("Voxel3D")
+  local oldNewMesh = love.graphics.newMesh
+  local released = false
+  love.graphics.newMesh = function()
+    return {
+      setVertexMap = function() error("index upload failed") end,
+      release = function() released = true end,
+    }
+  end
+  local mesh = Voxel3D.newMesh({ { 0, 0, 0, 0, 0, 1 } }, { 1, 1, 1 })
+  love.graphics.newMesh = oldNewMesh
+  T.eq(mesh, nil, "failed vertex-map upload rejects the mesh")
+  T.check(released, "failed vertex-map upload releases the unusable mesh")
+end
+if MeshCache and MeshCache.encodeMesh and MeshCache.available() then
   -- dir() must capture BOTH pcall returns: pcall returns (true, path) and
   -- the first value alone is a boolean, and `true .. sep` used to throw,
   -- killing every mesh build and leaving no mod-derived dir on device.
@@ -621,12 +800,13 @@ if MeshCache and MeshCache.encodeMesh then
         },
       }
       local mesh = ChunkMesher.request(fastMap, false, nil, true)
-      T.check(mesh ~= nil and mesh ~= false,
-              "cold entry with a cached payload loads it synchronously")
-      T.eq(ChunkMesher.pending(), 0,
-           "a synchronous cache load queues no build job")
+      T.check(mesh == nil,
+              "cold cached entry defers storage work to the worker")
+      T.eq(ChunkMesher.pending(), 1,
+           "a cached cold entry queues one cooperative load job")
+      while ChunkMesher.pending() > 0 do ChunkMesher.pump(true) end
       T.check(ChunkMesher.pair(fastMap, false) ~= nil,
-              "the loaded pair answers from memory")
+              "the cooperative worker loads the pair into memory")
       T.check(ChunkMesher.grass(fastMap) ~= nil,
               "the aux grass rode the same fast path")
       -- a map with nothing on disk still queues the async cover path
@@ -646,6 +826,11 @@ if MeshCache and MeshCache.encodeMesh then
     end
     os.execute('rm -rf "' .. rtBase .. '"')
   end
+end
+
+if MeshCache then
+  T.check(not MeshCache.available() and MeshCache.dir() == nil,
+          "sandbox mode disables the optional host-file mesh cache")
 end
 
   -- The forward-local lint (see lib/BrickProfile.lua): a function that

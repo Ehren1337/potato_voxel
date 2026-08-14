@@ -50,12 +50,19 @@ local ChunkMesher = V.require("ChunkMesher")
 
 local OverworldBattle = {}
 
--- DS_BATTLE_DEBUG=1 logs what the HUD's brightness probe is reading, once a
--- second, which is how the glyph flip is checked from a shot run. Read
--- through pcall: the loader's sandbox does not hand a mod `os`, and a
--- diagnostic must never be the reason the mod fails to load.
-local DEBUG = select(2, pcall(function() return os.getenv("DS_BATTLE_DEBUG") end))
-if DEBUG == nil or DEBUG == false then DEBUG = nil end
+-- External debug flags are unavailable to sandboxed mods. Keep this opt-in
+-- diagnostic dark unless a caller enables it through the module.
+local DEBUG = nil
+
+function OverworldBattle.setDebug(enabled)
+  local previous = DEBUG and true or false
+  DEBUG = enabled and true or nil
+  return previous
+end
+
+function OverworldBattle.debugEnabled()
+  return DEBUG and true or false
+end
 
 OverworldBattle.KEY = "battles"
 OverworldBattle.LABEL = "3D-BTL"
@@ -455,8 +462,14 @@ end
 -- not nest.
 local session = nil
 
-local function isIOS()
-  return love.system and love.system.getOS and love.system.getOS() == "iOS"
+local function hudSnapAvailable()
+  local g = love and love.graphics
+  return g and type(g.newCanvas) == "function"
+    and type(g.getCanvas) == "function"
+    and type(g.setCanvas) == "function"
+    and type(g.newQuad) == "function"
+    and type(g.getBlendMode) == "function"
+    and type(g.setBlendMode) == "function"
 end
 
 local function game()
@@ -723,15 +736,15 @@ function OverworldBattle.update(dt)
     -- reason the scene is: it binds a canvas of its own. After the frost, so
     -- the glass is frosted from the world alone and never from the glyphs
     -- about to sit on it.
-    local ios = isIOS()
+    local canSnap = hudSnapAvailable()
     local okHud, up = false, false
-    if not ios then
+    if canSnap then
       okHud, up = pcall(OverworldBattle.snapHUDs, session.battle, shot)
     end
     session.snapped = (okHud and up) and true or false
     -- once per battle, not once per frame: a driver that cannot do this cannot
     -- do it sixty times a second either, and the fallback is silent and fine
-    if not ios and not okHud and not session.hudWarned then
+    if canSnap and not okHud and not session.hudWarned then
       session.hudWarned = true
       V.mod.log:warn("overworld battle HUD snap failed: %s -- the HUDs draw "
                      .. "in the battle frame this battle", tostring(up))
@@ -1303,7 +1316,7 @@ function OverworldBattle.install()
   local innerText = BattleState.drawTextArea
   function BattleState:drawTextArea()
     if not self.dramaticShapeShot then return innerText(self) end
-    if isIOS() then return innerText(self) end
+    if not hudSnapAvailable() then return innerText(self) end
     return withoutBoxFill(self, innerText)
   end
 
@@ -1520,7 +1533,7 @@ end
 function OverworldBattle.drawHudPanels(battle)
   local shot = battle.dramaticShapeShot
   if not shot then return end
-  if isIOS() then
+  if not hudSnapAvailable() then
     local slide = (battle.introSlide or 0) * 4
     local enemy, player = OverworldBattle.hudLive(battle, slide)
     local rect = OverworldBattle.HUD_RECT

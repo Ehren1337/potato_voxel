@@ -95,9 +95,9 @@ local function wrapped(str, limit, cols)
       if line then push(line) end
       -- A word longer than the line is BROKEN ACROSS lines rather than cut.
       -- It is always a path, and a path is the one thing here that has to be
-      -- readable in full -- an absolute Android save directory runs to
-      -- ninety-odd characters with no spaces in it at all, so truncating at
-      -- twenty told the player almost nothing.
+      -- readable in full -- a scoped storage hint or mod-relative path can
+      -- still be longer than the menu line, so truncating at twenty tells the
+      -- player almost nothing.
       while #word > cols do
         push(word:sub(1, cols))
         word = word:sub(cols + 1)
@@ -134,8 +134,8 @@ local function speciesName(dex)
 end
 
 -- `adopt` means the caller has ALREADY started the build, or already decided
--- it cannot start -- which is the imported path (StadiumRomPick opens the
--- picked file itself, because love.filesystem cannot read an absolute path).
+-- it cannot start -- which is the imported path (StadiumRomPick owns the
+-- user-facing explanation).
 -- Without it this screen would call begin() on the way in and throw away the
 -- job it was pushed to display, or overwrite the failure it was pushed to
 -- explain with a fresh "no ROM in baseroms" -- which would be true, and would
@@ -350,32 +350,18 @@ function StadiumScreen.maybePush()
   if asked then return false end
   local ok, Game = pcall(require, "src.core.Game")
   if not (ok and Game and Game.stack and Game.overworld) then return false end
+  if StadiumInstall.setGame then StadiumInstall.setGame(Game) end
   if Game.stack:top() ~= Game.overworld then return false end
   asked = true
   if not StadiumInstall.pending() then
-    -- Say where to put a cartridge, ONCE, and only when there is nothing to
-    -- build from and nothing already built. The two STADIUM rungs are simply
-    -- absent in that case (ModSetting.setGate), which is the right thing for
-    -- a row to do and tells the player nothing about why -- and the answer
-    -- they need is an absolute path that depends on how the game was
-    -- installed, so it cannot be written into the options help text.
+    -- Explain once why the optional Stadium models are absent. The row stays
+    -- disabled unless packs were bundled with the mod.
     if not StadiumInstall.available() then
-      -- The IMPORT row is the answer wherever a file dialog can be opened,
-      -- and it is the better one: no folder to create, no path to get right,
-      -- no restart. The folder is still said, once, for the platforms with no
-      -- dialog (Android, a handheld Linux with neither zenity nor kdialog)
-      -- and for anyone who would rather drop a file than click through one.
-      -- The STADIUM ROM row is on the OPTIONS menu on every platform now, so
-      -- point at it rather than reciting a path here: where a file dialog can
-      -- be opened it opens one, and where it cannot it shows this same folder
-      -- on screen -- which is the part a phone could not otherwise find out.
       local okPick, pick = pcall(V.require, "StadiumRomPick")
       local label = (okPick and pick and pick.LABEL) or "STADIUM ROM"
-      local how = (okPick and pick and pick.canDialog())
-                  and "opens a file picker" or "says where to put one"
       V.mod.log:info("stadium: no Pokemon Stadium (US) 1.0 ROM found, so the "
-                     .. "STADIUM battle rungs are off. OPTIONS -> %s %s; the "
-                     .. "folder is %s", label, how, StadiumInstall.romHint())
+                     .. "STADIUM battle rungs are off. OPTIONS -> %s is "
+                     .. "available only for bundled assets", label)
     end
     return false
   end

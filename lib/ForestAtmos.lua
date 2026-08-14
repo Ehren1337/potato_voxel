@@ -54,26 +54,9 @@ local ForestAtmos = {}
 -- FULL is the point; LOW halves the march and drops the particles, for
 -- hardware that minds a per-pixel loop under 4X supersampling.
 --
--- On ANDROID the ladder itself is shorter: LOW and OFF, with LOW the
--- default. The march needs a depth texture it can READ, and no driver on
--- the phones this runs on has granted one (see newDepth in Voxel3D) --
--- so FULL would be a rung with nothing behind it, which reads as a
--- broken mod rather than a missing feature. LOW there is the haze, the
--- one part of the atmosphere that rides the scene shader and works
--- everywhere. A desktop save opened on a phone stores FULL still;
--- ModSetting's unknown-value fallback lands it on LOW, and putting the
--- save back on the desktop restores the choice.
-local function onAndroid()
-  if not (love and love.system and love.system.getOS) then return false end
-  local ok, os = pcall(love.system.getOS)
-  return ok and os == "Android"
-end
-
-ForestAtmos.setting = onAndroid()
-  and ModSetting.new("atmos", "FOREST FX", { "off", "low" },
-                     { "OFF", "LOW" })
-  or ModSetting.new("atmos", "FOREST FX", { "off", "low", "full" },
-                    { "OFF", "LOW", "FULL" })
+ForestAtmos.setting = ModSetting.new("atmos", "FOREST FX",
+                                     { "off", "low", "full" },
+                                     { "OFF", "LOW", "FULL" })
 
 -- the animation clock: ticked by main.lua's always-running update hook,
 -- pinnable (frozen = true) so a screenshot driver can hold a frame still
@@ -130,7 +113,7 @@ local said = {}
 local function say(key, msg)
   if said[key] then return end
   said[key] = true
-  print("[DRAMATIC_SHAPE] atmos: " .. msg)
+  print("[PotatoVoxel] atmos: " .. msg)
 end
 
 function ForestAtmos.invalidate(mapId)
@@ -219,52 +202,12 @@ end
 
 -- ------- deterministic noise
 --
--- The same written-out xorshift StadiumFx runs (see the note there on why
--- not LuaJIT's `bit`): the particle deal and the leaf field must come out
--- identical on every machine and every visit.
+-- The shared xorshift (lib/Noise.lua): the particle deal and the leaf
+-- field must come out identical on every machine and every visit.
 
-local function bxor32(a, b)
-  local r, p = 0, 1
-  for _ = 1, 32 do
-    local x, y = a % 2, b % 2
-    if x ~= y then r = r + p end
-    a, b, p = floor(a / 2), floor(b / 2), p * 2
-  end
-  return r
-end
-
-local Rng = {}
-Rng.__index = Rng
-
-local function newRng(seed)
-  local s = seed % 0x100000000
-  if s == 0 then s = 0x9E3779B9 end
-  return setmetatable({ s = s }, Rng)
-end
-
-function Rng:next()
-  local x = self.s
-  x = bxor32(x, (x % 0x80000) * 0x2000)               -- x ^= (x << 13)
-  x = bxor32(x, floor(x / 0x20000))                   -- x ^= x >> 17
-  x = bxor32(x, (x % 0x8000000) * 0x20)               -- x ^= (x << 5)
-  self.s = x % 0x100000000
-  return self.s
-end
-
-function Rng:unit()
-  return self:next() / 0x100000000
-end
-
--- bilinear value noise on a torus (StadiumFx's), so the leaf field tiles
-local function lattice(rng, w, h)
-  local g = {}
-  for y = 1, h do
-    local row = {}
-    for x = 1, w do row[x] = rng:unit() end
-    g[y] = row
-  end
-  return g
-end
+local Noise = V.require("Noise")
+local newRng = Noise.rng
+local lattice = Noise.lattice
 
 local function smoothstep01(t)
   return t * t * (3 - 2 * t)
@@ -660,15 +603,8 @@ local PART_FORMAT = {
 
 local CORNERS = { { -1, -1 }, { 1, -1 }, { 1, 1 }, { -1, 1 } }
 
-local function pushQuad(map, n)
-  local b = n * 4
-  map[#map + 1] = b + 1
-  map[#map + 1] = b + 2
-  map[#map + 1] = b + 3
-  map[#map + 1] = b + 1
-  map[#map + 1] = b + 3
-  map[#map + 1] = b + 4
-end
+-- shared index writer: see Voxel3D.pushQuad
+local pushQuad = V.require("Voxel3D").pushQuad
 
 local function buildPartMesh(points)
   if #points == 0 then return nil end

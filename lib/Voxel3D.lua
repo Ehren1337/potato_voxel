@@ -440,7 +440,14 @@ function Voxel3D.newMesh(verts, map)
   local ok, mesh = pcall(love.graphics.newMesh, Voxel3D.FORMAT, verts,
                          "triangles", "static")
   if not ok then return nil end
-  if map and #map > 0 then pcall(mesh.setVertexMap, mesh, map) end
+  if map and #map > 0 then
+    local mapped = pcall(mesh.setVertexMap, mesh, map)
+    if not mapped then
+      -- An unindexed quad stream becomes giant cross-quad triangles.
+      if mesh.release then pcall(mesh.release, mesh) end
+      return nil
+    end
+  end
   return mesh
 end
 
@@ -1299,12 +1306,10 @@ end
 -- -------------------------------------------------------------- shadows --
 
 -- The sun. One direction, shared by everything that needs to know where
--- the light comes from: the shadow map, the flat fallback below, and the
--- baked contact shading in ChunkMesher. Both shears are negative, which
--- hangs it in the SOUTHEAST and throws every shadow northwest -- up and to
--- the left on screen.
-Voxel3D.SHADOW_KX = ShadowMap.KX   -- west drift per pixel of height
-Voxel3D.SHADOW_KZ = ShadowMap.KZ   -- north drift per pixel of height
+-- the light comes from: the shadow map (ShadowMap.KX/KZ, retuned by
+-- DayNight.applyRig) and the baked contact shading in ChunkMesher. Both
+-- shears are negative, which hangs it in the SOUTHEAST and throws every
+-- shadow northwest -- up and to the left on screen.
 Voxel3D.SHADOW_EPS = 0.25     -- float above the ground to dodge z-fighting
 -- Contact blobs are depth-tested against the terrain but do not write depth.
 -- A small camera-ward pull separates their depth from the ground without
@@ -1350,23 +1355,11 @@ function Voxel3D.shadowPosition(px, py)
 end
 
 -- FALLBACK ONLY (no shadow map: headless, or a driver that cannot make the
--- canvas). The legacy sprite-projection matrix remains available for callers
--- that need it, but the fallback actor path uses shadowBlobMatrix below.
-function Voxel3D.shadowMatrix(px, py, gh, lift, mirror)
-  local card = Voxel3D.casterMatrix(px, py, gh + (lift or 0), mirror)
-  -- flatten about the ground plane: y' = 0, x/z shear by height above it
-  local squash = { 1, Voxel3D.SHADOW_KX, 0, 0,
-                   0, 0,                 0, 0,
-                   0, Voxel3D.SHADOW_KZ, 1, 0,
-                   0, 0,                 0, 1 }
-  local m = Mat4.mul(squash, Mat4.mul(Mat4.translate(0, -gh, 0), card))
-  return Mat4.mul(Mat4.translate(0, gh + Voxel3D.SHADOW_EPS, 0), m)
-end
-
--- Stable, low-end contact/blob shadow: fixed footprint, no sprite texture or
--- animation state, and whole-world-pixel placement. It intentionally stays
--- under a hopping actor instead of projecting the actor silhouette along the
--- sun vector; that is the classic readable contact shadow at this quality rung.
+-- canvas). Stable, low-end contact/blob shadow: fixed footprint, no sprite
+-- texture or animation state, and whole-world-pixel placement. It
+-- intentionally stays under a hopping actor instead of projecting the actor
+-- silhouette along the sun vector; that is the classic readable contact
+-- shadow at this quality rung.
 function Voxel3D.shadowBlobMatrix(px, py, gh)
   local x, z = Voxel3D.shadowPosition(px, py)
   return Mat4.translate(x + 8, gh + Voxel3D.SHADOW_EPS, z + 8)
