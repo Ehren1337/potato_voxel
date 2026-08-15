@@ -9,6 +9,7 @@ tests/potato_voxel_cache_test.lua
 tests/voxel_loading_test.lua
 tests/shadow_cadence_probe.lua
 tests/shadow_golden.lua
+tests/sandbox_api_test.lua
 tests/goldens/shadow_golden.txt
 
 # Repo-only: issue templates must never ship in the mod zip.

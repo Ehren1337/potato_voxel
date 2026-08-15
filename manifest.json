@@ -18,8 +18,7 @@
     "DRAMALESS_SHAPE"
   ],
   "permissions": [
-    "engine_internals",
-    "filesystem"
+    "engine_internals"
   ],
   "affects_link": false,
   "github": "ShaneMcGovernIE/potato_voxel",
