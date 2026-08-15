@@ -50,7 +50,10 @@
 local V = ...
 
 local Budget = V.require("BuildBudget")
-local Perf = V.require("Perf")
+-- Perf died with the diagnostics panel (see the removals ADR); the
+-- counters it fed are gone, so the instrumentation call sites became
+-- no-ops.
+local Perf = { enabled = false, count = function() end }
 
 local Buildings = {}
 
@@ -125,9 +128,13 @@ end
 
 -- The shape profile ships with the mod; absent or broken simply means no
 -- building templates, and every building falls back to the volume path.
-local DataFile = V.require("DataFile")
+local spec = nil
 local function profile()
-  return DataFile.table("voxel_heights")
+  if spec == nil then
+    local ok, s = pcall(V.data, "voxel_heights")
+    spec = (ok and type(s) == "table") and s or false
+  end
+  return spec or nil
 end
 
 local models = {}          -- "<tileset>:<index>" -> prebuilt local quads

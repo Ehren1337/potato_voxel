@@ -1,136 +1,246 @@
--- lib/MeshCache.lua
+-- MeshCache: the terrain mesh cache.
 --
--- Pre-compiled voxel meshes: persist the finished vertex streams a map's
--- build produced, so a later visit -- or a whole later session -- UPLOADS
--- the geometry instead of re-running the Structures analysis and triangle
--- generation. That cold build is what makes the 2D -> diorama transition
--- take seconds on the TrimUI Brick (4x A53 @1.8GHz); with a warm cache it
--- is a scoped-storage read plus the same sliced GPU upload the build already does.
+-- v2 (1.6.1): the cache lives in the mod sandbox's scoped byte storage
+-- (mod.storage:writeBytes/readBytes -- upstream PR #1304) instead of raw
+-- files in the save directory. The engine owns the physical storage:
+-- writes are crash-safe (tmp + verify + swap), keys are scoped per game
+-- version x playthrough x mod id, and no path in any spelling exists to
+-- get wrong. What this file keeps is everything ON TOP of that:
 --
--- Active on every device (the Brick, desktops, other handhelds): the
--- cache is a strict win -- it can speed a build up but never changes
--- what a build produces. On ANY failure: a corrupt file, a full SD card,
--- a missing directory, a fingerprint mismatch -- this is a silent no-op.
+--   key layout       maps/<mapId>/<slot>/<kind>   payload bytes
+--                    meta/<mapId>/<slot>/<kind>   small table: the
+--                        fingerprint + format + lengths + codec -- the
+--                        boot-time "header" the old file layout carried,
+--                        so READY scans stay bounded (whole-key reads
+--                        make partial payload reads impossible)
+--                    manifest                      table: PVMC1 manifest
+--                    buildinfo                     table: build identity
 --
--- What is stored: one binary file per (map, slot, kind), the same
--- 6-float-per-vertex unindexed stream the GPU meshes hold (position,
--- texcoord, shade). A mesh is rebuilt by streaming the file straight into
--- a love Mesh, so nothing about the 3D models is re-derived. The header
--- carries the fingerprint everything the geometry depends on: the mesher
--- version, the brick-profile knobs that change the geometry, the map id,
--- the tileset art path, and the true-colour flag (RED++ bakes a per-map
--- atlas whose UV layout is its own). A mismatch is a miss, so stale files
--- can never serve wrong geometry.
+--   payload format   unchanged since v18: "DSM" magic + format byte +
+--                    fingerprint + optional codec/lengths, then a
+--                    quantized (terrain/water) or float (aux) INDEXED
+--                    vertex payload. love.data compress/decompress do
+--                    the entropy codec; love.data.newByteData replaces
+--                    the old ffi float buffers end to end.
 --
--- Records live in the engine-owned, per-mod/per-playthrough storage namespace
--- under the logical `meshes/` prefix. They are dropped by
--- ChunkMesher.invalidate/refresh when a block edit changes the inputs, so an
--- edit never serves a stale mesh. Records are a few MB per map; stale ones
--- are removed by the fingerprint check.
+-- Availability is fail-open: when the storage facade cannot resolve (no
+-- playthrough yet, title screen without an existing save), every cache
+-- call no-ops and callers proceed as if the cache were empty -- the
+-- prebuild gate and the BUILD NOW prompt both already understand "no
+-- cache today". A resolution is re-probed on failure, so a session that
+-- starts at the title screen and lands in a playthrough picks the store
+-- up the moment it exists.
 
 -- the mod namespace (see main.lua): V.require loads a sibling module
 local V = ...
 
 local Brick = V.require("BrickProfile")
 local Budget = V.require("BuildBudget")
-local ScopedStorage = V.require("ScopedMeshStorage")
+
+-- The engine's save-root resolver used to pick the portable SD-card dir.
+-- With storage the engine owns placement entirely; SaveData is no longer
+-- consulted (kept out of the picture deliberately -- see the removals ADR).
 
 local MeshCache = {}
 local dataKey = "unconfigured"
 local dirty = false
 local compression = "unknown"
 local codec = nil          -- "lz4"/"zstd"/"MIX" behind the compressed files
-local storageGame = nil
-local MANIFEST = "cache.info"
-local BUILD_INFO = "build.info"
+local MANIFEST_KEY = "manifest"
+local BUILD_INFO_KEY = "buildinfo"
 -- Populated by ready() whenever it returns false, so a caller (the boot
--- path) can report exactly WHY the cache was rejected -- an identity drift
--- between the build session and this launch, or payload files that did not
--- survive. nil after a successful ready().
+-- path) can report exactly WHY the cache was rejected. nil after a
+-- successful ready().
 local lastFailure = nil
--- Snapshot of identity() captured at begin(): every payload file and the
--- manifest written by that build session share ONE identity even if a live
--- component (voidFill) changes mid-build. Cleared when the build finishes.
+-- Snapshot of identity() captured at begin(): every payload and the
+-- manifest written by that build session share ONE identity even if a
+-- live component (voidFill) changes mid-build. Cleared when the build
+-- finishes.
 local buildIdentity = nil
--- Components of the build-session identity, captured at begin() for the
--- build.info sidecar so a later launch can compare against the live identity.
 local buildParts = nil
--- Per-session write-error tracking (F5): every saveTerrain/saveWater/saveAux
--- write failure is remembered, so a build that dies to a full SD card or a
--- read-only folder says WHY instead of "cache verification failed".
+-- Per-session write-error tracking (F5): every save write failure is
+-- remembered, so a build that dies to a full disk or a missing store
+-- says WHY instead of "cache verification failed".
 local lastSaveError = nil
 local saveFailures = 0
-local readStoredPayload, readPackedPayload
 
 -- Bump when the meshing algorithm changes the vertex/UV output, so a
 -- cache written by an older build is never trusted by a newer one. (The
 -- mod version alone is not enough: a settings-only release changes no
--- geometry.) NOTE: this is the CACHE FORMAT, not the file layout -- the
--- layout has its own magic+version byte inside the file.
--- 4: the fingerprint gained the brick/full profile token. Brick ON and
--- OFF produce different geometry from the same mod id (billboard hulls,
--- no round ring), so the token keeps a brick-built mesh from ever being
--- served to full mode and vice-versa.
--- 5: the brick profile restores the full 12-tile border forest ring as
--- billboard cards (BrickProfile ROUND_RING 0 -> 12). Brick meshes built
--- before this bump have no ring past the map edge and must not be
--- served. Full-mode meshes are unchanged (their ring depth never moved),
--- but the version is shared across profiles, so both rebuild once.
--- 6: the brick's billboard hulls gain sprite stacking (BILLBOARD_LAYERS
--- 3 / STEP 4): the flat south-facing card is repeated at stepped depths
--- so canopies read as layered foliage. Every brick mesh changes; the
--- full carve never reads those fields, so full-mode geometry is
--- identical, but the shared version bumps both profiles once.
--- 7: sprite stacking is replaced by the sprite CROSSHAIR
--- (BILLBOARD_CROSS): each card is repeated at +45/-45 degrees about the
--- hull's vertical axis (the crossed-billboard dome). Every brick mesh
--- changes again; the full carve never reads the field.
--- 8: the crosshair is replaced by the full 360 SPRITE FAN
--- (BILLBOARD_ARMS): N vertical planes through the hull's axis at
--- azimuths k*180/N (the classic N64-era tree). Every brick mesh changes
--- again; the full carve never reads the field.
--- 9: REVERTED to the crosshair (brick.10): the fan's extra planes only
--- darkened the canopy interior (silhouette byte-identical at 4 planes)
--- and cost 2-3x the quads, so the brick goes back to BILLBOARD_CROSS.
--- Fan meshes from version 8 must not be served.
--- 10: terrain/water payloads become INDEXED (4 verts per quad + a u32
--- vertex map instead of 6 duplicated verts) -- ~33% fewer vertices
--- uploaded and transformed, zero visual change. Payload layout changed
--- (an index section follows the vertex stream), so every cache file
--- written before this bump must be discarded. Aux payloads (grass,
--- flowers, figures) keep the unindexed 6-vert layout.
--- 11: the index values in version-10 files were written 1-based, but
--- LOVE's Data vertex maps are RAW 0-BASED (table maps are 1-based;
--- Data maps are not converted) -- every triangle referenced vertices
--- one slot too far and the scene rendered as grey mush. The sink now
--- writes 0-based indices; every version-10 cache file must die.
--- 12: AUX payloads (grass/flowers/figures) become indexed too -- they
--- were the last unindexed 6-vert-per-quad streams, wasting the same
--- 33% duplicated corners brick.11 removed from terrain/water. Their
--- payloads now carry the u32 vertex map section like the terrain ones,
--- so every aux file written before this bump must be discarded.
--- 13: Method 3 adds dedicated octagonal stump geometry and changes the
--- billboard hull's cut-face projection; every existing stump mesh is stale.
--- 14: the OVERWORLD CUT bush now emits a dedicated 16-quad low-poly model
--- from the pinned prop path; cached auxiliary/object geometry must rebuild.
--- 16: CUT uses sprite stacking with region-relative atlas/state indexing and
--- isolates adjacent same-class props; all derived meshes must be regenerated.
--- 17: cache headers include the active ROM/data identity, so a Red/Blue/
--- Yellow switch or a changed map dataset can never reuse old geometry.
--- 18: terrain/water payloads become QUANTIZED -- 11 bytes/vertex (int16
--- position, u16 uv, u8 shade) instead of the 24-byte 6-float stream, ~54%
--- smaller before the entropy codec. Aux (grass/flowers/figures) keeps the
--- float layout. Every terrain/water file written before this bump must be
--- discarded.
--- 19: sandbox auxiliary vertices use dense Lua rows. Version 18 wrote rows
--- at float offsets (1, 7, 13...) and row 7 collided with sparse row 2,
--- stretching grass and figure triangles across the map.
-MeshCache.GEOMETRY_VERSION = 19
+-- geometry.) NOTE: this is the CACHE FORMAT, not the storage layout --
+-- the payload format has its own magic byte inside each value.
+-- (History elided here for the storage rewrite; the version carries
+-- forward: 18 = quantized terrain/water, indexed aux, ROM-identity
+-- headers. The move to scoped storage does NOT bump it -- the new store
+-- starts empty, so every device rebuilds once on its own.)
+MeshCache.GEOMETRY_VERSION = 18
 
--- A small deterministic revision for the inputs that can change terrain
--- output without changing the mesher. It is intentionally not a checksum:
--- it only separates cache generations, while the file headers still validate
--- the actual payloads.
+-- ------------------------------------------------------------- storage
+--
+-- The storage facade is resolved lazily and re-probed after a failure,
+-- because a session moves through states where no playthrough exists:
+-- boot at the title screen has selected(game) at best (and only when a
+-- save exists to select), NEW GAME has nothing until save.created, and
+-- in-game has the plain facade. `false` is deliberately NOT cached.
+
+local store = nil
+local storeSource = nil
+
+local function liveGame()
+  local ok, Game = pcall(require, "src.core.Game")
+  return ok and Game or nil
+end
+
+local function resolveStore()
+  local mod = V.mod
+  if not (mod and mod.storage) then return nil end
+  local game = liveGame()
+  local ok, ctx = pcall(mod.storage.context, mod.storage, game)
+  if ok and ctx and ctx.playthroughId then
+    return mod.storage
+  end
+  if mod.storage.selected then
+    local okS, selected = pcall(mod.storage.selected, mod.storage, game)
+    if okS and selected then
+      local okC, ctx2 = pcall(selected.context, selected)
+      if okC and ctx2 and ctx2.playthroughId then
+        return selected
+      end
+    end
+  end
+  return nil
+end
+
+local function facade()
+  local mod = V.mod
+  local source = mod and mod.storage or nil
+  if store and storeSource == source then return store end
+  store = resolveStore()
+  storeSource = source
+  return store
+end
+
+-- Drop a facade that a storage call reported unusable (not_in_playthrough
+-- mid-session, a wiped playthrough) so the next call re-resolves.
+local function facadeFailed()
+  store = nil
+end
+
+-- Storage failure codes worth surfacing: every write/read returns
+-- (ok, code, message); a code other than nil is the WHY.
+local function callFail(op, code, message)
+  if code == "not_in_playthrough" or code == "not_at_title" then
+    facadeFailed()
+  end
+  -- not_found (and a nil code from a stub) is the normal empty-cache
+  -- case, not a failure worth logging; every other code is.
+  if code ~= nil and code ~= "not_found" then
+    local okD, Overlay = pcall(V.require, "DebugOverlay")
+    if okD and Overlay then
+      Overlay.count("storageFails")
+      Overlay.error("storage %s: %s (%s)", tostring(op), tostring(code),
+                    tostring(message))
+    end
+  end
+  return false
+end
+
+-- The docs' byte surface (writeBytes/readBytes, PR #1304) is not present
+-- in every engine build: when the methods are missing, payload bytes fall
+-- back to TABLE storage with the string as the value -- strings are
+-- data-only and legal table values, and the meta/manifest/buildinfo
+-- records are tables already. One storage type per key is preserved
+-- either way (payloads and metas live under different keys).
+local function readBytes(key)
+  local store_ = facade()
+  if not store_ then return nil end
+  if store_.readBytes then
+    local ok, data, code, message = pcall(store_.readBytes, store_,
+                                          liveGame(), key)
+    if ok and data then return data end
+    -- not_found and type conflicts both fall through: the table shape
+    -- may hold what the byte read could not see.
+    callFail("readBytes", code, message)
+  end
+  local ok, data, code, message = pcall(store_.read, store_,
+                                        liveGame(), key)
+  if not ok or not data then callFail("read", code, message) end
+  if type(data) == "table" and data.bytes ~= nil then return data.bytes end
+  if type(data) == "string" then return data end
+  return nil
+end
+
+local function writeBytes(key, bytes)
+  local store_ = facade()
+  if not store_ then return false end
+  if store_.writeBytes then
+    local ok, result, code, message = pcall(store_.writeBytes, store_,
+                                            liveGame(), key, bytes)
+    if ok and result then return true end
+    callFail("writeBytes", code, message)
+    -- Fall through to the table shape: a playthrough whose keys were
+    -- written by an engine without byte storage still has table-typed
+    -- values, and a byte write over one is a type conflict -- the table
+    -- write below replaces it in the same type.
+  end
+  local ok, result, code, message = pcall(store_.write, store_,
+                                          liveGame(), key,
+                                          { bytes = bytes })
+  if ok and result then return true end
+  -- A key written as bytes by a newer engine is a type conflict for the
+  -- table write. Cache payload keys are disposable -- a delete + one
+  -- retry clears the conflict without ever touching a live map.
+  pcall(store_.delete, store_, liveGame(), key)
+  local ok2, result2, code2, message2 = pcall(store_.write, store_,
+                                              liveGame(), key,
+                                              { bytes = bytes })
+  if not ok2 or not result2 then
+    callFail("write", code2, message2)
+  end
+  return ok2 and result2 and true or false
+end
+
+local function writeTable(key, value)
+  local store_ = facade()
+  if not store_ or not store_.write then return false end
+  local ok, result, code, message = pcall(store_.write, store_,
+                                          liveGame(), key, value)
+  if not ok or not result then callFail("write", code, message) end
+  return ok and result and true or false
+end
+
+local function readTable(key)
+  local store_ = facade()
+  if not store_ or not store_.read then return nil end
+  local ok, data, code, message = pcall(store_.read, store_, liveGame(), key)
+  if not ok or not data then callFail("read", code, message) end
+  return ok and data or nil
+end
+
+local function listKeys(prefix)
+  local store_ = facade()
+  if not store_ or not store_.list then return {} end
+  local ok, keys, code, message = pcall(store_.list, store_, liveGame(),
+                                        prefix)
+  if not ok then callFail("list", code, message) end
+  return (ok and keys) or {}
+end
+
+local function deleteKey(key)
+  local store_ = facade()
+  if not store_ or not store_.delete then return false end
+  pcall(store_.delete, store_, liveGame(), key)
+  return true
+end
+
+function MeshCache.dir()
+  -- Kept for callers that want a one-word "is there anywhere to put it"
+  -- answer; the engine owns the real path now.
+  return facade() and "storage" or nil
+end
+
+-- ------------------------------------------------------------ identity
+
 local function hashString(hash, value)
   value = tostring(value or "")
   for i = 1, #value do
@@ -175,8 +285,6 @@ local function datasetRevision(data)
       hash = hashString(hash, direction)
       hash = hashString(hash, connection.map)
       hash = hashString(hash, connection.offset)
-      -- hashed defensively: no shipped dataset carries it today, but a
-      -- walkable-capped connection would change the meshed strip
       hash = hashString(hash, connection.walkable)
     end
   end
@@ -188,10 +296,6 @@ local function datasetRevision(data)
     hash = hashString(hash, tileset.trueColor)
     hash = hashString(hash, tileset.tilesPerRow)
     hash = hashValues(hash, tileset.blocks)
-    -- The tileset fields the mesher reads but the revision used to skip:
-    -- a dataset that moved which tiles are walkable, counters, doors,
-    -- warps or grass would have produced identical geometry from stale
-    -- cache records (F6).
     hash = hashValues(hash, tileset.walkable)
     hash = hashValues(hash, tileset.counterTiles)
     hash = hashValues(hash, tileset.doorTiles)
@@ -201,18 +305,21 @@ local function datasetRevision(data)
   return tostring(hash)
 end
 
+local GameVersion = nil
+do
+  local ok, mod = pcall(require, "src.core.GameVersion")
+  if ok then GameVersion = mod end
+end
+
 local function activeVersion()
-  local save = storageGame and storageGame.save
-  if save and type(save.version) == "string" then return save.version end
+  if GameVersion and GameVersion.get then return GameVersion.get() end
   return "red"
 end
 
 local function identityParts()
   local okTR, TileRenderer = pcall(require, "src.render.TileRenderer")
   local voidFill = (okTR and TileRenderer and TileRenderer.voidFill) or "trees"
-  -- one build, one profile: the token is kept in the fingerprint so
-  -- existing caches stay valid and cross-profile meshes stay unservable
-  local profile = "b"
+  local profile = Brick.isBrick() and "b" or "f"
   return {
     format = "PVMC1",
     version = MeshCache.GEOMETRY_VERSION,
@@ -229,8 +336,6 @@ local function identity()
                         parts.profile, parts.dataKey, parts.voidFill }, "|")
 end
 
--- Compares two identity strings (expected vs actual) and returns the names of
--- the components that differ, so diagnostics can pinpoint a drift.
 local IDENTITY_COMPONENTS = { "format", "version", "activeVersion", "profile",
                               "dataKey", "voidFill" }
 
@@ -252,22 +357,13 @@ local function identityDiff(expected, actual)
   return diffs
 end
 
-function MeshCache.configure(data, game)
+function MeshCache.configure(data)
   dataKey = datasetRevision(data)
-  storageGame = game or storageGame
-  ScopedStorage.configure(V.mod and V.mod.storage, storageGame)
   dirty = false
   compression = "unknown"
   codec = nil
-  -- A new configuration starts a fresh session: drop any snapshot from a
-  -- previous build so live identity() is authoritative until begin() runs.
   buildIdentity = nil
   buildParts = nil
-end
-
-function MeshCache.setGame(game)
-  storageGame = game
-  ScopedStorage.configure(V.mod and V.mod.storage, storageGame)
 end
 
 function MeshCache.isDirty()
@@ -279,8 +375,7 @@ function MeshCache.compressionStatus()
 end
 
 -- The codec behind the compressed payloads: "lz4", "zstd", "MIX" (a cache
--- spanning codecs), or nil when nothing is compressed. Set by
--- updateCompression when ready()/writeManifest scans the headers.
+-- spanning codecs), or nil when nothing is compressed.
 function MeshCache.codec()
   return codec
 end
@@ -289,102 +384,30 @@ MeshCache.identity = identity
 
 -- ---------------------------------------------------------- availability
 
--- Persistent mesh data lives in the engine-owned, per-mod/per-playthrough
--- storage namespace. The path-looking values below are logical names only;
--- they never reach a host filesystem and are converted to storage keys by the
--- adapter below.
-local dirBackend = "storage"
-local STORAGE_PREFIX = "meshes"
-
-local function storageApi()
-  return ScopedStorage.available() and (V and V.mod and V.mod.storage) or nil
-end
-
-local function storageKey(path)
-  local name = tostring(path):match("([^/]+)$") or tostring(path)
-  name = name:gsub("[^%w_-]", "_")
-  return STORAGE_PREFIX .. "/" .. name
-end
-
 function MeshCache.available()
-  return ScopedStorage.available()
-end
-
-function MeshCache.dir()
-  return MeshCache.available() and "mod.storage" or nil
-end
-
-function MeshCache.dirBackend()
-  return dirBackend
-end
-
-local function probeWritable()
-  return MeshCache.available()
-end
-MeshCache.probeWritable = probeWritable
-
-local function metadataName(path)
-  local name = tostring(path):match("([^/]+)$") or tostring(path)
-  if name == MANIFEST then return "manifest" end
-  if name == BUILD_INFO then return "build-info" end
-  return nil
-end
-
-local function readFile(path)
-  local name = metadataName(path)
-  if not name then return nil end
-  local value = ScopedStorage.readMeta(name)
-  return type(value) == "table" and type(value.body) == "string"
-         and value.body or nil
-end
-
-local function writeFile(path, data)
-  local name = metadataName(path)
-  if not name or type(data) ~= "string" then return false end
-  return ScopedStorage.writeMeta(name, { body = data })
-end
-
-local function removeFile(path)
-  local name = metadataName(path)
-  return name and ScopedStorage.removeMeta(name) or false
-end
-
-local function manifestPath()
-  return MeshCache.available() and MANIFEST or nil
+  return facade() ~= nil
 end
 
 function MeshCache.begin()
   dirty = true
   compression = "unknown"
   codec = nil
-  -- Snapshot the identity at the START of a build session. Every payload
-  -- file and the manifest written by this session share this one identity,
-  -- even if a live component (e.g. voidFill) changes mid-build. This removes
-  -- the "identity drifted between begin() and finish()" failure class.
+  -- Snapshot the identity at the START of a build session (see the
+  -- module header): every payload and the manifest written by this
+  -- session share this one identity, even if a live component (e.g.
+  -- voidFill) changes mid-build.
   buildIdentity = identity()
   buildParts = identityParts()
   lastFailure = nil
   lastSaveError = nil
   saveFailures = 0
-  -- The manifest is KEPT, not deleted. Deleting it here meant a build
-  -- interrupted before finish() (an Android background kill, a battery
-  -- pull) left no manifest behind at all -- and the next boot saw only
-  -- orphaned payloads and prompted for a rebuild on every single launch.
-  -- Keeping it is safe: payload writes are atomic (tmp + rename), so the
-  -- files a mid-build death leaves behind are each EITHER the old
-  -- complete payload or the new complete payload, and the fingerprint
-  -- check accepts whichever mix survived when the identity matches.
-  -- Prebuild overwrites the manifest per job (writeProgress) so even the
-  -- very first build leaves a manifest describing exactly the jobs that
-  -- finished.
+  -- The manifest is KEPT, not deleted: a build interrupted before
+  -- finish() must leave the previous manifest behind rather than none
+  -- at all, and the fingerprint check accepts whichever mix survived.
 end
 
 -- ------------------------------------------------------------- fingerprint
 
--- The exact string of everything a map's geometry depends on. Stored in
--- each file header and compared at load; any difference (a tileset swap,
--- a RED++ vs SGB atlas, a mesher rewrite) is a miss and the file is
--- dropped.
 local function fingerprint(map, slot)
   local tileset = (map.tileset and map.tileset.image) or "?"
   local trueColor = (map.tileset and map.tileset.trueColor) and "1" or "0"
@@ -394,22 +417,24 @@ local function fingerprint(map, slot)
          .. tileset .. "|" .. trueColor .. "|" .. atlas
 end
 
-local function fileName(map, slot, kind)
-  return tostring(map.id):gsub("[^%w_]", "_") .. "." .. tostring(slot)
-         .. "." .. kind
+-- Storage keys: slash-separated [A-Za-z0-9_-]+ segments, so a map id is
+-- sanitised before it names a key.
+local function safeId(mapId)
+  return tostring(mapId):gsub("[^%w_-]", "_")
 end
 
-local function fileFor(map, slot, kind)
-  return MeshCache.dir() .. "/" .. fileName(map, slot, kind)
+local function payloadKey(map, slot, kind)
+  return "maps/" .. safeId(map.id) .. "/" .. tostring(slot) .. "/" .. kind
 end
 
-local function logicalKey(map, slot, kind)
-  return { mapId = tostring(map.id), slot = tostring(slot), kind = kind }
+local function metaKey(map, slot, kind)
+  return "meta/" .. safeId(map.id) .. "/" .. tostring(slot) .. "/" .. kind
 end
 
 -- ------------------------------------------------------------- encoding
 
--- Binary layout, little-endian throughout:
+-- Binary layout, little-endian throughout (unchanged from the file-era
+-- cache):
 --   raw format: "DSM" + format byte (1) + u32 fp-len + fp bytes + payload
 --   compressed format: same header, then codec byte (1=lz4, 2=zstd) +
 --     raw length + packed length + hash, then the packed bytes
@@ -424,47 +449,45 @@ local RAW_FORMAT = 1
 local COMPRESSED_FORMAT = 2
 local LZ4_CODEC = 1
 local ZSTD_CODEC = 2
--- codec byte -> love.data format name. ZSTD is reserved: the engine ships
--- no zstd codec yet, but a file written by a build that does (or a later
--- runtime) reads and is reported correctly here.
 local CODEC_NAMES = { [LZ4_CODEC] = "lz4", [ZSTD_CODEC] = "zstd" }
 local MAX_PAYLOAD = 512 * 1024 * 1024
 
--- IEEE-754 single precision, little endian. This is deliberately pure Lua:
--- the sandbox removes LuaJIT FFI, while the public love.data surface is for
--- compression and byte containers rather than arbitrary native pointers.
+-- ffi is sandbox-banned and this engine's love.data ByteData carries no
+-- float accessors, so float32 bytes are packed and unpacked in pure Lua.
+-- Only the AUX/figures payloads use floats at all -- terrain and water
+-- are quantized integers -- so the slow path is the small path.
 local function f32(v)
+  if v ~= v then v = 0 end                 -- NaN never reaches the cache
+  if v == 0 then return string.char(0, 0, 0, 0) end
   local sign = 0
-  if v < 0 or (v == 0 and 1 / v < 0) then sign, v = 128, -v end
-  if v ~= v then return string.char(0, 0, 192, 127 + sign) end
-  if v == math.huge then return string.char(0, 0, 128, 127 + sign) end
-  if v == 0 then return string.char(0, 0, 0, sign) end
-  local mantissa, exponent = math.frexp(v)
-  local e = exponent - 1 + 127
-  local mantissaBits
-  if e >= 255 then
-    return string.char(0, 0, 128, 127 + sign)
-  elseif e <= 0 then
-    mantissaBits = math.floor(v / 2 ^ -149 + 0.5)
-    if mantissaBits >= 8388608 then mantissaBits, e = 0, 1 end
-  else
-    mantissaBits = math.floor((mantissa * 2 - 1) * 8388608 + 0.5)
-    if mantissaBits >= 8388608 then
-      mantissaBits, e = 0, e + 1
-      if e >= 255 then return string.char(0, 0, 128, 127 + sign) end
-    end
-  end
-  local b4 = sign + math.floor(e / 2)
-  local b3 = (e % 2) * 128 + math.floor(mantissaBits / 65536)
-  local b2 = math.floor(mantissaBits / 256) % 256
-  local b1 = mantissaBits % 256
-  return string.char(b1, b2, b3, b4)
+  if v < 0 then sign = 0x80; v = -v end
+  if v == math.huge then return string.char(0, 0, 0x80, sign + 0x7F) end
+  local mant, exp = math.frexp(v)          -- v = mant * 2^exp, 0.5 <= m < 1
+  exp = exp + 126                          -- float32 bias
+  if exp <= 0 then return string.char(sign, 0, 0, 0) end  -- subnormal -> 0
+  mant = math.floor((mant * 2 - 1) * 8388608 + 0.5)
+  if mant >= 8388608 then mant = 0; exp = exp + 1 end
+  if exp >= 255 then return string.char(0, 0, 0x80, sign + 0x7F) end
+  -- little-endian, like every other number in the wire format
+  return string.char(mant % 256, math.floor(mant / 256) % 256,
+                     (exp % 2) * 128 + math.floor(mant / 65536),
+                     sign + math.floor(exp / 2))
 end
 
 local function f32s(values)
   local parts = {}
   for _, v in ipairs(values) do parts[#parts + 1] = f32(v) end
   return table.concat(parts)
+end
+
+local function f32read(s, i)
+  local b1, b2, b3, b4 = s:byte(i, i + 3)  -- little-endian: b1 is LSB
+  local sign = (b4 >= 128) and -1 or 1
+  local exp = (b4 % 128) * 2 + math.floor(b3 / 128)
+  local mant = ((b3 % 128) * 65536 + b2 * 256 + b1) / 8388608
+  if exp == 0 then return 0 end            -- subnormals flushed to zero
+  if exp == 255 then return sign * math.huge end
+  return sign * math.ldexp(1 + mant, exp - 127)
 end
 
 local function u32(n)
@@ -476,38 +499,6 @@ end
 local function readU32(s, offset)
   return s:byte(offset) + s:byte(offset + 1) * 256
        + s:byte(offset + 2) * 65536 + s:byte(offset + 3) * 16777216
-end
-
-local function readF32(s, offset)
-  local b1, b2, b3, b4 = s:byte(offset, offset + 3)
-  if not b4 then return nil end
-  local sign = 1
-  if b4 >= 128 then sign, b4 = -1, b4 - 128 end
-  local exponent = b4 * 2 + math.floor(b3 / 128)
-  local mantissa = (b3 % 128) * 65536 + b2 * 256 + b1
-  if exponent == 255 then
-    return mantissa == 0 and sign * math.huge or 0
-  elseif exponent == 0 then
-    return sign * mantissa * 2 ^ -149
-  end
-  return sign * (1 + mantissa / 8388608) * 2 ^ (exponent - 127)
-end
-
-local function vertexValue(src, vertex, field)
-  local row = type(src[vertex + 1]) == "table" and src[vertex + 1]
-  if row then return row[field] or 0 end
-  -- flattenQuads stores Lua rows sparsely at the first slot of each
-  -- six-value vertex. Prefer that row before the scalar one-/zero-based
-  -- fallback, or field 2 would resolve to the whole previous row table.
-  local packedRow = src[vertex * 6 + 1]
-  if type(packedRow) == "table" then return packedRow[field] or 0 end
-  local oneBased = vertex * 6 + field
-  local zeroBased = oneBased - 1
-  return src[oneBased] or src[zeroBased] or 0
-end
-
-local function indexValue(src, index)
-  return src[index + 1] or src[index] or 0
 end
 
 local function header(fp, format, rawLen, packedLen, checksum, codec)
@@ -542,27 +533,11 @@ local function parseHeader(s, totalLen)
     meta.checksum = readU32(s, offset + 9)
     offset = offset + 13
     if meta.codec == nil or CODEC_NAMES[meta.codec] == nil
-       or length - offset + 1 ~= meta.packedLen then
+        or length - offset + 1 ~= meta.packedLen then
       return nil
     end
   end
   return s:sub(9, head), offset, meta
-end
-
--- Boot only needs the cache identity and payload bounds. Reading the full mesh
--- here defeats the point of the persistent cache: a complete cache can be hundreds
--- of megabytes, and decompressing every entry before the title screen makes
--- the launcher appear hung. Full checksum/decode validation still happens
--- when a map actually loads its mesh.
-local MAX_HEADER = 64 * 1024
-local function readHeader(path)
-  local s = readFile(path)
-  if not s or #s < 8 then return nil end
-  local fpLen = readU32(s, 5)
-  local extra = s:byte(4) == COMPRESSED_FORMAT and 13 or 0
-  local headerLen = 8 + fpLen + extra
-  if headerLen > MAX_HEADER or #s < headerLen then return nil end
-  return s:sub(1, headerLen), #s
 end
 
 local function unpackPayload(s, offset, meta)
@@ -574,11 +549,9 @@ local function unpackPayload(s, offset, meta)
   local codecName = CODEC_NAMES[meta.codec]
   if not codecName then return nil end
   local ok, raw = pcall(data.decompress, "string", codecName, body)
-  -- ponytail: no per-byte checksum -- a Lua loop over a 10-25MB payload is a
-  -- 100ms+ hitch on every cold map transition. Truncation is caught by the
-  -- packed-length check in parseHeader and the raw-length check here; corrupt
-  -- LZ4 fails to decompress or yields the wrong size. Add hashing back only if
-  -- bit-rot that decompresses to the exact length is ever observed.
+  -- No per-byte checksum: truncation is caught by the packed-length and
+  -- raw-length checks, and storage writes are crash-safe whole-value
+  -- swaps, so a torn write cannot exist here at all.
   if not (ok and type(raw) == "string" and #raw == meta.rawLen) then
     return nil
   end
@@ -602,81 +575,74 @@ local function packPayload(fp, body)
   return header(fp, RAW_FORMAT) .. body
 end
 
-local function repackRaw(path, fp, body, meta)
-  -- Payloads are already committed through ScopedMeshStorage. Repacking a
-  -- legacy raw record during a read would require a path-shaped write, so
-  -- migration is handled by the logical payload readers instead.
-  return path, fp, body, meta
-end
-
 -- ------------------------------------------------------------- payloads
 
--- Encode a vertex stream (n*6 floats from a float* src) into payload
--- bytes. ALWAYS length-prefixed -- n == 0 writes just the u32 zero -- so
--- a payload is self-delimiting and empty meshes round-trip as empty
--- meshes rather than making a whole file unparseable.
+-- Encode a vertex stream (n*6 floats) into payload bytes. ALWAYS
+-- length-prefixed -- n == 0 writes just the u32 zero -- so a payload is
+-- self-delimiting and empty meshes round-trip as empty meshes. `src` is
+-- a 1-based Lua float table (the table sink's shape).
 local function encodeMesh(n, src)
   local parts = { u32(n or 0) }
   if not src or n == nil or n == 0 then return table.concat(parts) end
-  for vertex = 0, n - 1 do
-    local values = {}
-    for field = 1, 6 do
-      values[field] = f32(vertexValue(src, vertex, field))
+  local CHUNK = 4096
+  local off = 0
+  local total = n * 6
+  while off < total do
+    local c = math.min(CHUNK, total - off)
+    local chunk = {}
+    for i = 1, c do
+      chunk[i] = f32(src[off + i] or 0)
     end
-    parts[#parts + 1] = table.concat(values)
-    if vertex % 16384 == 0 then
-      -- A storage write is still a large data operation; yield between
-      -- chunks when called from the cooperative prebuilder.
-      Budget.check()
-    end
+    parts[#parts + 1] = table.concat(chunk)
+    off = off + c
+    Budget.check()
   end
   return table.concat(parts)
 end
 
 -- INDEXED payload (float): the vertex stream above, then a u32 vertex map
 -- (m entries). Aux payloads (grass/flowers) are stored this way; terrain
--- and water use the quantized encodeQuant instead (v18).
+-- and water use the quantized encodeQuant instead (v18). `idx` is a
+-- 1-based u32 Lua table; the wire format is 0-based (LOVE Data-map
+-- convention), so the encode subtracts one.
 local function encodeIndexed(n, src, m, idx)
   local parts = { encodeMesh(n, src), u32(m or 0) }
   if not idx or m == nil or m == 0 then return table.concat(parts) end
-  for i = 0, m - 1 do
-    parts[#parts + 1] = u32(indexValue(idx, i))
-    if i % 16384 == 0 then Budget.check() end
+  local CHUNK = 65536
+  local off = 0
+  while off < m do
+    local c = math.min(CHUNK, m - off)
+    local chunk = {}
+    for i = 1, c do
+      chunk[i] = u32((idx[off + i] or 0) - 1)
+    end
+    parts[#parts + 1] = table.concat(chunk)
+    off = off + c
+    Budget.check()
   end
   return table.concat(parts)
 end
 
--- Decode a mesh payload into a data record { n, str, ptr } -- str is the
--- payload string (kept alive by the record) and ptr a float* into it.
--- nil when corrupt. The length check is a MINIMUM (truncation guard),
--- not exact: aux files carry the grass payload, then flowers, then the
--- figures payload, all concatenated -- exact equality would reject every
--- multi-payload file and the aux cache could never hit.
+-- Decode a mesh payload into a data record { n, verts } -- verts a
+-- 1-based Lua float table, the table sink's upload shape. nil when
+-- corrupt. The length check is a MINIMUM (truncation guard), not exact:
+-- aux payloads carry grass, then flowers, then figures, all concatenated.
 local function decodeMesh(s)
   if not s or #s < 4 then return nil end
   local n = readU32(s, 1)
   if n > 0 and #s < 4 + n * 24 then return nil end
   if n == 0 then return { n = 0 } end
-  local vertices, offset = {}, 5
-  for vertex = 1, n do
-    local row = {}
-    for field = 1, 6 do
-      row[field] = readF32(s, offset)
-      if row[field] == nil then return nil end
-      offset = offset + 4
-    end
-    vertices[vertex] = row
-    if vertex % 16384 == 1 then Budget.check() end
+  local verts = {}
+  for i = 0, n * 6 - 1 do
+    verts[i + 1] = f32read(s, 4 + i * 4 + 1)
+    if i % 4096 == 0 then Budget.check() end
   end
-  return { n = n, vertices = vertices }
+  return { n = n, verts = verts }
 end
 
--- Decode an INDEXED float mesh payload (aux, brick.11+): the vertex
--- stream as decodeMesh reads it, then u32 index count + the u32 vertex
--- map. Returns { n, str, ptr, m, istr, iptr } (m = index count; iptr a
--- uint32_t* into the map), or nil when corrupt. Files written before
--- the version-10 bump carried no index section and are rejected by the
--- fingerprint check before this ever runs.
+-- Decode an INDEXED float mesh payload (aux): the vertex stream as
+-- decodeMesh reads it, then u32 index count + the u32 vertex map,
+-- returned 1-based for table uploads (the wire format is 0-based).
 local function decodeIndexed(s)
   if not s or #s < 8 then return nil end
   local n = readU32(s, 1)
@@ -684,42 +650,38 @@ local function decodeIndexed(s)
   local voff = 4 + n * 24
   local m = readU32(s, voff + 1)
   if m > 0 and #s < voff + 4 + m * 4 then return nil end
-  local mesh = decodeMesh(s:sub(1, voff))
-  if not mesh then return nil end
-  local rec = { n = n, vertices = mesh.vertices, m = m, indices = {} }
-  for i = 1, m do
-    rec.indices[i] = readU32(s, voff + 4 * i + 1)
-    if i % 16384 == 1 then Budget.check() end
+  if n == 0 then return { n = 0, m = 0 } end
+  local rec = decodeMesh(s:sub(1, 4 + n * 24))
+  rec.m = m
+  if m > 0 then
+    local indices = {}
+    for i = 1, m do
+      indices[i] = readU32(s, voff + 4 + (i - 1) * 4 + 1) + 1
+      if i % 16384 == 0 then Budget.check() end
+    end
+    rec.indices = indices
   end
   return rec
 end
 
 -- ------------------------------------------------------------ quantization
 --
--- The modern real-time-game answer to mesh storage: quantize each vertex
--- attribute to the smallest width that carries it, instead of six 32-bit
--- floats. The voxel world makes this near-lossless -- positions are integer
--- pixels, texture coords sample a small atlas, and shade is baked ambient
--- occlusion with 0.216-unit steps:
---
---   position  int16 x3   (exact: the grid is integer px, well inside range)
---   texcoord  u16   x2   (0..65535 over [0,1]; sub-texel on a 128px atlas)
---   shade     u8         (0..255 over [0,1]; sub-band for the AO steps)
---
--- 11 bytes/vertex vs 24 (~54% smaller) BEFORE the entropy codec, with no
--- codec dependency and no shell -- it is plain integer packing, so it works
--- on every platform the cache already runs on. Decode expands back to the
--- same 6-float stream the GPU upload path consumes; nothing downstream
--- knows the disk format changed. Terrain and water only (GEOMETRY_VERSION
--- 18); aux payloads keep the float layout.
+-- Terrain and water are stored quantized: 11 bytes/vertex (int16
+-- position, u16 uv, u8 shade) instead of the 24-byte 6-float stream,
+-- ~54% smaller before the entropy codec, near-lossless on the voxel
+-- grid. Decode expands back to the same 6-float stream the GPU upload
+-- consumes. Aux payloads keep the float layout (v18).
 local QUANT_STRIDE = 11
 
-local function u16(n)
-  return string.char(n % 256, math.floor(n / 256) % 256)
+-- i16 as two little-endian bytes (a 2-byte string), for the quantized
+-- vertex records.
+local function u16byte(v)
+  v = v % 65536
+  return string.char(v % 256, math.floor(v / 256) % 256)
 end
 
 local function readU16(s, off)
-  return s:byte(off + 1) + s:byte(off + 2) * 256
+  return s:byte(off) + s:byte(off + 1) * 256
 end
 
 local function readI16(s, off)
@@ -728,68 +690,103 @@ local function readI16(s, off)
 end
 
 -- Encode a quantized INDEXED payload: u32 n, n*11 quantized vertex bytes,
--- u32 m, m u32 indices -- the same shape encodeIndexed writes for floats.
+-- u32 m, m u32 indices (0-based on the wire). `src` is a 1-based Lua
+-- float table (the table sink's shape), `idx` a 1-based u32 table.
 local function encodeQuant(n, src, m, idx)
   local parts = { u32(n or 0) }
   if src and n and n > 0 then
-    for vertex = 0, n - 1 do
-      local x = math.floor(vertexValue(src, vertex, 1) + 0.5)
-      local y = math.floor(vertexValue(src, vertex, 2) + 0.5)
-      local z = math.floor(vertexValue(src, vertex, 3) + 0.5)
-      local u = math.floor(vertexValue(src, vertex, 4) * 65535 + 0.5)
-      local v = math.floor(vertexValue(src, vertex, 5) * 65535 + 0.5)
-      local sh = math.floor(vertexValue(src, vertex, 6) * 255 + 0.5)
-      x = math.max(-32768, math.min(32767, x))
-      y = math.max(-32768, math.min(32767, y))
-      z = math.max(-32768, math.min(32767, z))
-      u = math.max(0, math.min(65535, u))
-      v = math.max(0, math.min(65535, v))
-      sh = math.max(0, math.min(255, sh))
-      parts[#parts + 1] = u16(x < 0 and x + 65536 or x)
-        .. u16(y < 0 and y + 65536 or y)
-        .. u16(z < 0 and z + 65536 or z)
-        .. u16(u) .. u16(v) .. string.char(sh)
-      if vertex % 16384 == 0 then Budget.check() end
+    local CHUNK = 4096
+    local vi = 0
+    while vi < n do
+      local c = math.min(CHUNK, n - vi)
+      local bytes = {}
+      for i = 1, c do
+        local base = (vi + i - 1) * 6 + 1
+        local x = math.floor((src[base] or 0) + 0.5)
+        local y = math.floor((src[base + 1] or 0) + 0.5)
+        local z = math.floor((src[base + 2] or 0) + 0.5)
+        local u = math.floor((src[base + 3] or 0) * 65535 + 0.5)
+        local v = math.floor((src[base + 4] or 0) * 65535 + 0.5)
+        local sh = math.floor((src[base + 5] or 0) * 255 + 0.5)
+        if x < -32768 then x = -32768 elseif x > 32767 then x = 32767 end
+        if y < -32768 then y = -32768 elseif y > 32767 then y = 32767 end
+        if z < -32768 then z = -32768 elseif z > 32767 then z = 32767 end
+        if u < 0 then u = 0 elseif u > 65535 then u = 65535 end
+        if v < 0 then v = 0 elseif v > 65535 then v = 65535 end
+        if sh < 0 then sh = 0 elseif sh > 255 then sh = 255 end
+        local b = (i - 1) * 6 + 1
+        bytes[b] = u16byte(x)
+        bytes[b + 1] = u16byte(y)
+        bytes[b + 2] = u16byte(z)
+        bytes[b + 3] = u16byte(u)
+        bytes[b + 4] = u16byte(v)
+        bytes[b + 5] = string.char(sh)
+        if i % 1024 == 0 then Budget.check() end
+      end
+      parts[#parts + 1] = table.concat(bytes)
+      vi = vi + c
+      Budget.check()
     end
   end
   parts[#parts + 1] = u32(m or 0)
   if idx and m and m > 0 then
-    for i = 0, m - 1 do
-      parts[#parts + 1] = u32(indexValue(idx, i))
-      if i % 16384 == 0 then Budget.check() end
+    local CHUNK = 65536
+    local off = 0
+    while off < m do
+      local c = math.min(CHUNK, m - off)
+      local chunk = {}
+      for i = 1, c do
+        chunk[i] = u32((idx[off + i] or 0) - 1)
+      end
+      parts[#parts + 1] = table.concat(chunk)
+      off = off + c
+      Budget.check()
     end
   end
   return table.concat(parts)
 end
 
--- Decode a quantized payload into { n, buf, m, istr, idx } -- buf is a
--- table of expanded 6-float rows (the fresh-build shape) and a table of
--- integer indices. nil when corrupt.
+-- Decode a quantized payload into { n, verts, m, indices } -- verts a
+-- 1-based Lua float table (the table sink's upload shape) and indices a
+-- 1-based u32 table. nil when corrupt.
 local function decodeQuant(s)
   if not s or #s < 8 then return nil end
   local n = readU32(s, 1)
   local vbytes = n * QUANT_STRIDE
   if n > 0 and #s < 4 + vbytes + 4 then return nil end
-  local vertices = {}
+  local verts = {}
   if n > 0 then
-    for vertex = 0, n - 1 do
-      local r = 5 + vertex * QUANT_STRIDE
-      vertices[vertex + 1] = {
-        readI16(s, r - 1), readI16(s, r + 1), readI16(s, r + 3),
-        readU16(s, r + 5) / 65535, readU16(s, r + 7) / 65535,
-        s:byte(r + 10) / 255,
-      }
-      if vertex % 16384 == 0 then Budget.check() end
+    local CHUNK = 4096
+    local vi = 0
+    while vi < n do
+      local c = math.min(CHUNK, n - vi)
+      for i = 1, c do
+        local r = 4 + (vi + i - 1) * QUANT_STRIDE + 1
+        local fo = (vi + i - 1) * 6 + 1
+        verts[fo] = readI16(s, r)
+        verts[fo + 1] = readI16(s, r + 2)
+        verts[fo + 2] = readI16(s, r + 4)
+        verts[fo + 3] = readU16(s, r + 6) / 65535
+        verts[fo + 4] = readU16(s, r + 8) / 65535
+        verts[fo + 5] = s:byte(r + 10) / 255
+        if i % 1024 == 0 then Budget.check() end
+      end
+      vi = vi + c
+      Budget.check()
     end
   end
   local voff = 4 + vbytes
   local m = readU32(s, voff + 1)
   if m > 0 and #s < voff + 4 + m * 4 then return nil end
   if n == 0 then return { n = 0, m = m } end
-  local rec = { n = n, vertices = vertices, m = m, indices = {} }
-  for i = 1, m do
-    rec.indices[i] = readU32(s, voff + 4 * i + 1)
-    if i % 16384 == 1 then Budget.check() end
+  local rec = { n = n, verts = verts, m = m }
+  if m > 0 then
+    local indices = {}
+    for i = 1, m do
+      indices[i] = readU32(s, voff + 4 + (i - 1) * 4 + 1) + 1
+      if i % 16384 == 0 then Budget.check() end
+    end
+    rec.indices = indices
   end
   return rec
 end
@@ -797,7 +794,8 @@ end
 local function encodeFigures(list)
   local parts = { string.char(math.min(#list, 255)) }
   for _, f in ipairs(list) do
-    parts[#parts + 1] = encodeIndexed(f.n, f.ptr or f.buf, f.m, f.idx)
+    parts[#parts + 1] = encodeIndexed(f.n, f.verts or f.buf, f.m,
+                                      f.indices or f.idx)
     parts[#parts + 1] = f32s({ f.wx or 0, f.wz or 0, f.y or 0, f.w or 0 })
   end
   return table.concat(parts)
@@ -812,69 +810,72 @@ local function decodeFigures(s)
     if not d then return nil end
     pos = pos + 4 + d.n * 24 + 4 + d.m * 4
     if pos + 16 > #s + 1 then return nil end
-    local wx, wz, y, w = readF32(s, pos), readF32(s, pos + 4),
-                          readF32(s, pos + 8), readF32(s, pos + 12)
-    if not (wx and wz and y and w) then return nil end
-    list[#list + 1] = { n = d.n, vertices = d.vertices, m = d.m,
-                        indices = d.indices, wx = wx, wz = wz, y = y, w = w }
+    local p = pos - 1
+    list[#list + 1] = { n = d.n, verts = d.verts, m = d.m,
+                        indices = d.indices,
+                        wx = f32read(s, p), wz = f32read(s, p + 4),
+                        y = f32read(s, p + 8), w = f32read(s, p + 12) }
     pos = pos + 16
   end
   return list
 end
 
-local function decodeAuxPayload(body)
-  local grass = decodeIndexed(body)
-  if not grass then return nil end
-  local flowerPos = 4 + grass.n * 24 + 4 + grass.m * 4
-  local flowers = decodeIndexed(body:sub(1 + flowerPos))
-  if not flowers then return nil end
-  local figurePos = flowerPos + 4 + flowers.n * 24 + 4 + flowers.m * 4
-  local figures = decodeFigures(body:sub(1 + figurePos))
-  if not figures then return nil end
-  return { grass = grass, flowers = flowers, figures = figures }
-end
+-- ---------------------------------------------------------- meta records
+--
+-- One small table per payload, written AFTER the payload bytes: its
+-- presence is the commit marker, and it carries everything the boot
+-- scan needs (fingerprint, format, lengths, codec) without reading the
+-- payload. The engine's storage writes are whole-value and crash-safe,
+-- so a meta record can never describe a torn payload.
 
-readPackedPayload = function(map, slot, kind, fp)
-  local packed, source = ScopedStorage.read(logicalKey(map, slot, kind), fp)
-  if not packed then return nil end
-  local got, off, meta = parseHeader(packed)
+local function metaFromPayload(fp, bytes)
+  local got, off, meta = parseHeader(bytes)
   if not got or got ~= fp then return nil end
-  local body = unpackPayload(packed, off, meta)
-  if not body then return nil end
-  if source == "legacy" then
-    -- A legacy read remains usable even if migration cannot commit. The
-    -- current frame gets its cache hit; the next build can retry migration.
-    pcall(ScopedStorage.write, logicalKey(map, slot, kind), fp, packed)
-  end
-  return body
+  local rawLen = meta.format == COMPRESSED_FORMAT
+               and meta.rawLen or (#bytes - off + 1)
+  return { fp = fp, format = meta.format, rawLen = rawLen,
+           packedLen = meta.format == COMPRESSED_FORMAT
+                       and meta.packedLen or (#bytes - off + 1),
+           codec = CODEC_NAMES[meta.codec],
+           size = #bytes }
 end
 
-readStoredPayload = function(map, slot, kind, fp)
-  return readPackedPayload(map, slot, kind, fp)
+local function writePayload(key, mkey, bytes, fp)
+  if not writeBytes(key, bytes) then return false end
+  local meta = metaFromPayload(fp, bytes)
+  if not meta then return false end
+  return writeTable(mkey, meta)
 end
 
-local function noteCompression(packed)
-  local format = packed and packed:byte(4)
-  if format == COMPRESSED_FORMAT then
-    compression = "compressed"
-    local _, _, meta = parseHeader(packed)
-    codec = meta and CODEC_NAMES[meta.codec] or nil
-  elseif format == RAW_FORMAT then
-    compression = "raw"
-    codec = nil
-  end
-end
-
-local function payloadFingerprint(path, fp, kind, prefix)
-  local s = readFile(path)
+local function readPayload(key, fp)
+  local s = readBytes(key)
   if not s then return nil end
   local got, off, meta = parseHeader(s)
-  if not got then return nil end
-  if prefix then
-    if got:sub(1, #fp) ~= fp then return nil end
-  elseif got ~= fp then
+  if not got or got ~= fp then
+    deleteKey(key)
+    deleteKey(key:gsub("^maps/", "meta/"))
     return nil
   end
+  local body = unpackPayload(s, off, meta)
+  return body, meta
+end
+
+local function repackRaw(key, mkey, fp, body, meta)
+  if meta.format ~= RAW_FORMAT then return end
+  local packed = packPayload(fp, body)
+  if packed:byte(4) == COMPRESSED_FORMAT then
+    compression = "unknown"
+    codec = nil
+    pcall(function() writePayload(key, mkey, packed, fp) end)
+  end
+end
+
+local function payloadFingerprint(key, mkey, fp, kind)
+  local ok, s = pcall(readBytes, key)
+  if not ok or not s then return nil end
+  local got, off, meta = parseHeader(s)
+  if not got then return nil end
+  if got ~= fp then return nil end
   local body = unpackPayload(s, off, meta)
   if not body then return nil end
   if kind ~= "aux" then
@@ -889,56 +890,28 @@ local function payloadFingerprint(path, fp, kind, prefix)
   return decodeFigures(body:sub(1 + figurePos)) and got or nil
 end
 
-local function validPayload(path, fp, kind)
-  return payloadFingerprint(path, fp, kind) ~= nil
-end
-
-local function safeValidPayload(path, fp, kind)
-  local ok, valid = pcall(validPayload, path, fp, kind)
+local function safeValidPayload(key, mkey, fp, kind)
+  local ok, valid = pcall(payloadFingerprint, key, mkey, fp, kind)
   return ok and valid
 end
 
-local function headerFingerprint(path, prefix)
-  local s, totalLen = readHeader(path)
-  if not s then return false end
-  local got, offset, meta = parseHeader(s, totalLen)
-  if not (got and totalLen >= offset
-         and (meta.format ~= COMPRESSED_FORMAT
-              or meta.rawLen <= MAX_PAYLOAD)) then
+-- A meta record's fingerprint, validated against the live identity
+-- prefix for the job. nil when missing or stale.
+local function metaFingerprint(mkey, prefix)
+  local ok, meta = pcall(readTable, mkey)
+  if not (ok and type(meta) == "table" and type(meta.fp) == "string") then
     return nil
   end
-  if prefix and got:sub(1, #prefix) ~= prefix then return nil end
-  return got
+  if prefix and meta.fp:sub(1, #prefix) ~= prefix then return nil end
+  return meta
 end
 
-local function safeHeaderFingerprint(path, prefix)
-  local ok, got = pcall(headerFingerprint, path, prefix)
-  return ok and type(got) == "string" and got or nil
+local function safeMetaFingerprint(mkey, prefix)
+  local ok, got = pcall(metaFingerprint, mkey, prefix)
+  return ok and got or nil
 end
 
-local function validHeader(path, fp)
-  return headerFingerprint(path) == fp
-end
-
-local function safeValidHeader(path, fp)
-  local ok, valid = pcall(validHeader, path, fp)
-  return ok and valid
-end
-
-local function safeFormat(path, fp)
-  local ok, format, rawLen, codecName = pcall(function()
-    local s, totalLen = readHeader(path)
-    if not s then return nil end
-    local got, offset, meta = parseHeader(s, totalLen)
-    if got ~= fp then return nil end
-    local rawLen = meta.format == COMPRESSED_FORMAT
-                  and meta.rawLen or (totalLen - offset + 1)
-    return meta.format, rawLen, CODEC_NAMES[meta.codec]
-  end)
-  return ok and format or nil, ok and rawLen or nil, ok and codecName or nil
-end
-
-local function updateCompression(records, dir)
+local function updateCompression(records)
   local total, compressed = 0, 0
   local codecNames = {}
   for _, record in pairs(records or {}) do
@@ -947,12 +920,12 @@ local function updateCompression(records, dir)
       { record.water, record.waterFp },
       { record.aux, record.auxFp },
     }) do
-      local format, rawLen, codecName = safeFormat(dir .. "/" .. pair[1], pair[2])
-      if rawLen and rawLen >= 1024 then
+      local meta = safeMetaFingerprint(pair[1], pair[2])
+      if meta and meta.rawLen and meta.rawLen >= 1024 then
         total = total + 1
-        if format == COMPRESSED_FORMAT then
+        if meta.format == COMPRESSED_FORMAT then
           compressed = compressed + 1
-          if codecName then codecNames[codecName] = true end
+          if meta.codec then codecNames[meta.codec] = true end
         end
       end
     end
@@ -966,8 +939,6 @@ local function updateCompression(records, dir)
   else
     compression = "mixed"
   end
-  -- The codec behind the compressed payloads: one name when they all
-  -- agree, "MIX" when a cache spans codecs, nil when nothing is compressed.
   local names = {}
   for name in pairs(codecNames) do names[#names + 1] = name end
   if #names == 1 then
@@ -980,85 +951,73 @@ local function updateCompression(records, dir)
 end
 
 function MeshCache.jobRecord(map, slot)
+  local slotName = tostring(slot)
+  local mapSlot = { id = map.id }
   return {
-    key = tostring(map.id) .. "/" .. tostring(slot),
-    terrain = fileName(map, slot, "terrain"),
+    key = tostring(map.id) .. "/" .. slotName,
+    terrain = metaKey(mapSlot, slot, "terrain"),
     terrainFp = fingerprint(map, slot),
-    water = fileName(map, slot, "water"),
+    water = metaKey(mapSlot, slot, "water"),
     waterFp = fingerprint(map, slot .. "Water"),
-    aux = fileName(map, slot, "aux"),
+    aux = metaKey(mapSlot, slot, "aux"),
     auxFp = fingerprint(map, slot .. "Aux"),
   }
 end
 
+-- A record whose three payload metas all exist under the live identity.
+-- NOTE the record carries META keys (the boot scan's bounded reads);
+-- payload bytes are validated when a map actually loads.
 local function scanJob(job)
+  local map = { id = job.id }
   local slot = tostring(job.slot)
-  local id = tostring(job.id)
-  local entries = {
-    { mapId = id, slot = slot, kind = "terrain",
-      fingerprint = identity() .. "|" .. id .. "|" .. slot .. "|",
-      prefix = true },
-    { mapId = id, slot = slot, kind = "water",
-      fingerprint = identity() .. "|" .. id .. "|" .. slot .. "Water|",
-      prefix = true },
-    { mapId = id, slot = slot, kind = "aux",
-      fingerprint = identity() .. "|" .. id .. "|" .. slot .. "Aux|",
-      prefix = true },
-  }
-  local scanned, count = ScopedStorage.scan(entries, identity())
-  if count ~= #entries then return nil end
-  local function found(kind)
-    return scanned[id .. "/" .. slot .. "/" .. kind]
-  end
-  local terrain, water, aux = found("terrain"), found("water"), found("aux")
-  return { key = id .. "/" .. slot, terrain = fileName({ id = id }, slot, "terrain"),
-           terrainFp = terrain.fingerprint,
-           water = fileName({ id = id }, slot, "water"),
-           waterFp = water.fingerprint,
-           aux = fileName({ id = id }, slot, "aux"),
-           auxFp = aux.fingerprint }
+  local terrainMeta = safeMetaFingerprint(
+    metaKey(map, slot, "terrain"),
+    identity() .. "|" .. tostring(job.id) .. "|" .. slot .. "|")
+  local waterMeta = safeMetaFingerprint(
+    metaKey(map, slot, "water"),
+    identity() .. "|" .. tostring(job.id) .. "|" .. slot .. "Water|")
+  local auxMeta = safeMetaFingerprint(
+    metaKey(map, slot, "aux"),
+    identity() .. "|" .. tostring(job.id) .. "|" .. slot .. "Aux|")
+  if not (terrainMeta and waterMeta and auxMeta) then return nil end
+  return { key = tostring(job.id) .. "/" .. slot,
+           terrain = metaKey(map, slot, "terrain"),
+           terrainFp = terrainMeta.fp, water = metaKey(map, slot, "water"),
+           waterFp = waterMeta.fp, aux = metaKey(map, slot, "aux"),
+           auxFp = auxMeta.fp }
 end
 
 function MeshCache.verifyJob(map, slot)
-  if not MeshCache.available() or not readStoredPayload then return false end
+  if not MeshCache.available() then return false end
   local record = MeshCache.jobRecord(map, slot)
-  local terrain = readStoredPayload(map, slot, "terrain", record.terrainFp)
-  local water = readStoredPayload(map, slot, "water", record.waterFp)
-  local aux = readStoredPayload(map, slot, "aux", record.auxFp)
-  return terrain ~= nil and decodeQuant(terrain) ~= nil
-     and water ~= nil and decodeQuant(water) ~= nil
-     and aux ~= nil and decodeAuxPayload(aux) ~= nil
+  local mapSlot = { id = map.id }
+  return safeValidPayload(payloadKey(mapSlot, slot, "terrain"),
+                          record.terrain, record.terrainFp, "mesh")
+     and safeValidPayload(payloadKey(mapSlot, slot, "water"),
+                          record.water, record.waterFp, "mesh")
+     and safeValidPayload(payloadKey(mapSlot, slot, "aux"),
+                          record.aux, record.auxFp, "aux")
 end
 
--- Returns (manifest, failReason, manifestIdentity) where failReason is nil on
--- success, or one of "no_dir", "missing", "format", "identity", "records".
--- manifestIdentity is the identity string read from the manifest header, so
--- an identity mismatch can be diffed against the live identity.
+-- --------------------------------------------------------------- manifest
+
+-- Returns (manifest, failReason, manifestIdentity) where failReason is
+-- nil on success, or one of "no_store", "missing", "format", "identity",
+-- "records". The manifest is a TABLE now (the file-era text format died
+-- with the filesystem).
 local function readManifest()
-  local path = manifestPath()
-  if not path then return nil, "no_dir" end
-  local text = readFile(path)
-  if not text then return nil, "missing" end
-  local lines = {}
-  for line in text:gmatch("[^\n]+") do lines[#lines + 1] = line end
-  local format, manifestIdentity, total
-  if lines[1] then
-    format, manifestIdentity, total =
-      lines[1]:match("^(%S+)%s+(%S+)%s+(%d+)$")
+  if not MeshCache.available() then return nil, "no_store" end
+  local manifest = readTable(MANIFEST_KEY)
+  if not manifest then return nil, "missing" end
+  if manifest.format ~= "PVMC1" then return nil, "format" end
+  if manifest.identity ~= identity() then
+    return nil, "identity", manifest.identity
   end
-  if format ~= "PVMC1" then return nil, "format" end
-  if manifestIdentity ~= identity() then
-    return nil, "identity", manifestIdentity
+  if type(manifest.records) ~= "table"
+     or type(manifest.total) ~= "number" then
+    return nil, "records"
   end
-  local records = {}
-  for i = 2, #lines do
-    local key, terrain, terrainFp, water, waterFp, aux, auxFp =
-      lines[i]:match("^job\t([^\t]+)\t([^\t]+)\t([^\t]+)\t([^\t]+)\t([^\t]+)\t([^\t]+)\t([^\t]+)$")
-    if not key then return nil, "records" end
-    records[key] = { key = key, terrain = terrain, terrainFp = terrainFp,
-                     water = water, waterFp = waterFp, aux = aux, auxFp = auxFp }
-  end
-  return { total = tonumber(total), records = records }
+  return manifest
 end
 
 local function setLastFailure(reason, detail)
@@ -1069,22 +1028,25 @@ local function setLastFailure(reason, detail)
 end
 
 function MeshCache.ready(jobs)
-  if dirty or not MeshCache.available() then
-    setLastFailure(dirty and "dirty" or "unavailable")
+  -- The mid-build guard keys on buildIdentity, not dirty: invalidate()
+  -- sets dirty for "geometry may have changed" and is SUPPOSED to be
+  -- followed by the self-heal rescan below -- the boot invalidate deletes
+  -- the manifest and deletes nothing else, so a rescan that finds every
+  -- payload's meta record restores READY in place. Bailing on dirty here
+  -- left the flag set until a full rebuild ran, which made CONTINUE ask
+  -- to rebuild on every launch.
+  if buildIdentity or not MeshCache.available() then
+    setLastFailure(buildIdentity and "dirty" or "unavailable")
     return false, 0
   end
   local manifest, failReason, manifestIdentity = readManifest()
   if not manifest then
     if failReason == "identity" then
-      -- The definitive diagnostic: the manifest was built under a different
-      -- identity than the live one. Report it as the primary reason; a
-      -- self-heal scan can only succeed if files were rebuilt under the live
-      -- identity, and even then the mismatch is what a user needs to know.
       setLastFailure("identity_mismatch", {
         actual = manifestIdentity,
         diffs = identityDiff(manifestIdentity, identity()),
       })
-    elseif failReason == "missing" or failReason == "no_dir" then
+    elseif failReason == "missing" or failReason == "no_store" then
       setLastFailure("no_manifest")
     else
       setLastFailure("corrupt_manifest", { reason = failReason })
@@ -1093,8 +1055,6 @@ function MeshCache.ready(jobs)
     for _, job in ipairs(jobs or {}) do
       local record = scanJob(job)
       if not record then
-        -- Preserve the identity_mismatch diagnostic when present (the scan
-        -- failing against live identity is the expected consequence).
         if lastFailure.reason ~= "identity_mismatch" then
           setLastFailure("file_missing", { job = tostring(job.id) .. "/"
             .. tostring(job.slot) })
@@ -1117,19 +1077,25 @@ function MeshCache.ready(jobs)
   end
   local done = 0
   for _, job in ipairs(jobs or {}) do
-    local record = scanJob(job)
-    if record then done = done + 1 end
+    local key = tostring(job.id) .. "/" .. tostring(job.slot)
+    local record = manifest.records[key]
+    local ok = record ~= nil
+           and safeMetaFingerprint(record.terrain, record.terrainFp) ~= nil
+           and safeMetaFingerprint(record.water, record.waterFp) ~= nil
+           and safeMetaFingerprint(record.aux, record.auxFp) ~= nil
+    if ok then done = done + 1 end
   end
   if done == #jobs then
     lastFailure = nil
+    updateCompression(manifest.records)
     return true, done
   end
-  -- Some records are missing or invalid -- a partial manifest from a build
-  -- interrupted before finish(), a file that did not survive -- so rescan
-  -- the actual files. Payload writes are atomic, so whatever survived is a
-  -- COMPLETE old-or-new payload and the scan accepts the mix. A full rescan
+  -- Some records are missing or stale -- a partial manifest from a build
+  -- interrupted before finish(), a payload the player wiped -- so rescan
+  -- the metas. Storage writes are atomic, so whatever survived is a
+  -- COMPLETE payload and the scan accepts the mix. A full rescan
   -- self-heals the manifest (READY); a partial one reports how many jobs
-  -- are done so the prebuild can RESUME instead of restarting from zero.
+  -- are done so the prebuild can RESUME instead of restarting.
   local records, scanned = {}, 0
   for _, candidate in ipairs(jobs or {}) do
     local migrated = scanJob(candidate)
@@ -1146,10 +1112,9 @@ function MeshCache.ready(jobs)
   return false, scanned
 end
 
--- The records of every job whose three payload files all survive with the
--- live identity -- the resume set a boot can hand back to a prebuild that
--- was interrupted mid-session. File-level, like scanJob, so a manifest is
--- neither required nor trusted here.
+-- The records of every job whose three payload metas all survive with
+-- the live identity -- the resume set a boot can hand back to a prebuild
+-- that was interrupted mid-session.
 function MeshCache.scanComplete(jobs)
   if not MeshCache.available() then return {}, 0 end
   local records, done = {}, 0
@@ -1163,51 +1128,48 @@ function MeshCache.scanComplete(jobs)
   return records, done
 end
 
--- Writes the build.info sidecar: the identity (and its components) that the
--- cache was actually built with, plus a timestamp. Read at the next launch so
--- a persistent cache rejection can be diffed against the live identity.
+-- The build.info record: the identity (and its components) that the
+-- cache was actually built with, plus a timestamp.
 local function writeBuildInfo(id, parts)
-  local dir = MeshCache.dir()
-  if not dir then return end
-  writeFile(dir .. "/" .. BUILD_INFO, table.concat({
-    "identity=" .. id,
-    "format=" .. parts.format,
-    "version=" .. tostring(parts.version),
-    "activeVersion=" .. tostring(parts.activeVersion),
-    "profile=" .. parts.profile,
-    "dataKey=" .. parts.dataKey,
-    "voidFill=" .. parts.voidFill,
-    "builtAt=" .. tostring(os.time and os.time() or 0),
-  }, "\n") .. "\n")
+  if not MeshCache.available() then return end
+  local info = {
+    identity = id,
+    format = parts.format,
+    version = tostring(parts.version),
+    activeVersion = tostring(parts.activeVersion),
+    profile = parts.profile,
+    dataKey = parts.dataKey,
+    voidFill = parts.voidFill,
+    builtAt = os.time and os.time() or 0,
+  }
+  writeTable(BUILD_INFO_KEY, info)
 end
 
 -- The shared manifest writer: records keyed by job key, `total` the full
 -- job count. writeProgress lets a build UPDATE the manifest after every
--- completed job (records may be fewer than total), so a build interrupted
--- before finish() still leaves a manifest naming exactly the jobs whose
--- files survived. Returns (ok, writtenIdentity).
+-- completed job, so a build interrupted before finish() still leaves a
+-- manifest naming exactly the jobs whose payloads survived.
 local function writeManifestLines(records, total)
-  local path = manifestPath()
-  if not path or type(records) ~= "table" then return false end
+  if not MeshCache.available() or type(records) ~= "table" then
+    return false
+  end
   local keys = sortedKeys(records)
   if #keys > total then return false end
-  -- During an active build the manifest carries the begin()-time snapshot so
-  -- it matches every payload file exactly; outside a build (self-heal rescan)
-  -- it carries the live identity the scan was validated against.
   local id = dirty and buildIdentity or identity()
-  local lines = { ("PVMC1\t%s\t%d"):format(id, total) }
+  local manifest = { format = "PVMC1", identity = id, total = total,
+                     records = {} }
   for _, key in ipairs(keys) do
     local record = records[key]
-    lines[#lines + 1] = table.concat({ "job", record.key, record.terrain,
-      record.terrainFp, record.water, record.waterFp, record.aux,
-      record.auxFp }, "\t")
+    manifest.records[key] = { key = record.key,
+                              terrain = record.terrain,
+                              terrainFp = record.terrainFp,
+                              water = record.water,
+                              waterFp = record.waterFp,
+                              aux = record.aux, auxFp = record.auxFp }
   end
-  return writeFile(path, table.concat(lines, "\n") .. "\n"), id
+  return writeTable(MANIFEST_KEY, manifest), id
 end
 
--- Per-job progress manifest (F3): the prebuild calls this after each job
--- so an interrupted build leaves a manifest instead of a hole the boot
--- prompts about forever.
 function MeshCache.writeProgress(records, total)
   local ok, id = writeManifestLines(records, total)
   if ok then
@@ -1222,56 +1184,67 @@ function MeshCache.writeManifest(records, total)
   if ok then
     writeBuildInfo(id, buildParts or identityParts())
     dirty = false
-    -- The build session is over: drop the snapshot so any later self-heal
-    -- scan validates against the LIVE identity, not the stale build one.
     buildIdentity = nil
     buildParts = nil
-    updateCompression(records, MeshCache.dir())
+    updateCompression(records)
+    local okD, Overlay = pcall(V.require, "DebugOverlay")
+    if okD and Overlay then
+      Overlay.trace("manifest written (%d jobs, codec %s)",
+                   total, tostring(codec))
+    end
   end
   return ok
 end
 
 -- ------------------------------------------------------------ save/load
 
--- A save that cannot write is now SURFACED, not swallowed (F5): the old
--- pcall only caught thrown errors, so a writeFile that returned false --
--- a full SD card, a read-only folder, a missing rename target -- vanished
--- into the next "cache verification failed". The per-session reason lands
--- in lastSaveError, which Prebuild copies into its failure message.
 local function recordSaveFailure(kind, detail)
   saveFailures = saveFailures + 1
-  detail = detail or ScopedStorage.lastError()
   lastSaveError = kind .. (detail and (": " .. tostring(detail)) or "")
+  local okD, Overlay = pcall(V.require, "DebugOverlay")
+  if okD and Overlay then
+    Overlay.note("cache save failed: %s", lastSaveError)
+  end
   return false
 end
 
 function MeshCache.saveTerrain(map, slot, buf, n, idx, m)
-  if not MeshCache.dir() then return false end
+  if not MeshCache.available() then return false end
   local ok, result = pcall(function()
     local fp = fingerprint(map, slot)
-    local packed = packPayload(fp, encodeQuant(n, buf, m, idx))
-    noteCompression(packed)
-    return ScopedStorage.write(logicalKey(map, slot, "terrain"), fp, packed)
+    local bytes = packPayload(fp, encodeQuant(n, buf, m, idx))
+    return writePayload(payloadKey(map, slot, "terrain"),
+                        metaKey(map, slot, "terrain"), bytes, fp)
   end)
   if not ok then
     return recordSaveFailure("terrain", result)
   end
   if result ~= true then return recordSaveFailure("terrain") end
+  local okD, Overlay = pcall(V.require, "DebugOverlay")
+  if okD and Overlay then
+    Overlay.trace("saved terrain %s/%s (%d verts)", tostring(map.id),
+                 tostring(slot), n or 0)
+  end
   return true
 end
 
 function MeshCache.saveWater(map, slot, buf, n, idx, m)
-  if not MeshCache.dir() then return false end
+  if not MeshCache.available() then return false end
   local ok, result = pcall(function()
     local fp = fingerprint(map, slot .. "Water")
-    local packed = packPayload(fp, encodeQuant(n, buf, m, idx))
-    noteCompression(packed)
-    return ScopedStorage.write(logicalKey(map, slot, "water"), fp, packed)
+    local bytes = packPayload(fp, encodeQuant(n, buf, m, idx))
+    return writePayload(payloadKey(map, slot, "water"),
+                        metaKey(map, slot, "water"), bytes, fp)
   end)
   if not ok then
     return recordSaveFailure("water", result)
   end
   if result ~= true then return recordSaveFailure("water") end
+  local okD, Overlay = pcall(V.require, "DebugOverlay")
+  if okD and Overlay then
+    Overlay.trace("saved water %s/%s (%d verts)", tostring(map.id),
+                 tostring(slot), n or 0)
+  end
   return true
 end
 
@@ -1279,19 +1252,38 @@ end
 -- miss. The two must land together (a body build's water beside a full
 -- mesh would draw the ring twice): callers check both.
 function MeshCache.loadTerrain(map, slot)
-  if not MeshCache.dir() then return nil, nil end
-  local terrainBody = readStoredPayload(map, slot, "terrain",
-                                        fingerprint(map, slot))
-  local waterBody = readStoredPayload(map, slot, "water",
-                                      fingerprint(map, slot .. "Water"))
-  local mesh = terrainBody and decodeQuant(terrainBody) or nil
-  local water = waterBody and decodeQuant(waterBody) or nil
+  if not MeshCache.available() then return nil, nil end
+  local t0 = love and love.timer and love.timer.getTime
+             and love.timer.getTime() or 0
+  local mesh = MeshCache.loadMeshData(map, slot, "terrain",
+                                      fingerprint(map, slot))
+  local water = MeshCache.loadMeshData(map, slot, "water",
+                                       fingerprint(map, slot .. "Water"))
+  if mesh and water then
+    local okD, Overlay = pcall(V.require, "DebugOverlay")
+    if okD and Overlay then
+      local ms = (love and love.timer and love.timer.getTime
+                  and math.floor((love.timer.getTime() - t0) * 1000 + 0.5))
+                 or 0
+      Overlay.count("cacheHits")
+      Overlay.trace("cache hit terrain %s/%s (%dms, %d verts)",
+                   tostring(map.id), tostring(slot), ms, mesh.n or 0)
+      if ms and ms > 250 then
+        Overlay.error("SLOW load terrain %s/%s: %dms", tostring(map.id),
+                     tostring(slot), ms)
+      end
+    end
+  end
   return mesh, water
 end
 
--- Read + validate one logical mesh payload. nil when missing/corrupt/stale.
+-- Read + validate one mesh payload. nil when missing/corrupt/stale.
 function MeshCache.loadMeshData(map, slot, kind, fp)
-  local body = readStoredPayload(map, slot, kind, fp)
+  if not MeshCache.available() then return nil end
+  local key = payloadKey(map, slot, kind)
+  local mkey = metaKey(map, slot, kind)
+  local body, meta = readPayload(key, fp)
+  if body then repackRaw(key, mkey, fp, body, meta) end
   return body and decodeQuant(body) or nil
 end
 
@@ -1299,7 +1291,7 @@ end
 -- { grass = {n=.., buf=..}, flowers = {n=.., buf=..}, figures = {..} } --
 -- produced by ChunkMesher from the Structures quads.
 function MeshCache.saveAux(map, slot, flattened)
-  if not MeshCache.dir() then return false end
+  if not MeshCache.available() then return false end
   local ok, result = pcall(function()
     local fp = fingerprint(map, slot .. "Aux")
     local body = encodeIndexed(flattened.grass and flattened.grass.n or 0,
@@ -1311,79 +1303,101 @@ function MeshCache.saveAux(map, slot, flattened)
                                   flattened.flowers and flattened.flowers.m or 0,
                                   flattened.flowers and flattened.flowers.idx)
     local figures = encodeFigures(flattened.figures or {})
-    local packed = packPayload(fp, body .. flowers .. figures)
-    noteCompression(packed)
-    return ScopedStorage.write(logicalKey(map, slot, "aux"), fp, packed)
+    local bytes = packPayload(fp, body .. flowers .. figures)
+    return writePayload(payloadKey(map, slot, "aux"),
+                        metaKey(map, slot, "aux"), bytes, fp)
   end)
   if not ok then
     return recordSaveFailure("aux", result)
   end
   if result ~= true then return recordSaveFailure("aux") end
+  local okD, Overlay = pcall(V.require, "DebugOverlay")
+  if okD and Overlay then
+    Overlay.trace("saved aux %s/%s", tostring(map.id), tostring(slot))
+  end
   return true
 end
 
 -- Load the aux streams: { grass, flowers, figures } data records, or nil.
 function MeshCache.loadAux(map, slot)
-  if not MeshCache.dir() then return nil end
-  local body = readStoredPayload(map, slot, "aux",
-                                 fingerprint(map, slot .. "Aux"))
-  return body and decodeAuxPayload(body) or nil
+  if not MeshCache.available() then return nil end
+  local key = payloadKey(map, slot, "aux")
+  local mkey = metaKey(map, slot, "aux")
+  local fp = fingerprint(map, slot .. "Aux")
+  local body, meta = readPayload(key, fp)
+  if not body then return nil end
+  repackRaw(key, mkey, fp, body, meta)
+  local g = decodeIndexed(body)
+  if not g then return nil end
+  local fpos = 4 + g.n * 24 + 4 + g.m * 4
+  local flowers = decodeIndexed(body:sub(1 + fpos))
+  if not flowers then return nil end
+  local fpos2 = fpos + 4 + flowers.n * 24 + 4 + flowers.m * 4
+  local figures = decodeFigures(body:sub(1 + fpos2))
+  if not figures then return nil end
+  local okD, Overlay = pcall(V.require, "DebugOverlay")
+  if okD and Overlay then
+    Overlay.trace("cache hit aux %s/%s", tostring(map.id), tostring(slot))
+  end
+  return { grass = g, flowers = flowers, figures = figures }
 end
 
--- Drop the cached files for one map (a block edit / a reloaded map) or
--- every map. mapId-scoped deletes are REAL: a cut tree changes blocks
--- without changing any fingerprint component, so the file must go or the
--- 3D world keeps the old tree. The nil (full) case only handles hot
--- reload and boot -- in-memory meshes, canvases and generations are
--- dropped by the callers above -- and the DISK files are deliberately
--- KEPT: they are fingerprint-protected, so a stale one (new mesher
--- version, a tileset swap, a void-fill change, a brick/full profile
--- switch) fails validation at load and is dropped then. Wiping the disk
--- at boot is what made every launch cold -- the cache never survived a
--- restart.
+-- Drop the cached payloads for one map (a block edit / a reloaded map)
+-- or every map. mapId-scoped deletes are REAL: a cut tree changes blocks
+-- without changing any fingerprint component, so the payload must go or
+-- the 3D world keeps the old tree. The nil (full) case drops the
+-- manifest only -- stale payloads are fingerprint-protected and die at
+-- load -- which is what keeps restarts warm.
 function MeshCache.invalidate(mapId)
   dirty = true
   compression = "unknown"
   codec = nil
-  if not MeshCache.dir() then return end
-  ScopedStorage.removeMeta("manifest")
+  local okD, Overlay = pcall(V.require, "DebugOverlay")
+  if okD and Overlay then
+    Overlay.trace("cache invalidate %s", tostring(mapId or "ALL"))
+  end
+  if not MeshCache.available() then return end
+  deleteKey(MANIFEST_KEY)
   if not mapId then return end
-  for _, slot in ipairs({ "body", "full" }) do
-    for _, kind in ipairs({ "terrain", "water", "aux" }) do
-      ScopedStorage.remove({ mapId = tostring(mapId), slot = slot, kind = kind })
-    end
+  local prefix = safeId(mapId)
+  for _, key in ipairs(listKeys("maps/" .. prefix)) do
+    deleteKey(key)
   end
-end
-
-local function listFiles()
-  local storage = storageApi()
-  if not storage then return {} end
-  local ok, keys = pcall(storage.list, storage, storageGame, STORAGE_PREFIX)
-  if not (ok and type(keys) == "table") then return {} end
-  local names = {}
-  for _, key in ipairs(keys) do
-    names[#names + 1] = tostring(key):match("([^/]+)$")
+  for _, key in ipairs(listKeys("meta/" .. prefix)) do
+    deleteKey(key)
   end
-  return names
 end
 
 function MeshCache.wipe(jobs)
   dirty = true
   compression = "unknown"
   codec = nil
-  if not MeshCache.dir() then return false end
-  return ScopedStorage.wipe()
+  local okD, Overlay = pcall(V.require, "DebugOverlay")
+  if okD and Overlay then Overlay.trace("cache wipe") end
+  if not MeshCache.available() then return false end
+  deleteKey(MANIFEST_KEY)
+  deleteKey(BUILD_INFO_KEY)
+  -- Everything the storage scoping lets us see is ours: list and delete
+  -- both namespaces. (The prefix pass catches stale payloads from maps
+  -- no longer present in the current data, which the jobs pass alone
+  -- would leave behind.)
+  for _, key in ipairs(listKeys("maps")) do
+    deleteKey(key)
+  end
+  for _, key in ipairs(listKeys("meta")) do
+    deleteKey(key)
+  end
+  return true
 end
 
 -- ------------------------------------------------ pure helpers (exported)
 
 -- Flatten a quads table (the Structures grass/flowers/figure shapes:
 -- 4 corners + uv + shade per quad) into the same INDEXED stream the
--- table mesh path consumes: 4 unique verts per quad in `buf`, plus 6
--- 1-based indices per quad in `idxBuf`. Returns
--- (floatCount, indexCount). The one function both aux save paths
--- share, exported so the headless suite can prove a round-trip is
--- byte-identical.
+-- table sink emits: 4 unique verts per quad in `buf` (a 1-based Lua
+-- float table), plus 6 u32 indices per quad (1-based, the table-map
+-- convention -- the wire format conversion happens in the encoders).
+-- Returns (floatCount, indexCount).
 function MeshCache.flattenQuads(quads, buf, idxBuf)
   local k, m = 0, 0
   for _, q in ipairs(quads) do
@@ -1396,43 +1410,41 @@ function MeshCache.flattenQuads(quads, buf, idxBuf)
       corner[i] = { c[1], c[2], c[3], uv[1], uv[2],
                     flatShade and q.shade or q.shade[i] }
     end
-    local base = k
     for i = 1, 4 do
       local v = corner[i]
-      -- Sandbox meshes consume a dense list of six-field rows. Float-offset
-      -- keys are ambiguous: dense row 7 and sparse row 2 both use key 7.
-      buf[#buf + 1] = v
+      buf[k + 1] = v[1]
+      buf[k + 2] = v[2]
+      buf[k + 3] = v[3]
+      buf[k + 4] = v[4]
+      buf[k + 5] = v[5]
+      buf[k + 6] = v[6]
       k = k + 6
     end
-    local v0 = base / 6 + 1   -- table maps are 1-based in love.graphics
-    idxBuf[m + 1] = v0
-    idxBuf[m + 2] = v0 + 1
-    idxBuf[m + 3] = v0 + 2
-    idxBuf[m + 4] = v0
-    idxBuf[m + 5] = v0 + 2
-    idxBuf[m + 6] = v0 + 3
+    local v0 = k / 6 - 4          -- 0-based first vertex of this quad
+    idxBuf[m + 1] = v0 + 1        -- 1-based table-map convention
+    idxBuf[m + 2] = v0 + 2
+    idxBuf[m + 3] = v0 + 3
+    idxBuf[m + 4] = v0 + 1
+    idxBuf[m + 5] = v0 + 3
+    idxBuf[m + 6] = v0 + 4
     m = m + 6
   end
   return k, m
 end
 
 -- A mesh payload encoder, exported for tests (no header -- the header
--- needs the fingerprint). Given a float* + vertex count, returns the
--- serialized bytes; decodeMesh reads them back.
+-- needs the fingerprint). Given a ByteData float buffer + vertex count,
+-- returns the serialized bytes; decodeMesh reads them back.
 MeshCache.encodeMesh = encodeMesh
 MeshCache.decodeMesh = decodeMesh
--- indexed terrain/water payloads (brick.11+)
 MeshCache.encodeIndexed = encodeIndexed
 MeshCache.decodeIndexed = decodeIndexed
--- Diagnostics: populated by ready() on failure, cleared on success. Getter
--- so callers always read the CURRENT failure (the local is reassigned).
+-- Diagnostics: populated by ready() on failure, cleared on success.
 function MeshCache.getLastFailure()
   return lastFailure
 end
--- Identity components / diff helpers, exported for boot diagnostics.
 MeshCache.identityParts = identityParts
 MeshCache.identityDiff = identityDiff
--- Per-session write-failure tracking (F5), for Prebuild's failure message.
 function MeshCache.saveError()
   return lastSaveError
 end
@@ -1440,22 +1452,14 @@ function MeshCache.saveFailureCount()
   return saveFailures
 end
 
--- Read the build.info sidecar written at build time (nil when absent).
+-- Read the build.info record written at build time (nil when absent).
 function MeshCache.readBuildInfo()
-  local dir = MeshCache.dir()
-  if not dir then return nil end
-  local text = readFile(dir .. "/" .. BUILD_INFO)
-  if not text then return nil end
-  local info = {}
-  for line in text:gmatch("[^\n]+") do
-    local k, v = line:match("^([^=]+)=(.*)$")
-    if k then info[k] = v end
-  end
-  return info
+  if not MeshCache.available() then return nil end
+  return readTable(BUILD_INFO_KEY)
 end
 
 -- A build-time snapshot of what this cache was built under, for the
--- CachePrebuild bootstrap log: the full identity and its components.
+-- CachePrebuild bootstrap log.
 function MeshCache.buildInfoSnapshot()
   if not buildParts then return nil end
   local info = { identity = buildIdentity }

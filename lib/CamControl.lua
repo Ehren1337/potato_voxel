@@ -8,12 +8,10 @@
 --   a staged battle      the camera the fight is shot with (BattleCam): the
 --                        wheel and Q/E work its lens, and the right stick,
 --                        a drag or the mouse walk it around the arena.
---                        (Live on every rung of this build.)
 --
 --   the 3RD rung         the boom behind the player's shoulder
 --                        (ThirdPerson): the wheel, Q/E and a pinch let it
---                        out and pull it in. (Retained with the free-roam
---                        rigs; no rung on this build selects it.)
+--                        out and pull it in.
 --
 --   an orbit rung        the engine's own survey zoom, which the wheel has
 --                        always driven -- so here the module mostly gets
@@ -263,9 +261,28 @@ function CamControl.install()
   local function clamp(v)
     return math.max(-MOUSE_STEP, math.min(MOUSE_STEP, v or 0))
   end
-  -- Mouse and touch input are delivered through the public pointer seam
-  -- below. The sandbox owns love.mouse* and the Game pointer handlers, so
-  -- neither callback is patched here.
+  -- The sandbox forbids assigning the engine's love callbacks, so the
+  -- battle-camera mouse read rides the input.pointer hook. Priority 10
+  -- keeps this wrap OUTSIDE FirstPerson's (the old love.mousemoved order:
+  -- this one saw the event first and forwarded it on). Nothing is ever
+  -- claimed here -- the steer is a read of the motion, and the cursor
+  -- still has UI to point at.
+  do
+    local mod = V.mod
+    if mod and mod.hooks then
+      mod.hooks:wrap("input.pointer", function(next, game, evt)
+        if evt and evt.phase == "moved" and evt.source ~= "touch"
+           and battleLive() then
+          local dx, dy = evt.dx, evt.dy
+          -- dy is NEGATED for the same reason the stick's is: moving the
+          -- mouse away from you sends the camera up and over
+          if dx and dx ~= 0 then BattleCam.mouseOrbit(clamp(dx)) end
+          if dy and dy ~= 0 then BattleCam.mousePitch(-clamp(dy)) end
+        end
+        return next(game, evt)
+      end, 10)
+    end
+  end
 
   -- ------- the touch screen
   --
@@ -277,6 +294,8 @@ function CamControl.install()
   --                             something -- and while they are down the
   --                             free-roam look stands aside, so a pinch in
   --                             3RD does not also spin the view
+  local TouchControls = require("src.core.TouchControls")
+
   local free = {}          -- id -> {x, y} for every finger on open screen
   local pinch = nil        -- { a, b, gap } while two of them are pinching
 
@@ -319,6 +338,12 @@ function CamControl.install()
     end
   end
 
+  local function onControl(x, y)
+    local hit = nil
+    pcall(function() hit = TouchControls:hitTest(x, y) end)
+    return hit
+  end
+
   -- Whether this module has any interest in touches at all this frame.
   -- Kept deliberately wide -- a battle, or anything that zooms -- because
   -- the wrap forwards everything it does not claim regardless.
@@ -326,66 +351,72 @@ function CamControl.install()
     return battleLive() or CamControl.zoomTarget() ~= nil
   end
 
-  local hooks = V.mod and V.mod.hooks
-  if hooks and type(hooks.wrap) == "function" then
-    -- Install after FirstPerson, with higher priority, matching the old
-    -- outer Game wrapper. A battle or pinch can consume a moved pointer by
-    -- not calling nextFn; ordinary events continue to the other camera.
-    hooks:wrap("input.pointer", function(nextFn, game, ev)
-      if type(ev) ~= "table" then return nextFn(game, ev) end
-
-      local phase, id = ev.phase, ev.id
-      if ev.source == "mouse" and phase == "moved" then
-        if battleLive() then
-          if ev.dx and ev.dx ~= 0 then BattleCam.mouseOrbit(clamp(ev.dx)) end
-          if ev.dy and ev.dy ~= 0 then BattleCam.mousePitch(-clamp(ev.dy)) end
-        end
-      elseif ev.source == "touch" then
-        if phase == "pressed" then
-          if wantsTouch() then
-            free[id] = { x = ev.x, y = ev.y }
-            if CamControl.zoomTarget() then startPinch() end
-          end
-        elseif phase == "moved" then
-          local f = free[id]
-          if f then
-            local px, py = f.x, f.y
-            f.x, f.y = ev.x, ev.y
-            if pinch and (id == pinch.a or id == pinch.b) then
-              local gap = gapOf(pinch.a, pinch.b)
-              local factor = gap / math.max(1, pinch.gap)
-              if math.abs(factor - 1) > CamControl.PINCH_SLACK then
-                CamControl.pinchBy(factor)
-                pinch.gap = gap
-              end
-              return true
-            end
-            if battleLive() and not pinch then
-              local w, h = 1280, 720
-              pcall(function()
-                w, h = love.graphics.getWidth(), love.graphics.getHeight()
-              end)
-              BattleCam.dragOrbit((ev.x - px) / math.max(320, w))
-              BattleCam.dragPitch(-(ev.y - py) / math.max(240, h))
-              return true
-            end
-          end
-        elseif phase == "released" then
-          if free[id] then
-            if pinch and (id == pinch.a or id == pinch.b) then endPinch(id) end
-            free[id] = nil
-          end
-        elseif phase == "cancelled" then
-          free, pinch = {}, nil
-          CamControl.surveyAccum = 0
-        end
-      elseif phase == "cancelled" then
-        free, pinch = {}, nil
-        CamControl.surveyAccum = 0
+  do
+    local inner = Game.touchpressed
+    function Game:touchpressed(id, x, y)
+      if wantsTouch() and not onControl(x, y) then
+        free[id] = { x = x, y = y }
+        if CamControl.zoomTarget() then startPinch() end
+        -- forwarded even so: a single free finger is the free-roam look's
+        -- to claim (FirstPerson's wrap is inside this one), and in a
+        -- battle it is nobody's until it MOVES
       end
+      return inner(self, id, x, y)
+    end
+  end
 
-      return nextFn(game, ev)
-    end, 100)
+  do
+    local inner = Game.touchmoved
+    function Game:touchmoved(id, x, y)
+      local f = free[id]
+      if f then
+        local px, py = f.x, f.y
+        f.x, f.y = x, y
+        if pinch and (id == pinch.a or id == pinch.b) then
+          local gap = gapOf(pinch.a, pinch.b)
+          local factor = gap / math.max(1, pinch.gap)
+          if math.abs(factor - 1) > CamControl.PINCH_SLACK then
+            CamControl.pinchBy(factor)
+            pinch.gap = gap
+          end
+          return                       -- claimed: never a look drag too
+        end
+        if battleLive() and not pinch then
+          local w, h = 1280, 720
+          pcall(function()
+            w, h = love.graphics.getWidth(), love.graphics.getHeight()
+          end)
+          BattleCam.dragOrbit((x - px) / math.max(320, w))
+          -- dragged UP sends the camera up and over, the same way the
+          -- stick and the mouse do
+          BattleCam.dragPitch(-(y - py) / math.max(240, h))
+          return
+        end
+      end
+      return inner(self, id, x, y)
+    end
+  end
+
+  do
+    local inner = Game.touchreleased
+    function Game:touchreleased(id, x, y)
+      if free[id] then
+        if pinch and (id == pinch.a or id == pinch.b) then endPinch(id) end
+        free[id] = nil
+      end
+      return inner(self, id, x, y)
+    end
+  end
+
+  -- a reset that drops held input state drops ours with it, exactly as the
+  -- free-roam look's does
+  do
+    local inner = Game.focus
+    function Game:focus(f)
+      free, pinch = {}, nil
+      CamControl.surveyAccum = 0
+      return inner(self, f)
+    end
   end
 end
 

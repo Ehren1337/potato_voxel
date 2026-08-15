@@ -1,12 +1,12 @@
 {
   "id": "potato_voxel",
   "name": "PotatoVoxel",
-  "version": "1.6.0",
+  "version": "1.6.1",
   "api": 2,
   "entry": "main.lua",
   "profile": "content",
   "category": "GRAPHICS",
-  "game_version": "0.0.0-dev || >=0.1.86 <2.0.0",
+  "game_version": "0.0.0-dev || >=0.1.37 <2.0.0",
   "priority": 100,
   "dependencies": [],
   "optional_dependencies": [],
@@ -18,9 +18,10 @@
     "DRAMALESS_SHAPE"
   ],
   "permissions": [
-    "engine_internals"
+    "engine_internals",
+    "filesystem"
   ],
   "affects_link": false,
   "github": "ShaneMcGovernIE/potato_voxel",
-  "description": "PotatoVoxel (fork of Dramatic Shape): the overworld as a 3D voxel diorama, retuned for low-end devices. Same diorama, with the settings that would otherwise cost a handheld its frame budget: the VOXEL ladder is a set of quality MODES (OFF / HIGH / MEDIUM / LOW / POTATO / CUSTOM) -- picking a mode applies its tuned defaults to the quality knobs (WATER, FOREST FX, AA, V-CURVE, V-GRID, 3D-BTL, SHADOWS), and touching any knob flips the mode to CUSTOM. A RENDER SCALE knob (100% / 75% / 50% / 33%) is the single biggest frame-budget lever, set by the modes and adjustable on its own; terrain meshes persist through scoped mod.storage. Every rung casts the player and NPCs through the two-layer actor shadow map (the contact/blob decal remains only when the shadow map itself cannot run). One build for every device -- no desktop environment switch."
+  "description": "PotatoVoxel (fork of Dramatic Shape): the overworld as a 3D voxel diorama, retuned for low-end devices. Same diorama, with the settings that would otherwise cost a handheld its frame budget: the VOXEL ladder is a set of quality MODES (OFF / HIGH / MEDIUM / LOW / POTATO / CUSTOM) -- picking a mode applies its tuned defaults to the quality knobs (WATER, AA, V-CURVE, V-GRID, 3D-BTL, SHADOWS), and touching any knob flips the mode to CUSTOM. A RENDER SCALE knob (100% / 75% / 50% / 33%) is the single biggest frame-budget lever, set by the modes and adjustable on its own; scoped mesh-cache storage. One build for every device -- no desktop environment switch. 1.6.1 runs under the mod sandbox: no raw file access, no OS queries, and the Stadium/VR/Forest FX features that needed them are gone."
 }

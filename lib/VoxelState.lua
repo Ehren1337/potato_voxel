@@ -1,5 +1,16 @@
 -- Voxel world mode: the camera angle and its tween.
 --
+-- Deliberately the same shape as src/render/Tilt.lua -- level 0 is off and
+-- 1..3 are the same 15/35/50 degree ladder, eased the same way. What
+-- differs is what the renderer does with the angle: tilt projects the flat
+-- world canvas as one rigid plane, voxel mode drives a real 3D camera over
+-- extruded terrain and voxel character models.
+--
+-- And because it is a real camera over real geometry, it has a rung tilt
+-- could never have: 75 degrees, low enough to read as a diorama shot from
+-- table height. Tilt's flat plane degenerates into a horizon line there,
+-- but geometry only gets more of itself to show.
+--
 -- The LEVEL is not ours. The engine's render_pipelines plumbing owns it --
 -- the options row, the hotkey, the ladder labels, persistence in
 -- save.options.pipelines.voxel, and the mutual exclusion with tilt -- and
@@ -12,36 +23,46 @@
 
 local Voxel = {}
 
--- The ladder this build ships: OFF plus the five active rungs
--- (HIGH / MEDIUM / LOW / POTATO / CUSTOM), every active rung at the
--- classic 35-degree diorama framing. The duplicate angle in the table is
--- deliberate: the ladder is a list of what each rung LOOKS like, and rungs
--- may look the same while meaning different things -- the modes differ in
--- the quality preset QualityMode applies. BrickProfile.apply() re-pins
--- these tables in place at boot (the pipeline record captured them by
--- reference), so a tuning change stays a one-file edit.
-Voxel.ANGLES_DEG = { 0, 35, 35, 35, 35, 35 }
-Voxel.ANGLE_LABELS = { "OFF", "HIGH", "MEDIUM", "LOW", "POTATO", "CUSTOM" }
+-- FULL is a PRESET, not another angle: one rung that puts the whole mode in
+-- its intended state at once -- this camera, the miniature blur at full, the
+-- horizon flat, the view fitted -- so a player who wants "the diorama" picks
+-- it rather than assembling it from four rows. It sits directly after OFF
+-- because that is the order those two get used in.
+--
+-- Its ANGLE is 35 degrees, the same as the rung of that name. The duplicate
+-- in the table is deliberate: the ladder is a list of what each rung LOOKS
+-- like, and two rungs may look the same while meaning different things.
+--
+-- 1ST and 3RD are the other rungs that are more than an angle: the camera
+-- steps off its orbit entirely and stands with the player -- in their eyes
+-- (lib/FirstPerson.lua), or on a boom behind their shoulder
+-- (lib/ThirdPerson.lua) -- with free look and free movement on both. Their
+-- ANGLE entries are 75 -- the orbit rung they hand over from -- because the
+-- tween in and out starts from whatever the orbit shows, and the lowest rung
+-- is the one a dive into a head should start from. Everything angle-derived
+-- (the sky's fade, the billboard lean the blend eases away) reads that 75
+-- while the free-roam rig owns the actual camera.
+Voxel.ANGLES_DEG = { 0, 35, 15, 35, 50, 75, 75, 75 }
+Voxel.ANGLE_LABELS = { "OFF", "FULL", "15", "35", "50", "75",
+                       "1ST (EXPERIMENTAL)", "3RD (EXPERIMENTAL)" }
 Voxel.MAX_LEVEL = #Voxel.ANGLES_DEG - 1
 
--- the rung HIGH sits on. The upstream build called this rung FULL, and
--- the name is kept so the gates that mean "the mode is at its headline
--- rung" still read as such.
+-- the rung FULL sits on, so nothing has to hunt for it by label
 Voxel.FULL_LEVEL = 1
 
 function Voxel.isFull(level)
   return (level or Voxel.level) == Voxel.FULL_LEVEL
 end
 
--- The free-roam rungs (upstream 1ST / 3RD) are not on this ladder --
--- these predicates are constant-false here. They stay for the VR restore
--- path, which reads them through FirstPerson.engaged().
+-- the rung the first-person camera sits on, likewise
 Voxel.FP_LEVEL = 6
 
 function Voxel.isFirstPerson(level)
   return (level or Voxel.level) == Voxel.FP_LEVEL
 end
 
+-- and the third-person one, which is the same rig with the eye boomed off
+-- the back of the head (lib/ThirdPerson.lua)
 Voxel.TP_LEVEL = 7
 
 function Voxel.isThirdPerson(level)
@@ -51,7 +72,7 @@ end
 -- The two of them together: the rungs where the camera stands WITH the
 -- player rather than orbiting the view centre, which is what decides that
 -- the look inputs are read, the walk goes free and the cards turn to face
--- the eye.
+-- the eye. Everything that used to ask isFirstPerson for those asks this.
 function Voxel.isFreeCam(level)
   level = level or Voxel.level
   return Voxel.isFirstPerson(level) or Voxel.isThirdPerson(level)
@@ -59,19 +80,26 @@ end
 
 -- ------- what the hotkey walks
 --
--- The active rungs: OFF -> HIGH -> MEDIUM -> LOW -> POTATO -> OFF. CUSTOM
--- is left out -- it is the player's own combination, reached from the
--- menu, not a mode a key should land on.
-Voxel.HOTKEY_ORDER = { 0, 1, 2, 3, 4 }  -- OFF,HIGH,MEDIUM,LOW,POTATO
+-- The ANGLE rungs only, with FULL left out. The key is a display-mode
+-- cycler: pressing it should change the camera and nothing else, and FULL
+-- reaches in and rewrites four other settings. Landing on it by accident,
+-- mid-walk, would silently turn the blur to maximum and flatten the horizon
+-- with no indication that a keypress had done so. FULL stays on the OPTIONS
+-- row, which is where a preset that changes other rows belongs.
+--
+-- 1ST and 3RD are on the path: they change the camera and only the camera,
+-- which is exactly what the key promises -- and the key is also the way back
+-- OUT of them on a keyboard, where the mouse is captured and the OPTIONS
+-- menu is a trip.
+Voxel.HOTKEY_ORDER = { 0, 2, 3, 4, 5, 6, 7 }  -- OFF,15,35,50,75,1ST,3RD
 
 -- The rung a press moves to from `level`.
 --
--- A level that is not on the key's path -- CUSTOM, reached from the menu
--- -- steps on from whichever rung shows the SAME camera it does: CUSTOM
--- is 35 degrees, so a press from it goes to MEDIUM rather than wrapping
--- early, and the key never appears to do nothing. Matched by ANGLE rather
--- than by a hardcoded rung, so retuning the ladder moves the key's answer
--- with it.
+-- A level that is not on the key's path -- FULL, reached from the menu --
+-- steps on from whichever rung shows the SAME camera it does. FULL is 35
+-- degrees, so a press from it goes to 50 rather than back to 35, and the key
+-- never appears to do nothing. Matched by ANGLE rather than by a hardcoded
+-- rung, so retuning FULL moves the key's answer with it.
 function Voxel.nextHotkeyLevel(level)
   level = level or Voxel.level
   local order = Voxel.HOTKEY_ORDER

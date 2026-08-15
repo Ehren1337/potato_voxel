@@ -342,9 +342,8 @@ local function castShadows(state, arena, terrain, nbMesh, cx, cy, vw, vh,
     -- only thing the sun has to see besides the Pokemon themselves.
     if arena.discs then
       pcall(function()
-        V.require("StadiumStage").cast(ShadowMap, arena, groundY or 0)
+        V.require("DiscArena").cast(ShadowMap, arena, groundY or 0)
       end)
-      pcall(function() V.require("Stadium").cast(ShadowMap) end)
     else
       -- the one shared world-layer run (lib/ShadowCast.lua)
       ShadowCast.terrainAndWater(ShadowMap, ChunkMesher, {
@@ -353,8 +352,6 @@ local function castShadows(state, arena, terrain, nbMesh, cx, cy, vw, vh,
         neighbors = neighbors,
         nbMesh = nbMesh, nbWater = nbWater,
       })
-      -- Stadium models are real geometry, not cut-out sprite cards.
-      pcall(function() V.require("Stadium").cast(ShadowMap) end)
     end
     ShadowMap.finish(worldSig, false)
   end
@@ -485,17 +482,10 @@ function BattleScene.render(state, arena, textures, token)
   -- no glint in the arena: the drift is the shot breathing, not the player
   -- moving, and a shimmer on background windows would fight the mons
   Voxel3D.glassGlint = 0
-  -- the host floor's atmosphere reaches the staged shot at HALF density --
-  -- a fight in Viridian Forest sits in the same haze the walk there did,
-  -- thinned so neither mon goes soft -- and its god rays stay out of it:
-  -- this camera is low and long, and a bright blade across a combatant
-  -- reads as a rendering fault, not weather. nil almost everywhere.
-  local ForestAtmos = V.require("ForestAtmos")
-  local atmos = ForestAtmos.frame(host)
-  Voxel3D.fog = atmos and { color = atmos.fog.color,
-                            density = atmos.fog.density * 0.5,
-                            start = atmos.fog.start,
-                            heightK = atmos.fog.heightK } or nil
+  -- The FOREST FX atmosphere is gone (see the removals ADR): the staged
+  -- shot draws under the same clear air as every other map now, so there
+  -- is no fog to hand the shader.
+  Voxel3D.fog = nil
 
   -- A B RUNG stands the fight on two carried discs against the sky, with no
   -- map in the shot at all (see StadiumStage). Everything below still runs --
@@ -617,7 +607,7 @@ function BattleScene.render(state, arena, textures, token)
       -- neighbouring maps, no water, no grass and no flowers -- see the
       -- matching skips further down. What is behind them is the sky the
       -- clear painted.
-      V.require("StadiumStage").draw(arena, groundY)
+      V.require("DiscArena").draw(arena, groundY)
     else
     Voxel3D.draw(terrain, atlasFor(host), nil)
     for i, nb in ipairs(neighbors) do
@@ -674,15 +664,6 @@ function BattleScene.render(state, arena, textures, token)
     end
     Voxel3D.glass(true)
     Voxel3D.seams(true)
-    -- and the STADIUM models, inside the same flash window and with the
-    -- same camera-ward pull, so a Pokemon standing on its tile still wins
-    -- the depth test against the tile. They manage the wireframe and the
-    -- glass mask around their own draws (StadiumRig), which is why this
-    -- sits outside the pair above rather than inside it.
-    local okStadium, stadiumErr = pcall(function()
-      V.require("Stadium").draw(BattleBillboard.PULL)
-    end)
-    if not okStadium then V.require("Stadium").report(stadiumErr) end
     if flashing then Voxel3D.flatten(nil) end
     -- grass and flowers ride the same camera-ward pull the free-roam pass
     -- gives them, measured against THIS camera's pitch rather than the
