@@ -26,13 +26,11 @@ end
 local Mat4 = assert(loadfile(root .. "/lib/Mat4.lua"))()
 local Voxel = { level = 1, angle = 0.9, FOCAL = 1.0 }
 local ShadowSettings = { quality = function() return nil end }
-local ShaderCache = assert(loadfile(root .. "/lib/ShaderCache.lua"))(nil)
 local V = {
   require = function(name)
     if name == "Mat4" then return Mat4 end
     if name == "VoxelState" then return Voxel end
     if name == "ShadowSettings" then return ShadowSettings end
-    if name == "ShaderCache" then return ShaderCache end
     error("golden: unexpected require " .. tostring(name))
   end,
 }

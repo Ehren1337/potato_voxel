@@ -11,11 +11,8 @@ Compared with the original mod, PotatoVoxel is designed to provide:
 - **Smoother gameplay:** mesh generation is spread across frames instead of blocking gameplay with large work spikes.
 - **Lower GPU load:** MEDIUM, LOW, and POTATO render the 3D scene at 75%, 50%, and 33% of window resolution, then scale it back to the display.
 - **Lower geometry cost:** distant border forests use crossed billboard cards instead of expensive carved voxel hulls.
-- **Predictable defaults:** water, forest effects, anti-aliasing, staged 3D battles, and other costly effects are disabled by default.
-- **Predictable rebuilds:** terrain meshes are rebuilt in memory when needed;
-  completed meshes are also kept in the engine's scoped mod storage, per
-  playthrough.
-- **Benchmark diagnostics:** the realtime stats overlay (frame-time and mesh-build spans) is armed by benchmark instrumentation.
+- **Predictable defaults:** water, anti-aliasing, staged 3D battles, and other costly effects are disabled by default.
+- **Faster revisits:** terrain meshes are stored in the mod's scoped storage and prebuilt from the OPTIONS menu.
 
 These changes target frame-time spikes, fill rate, and memory pressure. They are optimizations rather than a promise of a specific FPS on every device.
 
@@ -27,9 +24,9 @@ any knob individually flips the mode to **CUSTOM**, which keeps your own
 combination until you pick a named mode again:
 
 - **OFF** — use the normal 2D overworld.
-- **HIGH** — 100% render scale, full water and forest effects, 2X AA.
-- **MEDIUM** — 75% render scale, sky reflections, low forest effects.
-- **LOW** — 50% render scale, cheaper shadows, water and forest off.
+- **HIGH** — 100% render scale, full water effects, 2X AA.
+- **MEDIUM** — 75% render scale, sky reflections, cheaper shadows.
+- **LOW** — 50% render scale, water off.
 - **POTATO** — 33% render scale, the lowest GPU workload.
 - **CUSTOM** — the VOXEL row reads this the moment any knob leaves its
   mode's preset.
@@ -40,21 +37,41 @@ mode to CUSTOM.
 
 The potato profile is the build. Every device runs the same tuned diorama —
 there is no environment switch to a full desktop path, so behaviour is
-identical everywhere. **3D-BTL** defaults OFF and follows the VOXEL quality
-scale when enabled; legacy staged and Stadium selections remain compatible
-internally when ON.
+identical everywhere. **3D-BTL** defaults OFF, follows the VOXEL quality
+scale when enabled, and keeps the map mesh cache.
 
-VR support remains capability-gated because the sandbox does not expose a
-scoped OpenXR or graphics-interoperability API. The mod stays safe on builds
-without that engine capability; it does not load a raw FFI workaround.
+Shadows are enabled on every device that can run the shadow pass; when a
+device genuinely cannot, the game says why in the session log instead of
+failing silently.
+
+## Removed in 1.6.1 (the sandbox release)
+
+The engine's mod sandbox removed raw file access, native interop and OS
+queries. The features that depended on those are gone — see
+[docs/adr/0004-feature-removals.md](docs/adr/0004-feature-removals.md) for
+the reasoning:
+
+- **FOREST FX** (the Viridian Forest haze and light beams)
+- the **frosted battle-HUD glass** (battle HUDs draw on plain panels)
+- **STADIUM models** (importing a player-supplied Pokémon Stadium ROM is
+  impossible without raw file reads) — the 3D-BTL ladder is now
+  2D-3D A / 2D-3D B / OFF
+- **VR** (the OpenXR loader and its rigs)
+- the **DEBUG diagnostics panel** and its instrumentation
 
 ## Install
 
 Import the .zip in-game (MODS > Import mod .zip), or copy the folder to
 the game's `mods/` directory and restart — mods load at boot. The mod
-conflicts with `DRAMATIC_SHAPE`, `ds_fp_ceiling` and the pre-rename
-`dramatic_shape_brick`; only one may run at a time. Remove the old
-`dramatic_shape_brick` from the mod manager after installing.
+conflicts with `DRAMATIC_SHAPE`, `ds_fp_ceiling`, the pre-rename
+`dramatic_shape_brick`, `BATTLE_ART_VOXEL_FORK` and `DRAMALESS_SHAPE`;
+only one may run at a time.
+
+## Diagnostics (hidden)
+
+F9 toggles a debug overlay (off by default), F10 switches its detail
+level, F8 exports its log. It exists for support reports and is silent
+unless turned on.
 
 ## Develop & test
 
@@ -66,7 +83,8 @@ POKEPORT_DATA_DIR="$PWD/tests/fixture_data" \
 ```
 
 The suite asserts the single potato build (the collapse is exercised
-in-process by `BrickProfile.apply()`). Gates:
+in-process by `BrickProfile.apply()`), and the cache suites run against a
+fake `mod.storage` box so they stay headless. Gates:
 
 ```sh
 python3 tools/modkit.py lint mods/potato_voxel
@@ -75,28 +93,37 @@ python3 tools/modkit.py pack mods/potato_voxel
 
 ## Data & cache
 
+- **The cache is per save file.** It lives in the mod sandbox's scoped
+  storage (game version x playthrough x mod). Build it once IN-GAME --
+  accept the BUILD NOW prompt after CONTINUE, or run OPTIONS > VOXEL
+  SETTINGS > PREBUILD CACHE -- let it finish, then **save the game**.
+  The save write is what binds the cache to that save file, so a later
+  launch reuses it instead of asking again. Each other save file gets
+  its own cache and asks once.
 - Settings persist under `options.modOptions.potato_voxel` (row ids
   `potato_voxel:*`).
-- Terrain mesh cache records are stored through `mod.storage` under the mod's
-  own namespace as bounded v2 chunks. Each terrain, water, and auxiliary
-  payload has a fingerprint, generation, and commit record; incomplete
-  writes are invisible and older committed work remains resumable.
-- Existing unchunked cache records are read-only migration sources and are
-  copied into the v2 layout lazily. New writes never use filename-shaped or
-  raw filesystem keys.
-- **In-game OPTIONS → PREBUILD CACHE** builds and resumes logical map/variant
-  records; the progress count does not expose internal storage chunks. The
-  cache cannot be built from the main menu: load a save first, or start it
-  while loading into a save. A storage
-  failure stays visible as `FAILED` with retryable completed work. If the
-  scoped storage context is unavailable, the mod remains loaded but reports
-  `UNAVAILABLE` and does not start a persistent prebuild.
-- The normal renderer still builds maps on demand when no storage context
-  exists or when a cache record is missing or stale.
-- Stadium packs are read from the mod's own assets or generated once into
-  `mod.storage`. To generate them, place a supported ROM at
-  `baseroms/baserom.z64` inside the mod folder; `mod:read` supplies the bytes
-  without exposing an arbitrary host path.
+- The terrain mesh cache lives in the mod sandbox's **scoped storage**
+  (no longer a folder on disk — WIPE CACHE empties the storage keys).
+  Each payload carries a small summary record (fingerprint, codec,
+  lengths) so the boot-time READY check reads summaries, not whole
+  payloads. `MeshCache.GEOMETRY_VERSION` must be bumped whenever
+  geometry output changes. Old raw cache folders under `mod-derived/`
+  from previous releases are not used — they can be deleted by hand.
+- **OPTIONS → PREBUILD CACHE** cooperatively builds every map's body and full
+  terrain variant, including water and auxiliary meshes. The game checks the
+  complete cache at boot and shows **READY** when every current job is present.
+  When the cache is incomplete, **CONTINUE** or **NEW GAME** offers to build it
+  after the save loads (the check runs against the save's actual options, so a
+  matching cache never prompts); choosing NO starts normally. An interrupted
+  build resumes from the jobs it already finished. The progress screen can be
+  cancelled, and runtime GPU meshes are released after each map while the
+  stored cache remains.
+- **CACHE STATUS** shows the active geometry-cache version and the
+  compression codec. **WIPE CACHE** removes the precalculated payloads and
+  clears the completion marker; the next voxel visit rebuilds maps on demand.
+- **3D-BTL** reuses the same cached map terrain as the overworld. The battle
+  cards and effects stay dynamic because they follow the live battle state;
+  only the static map geometry belongs in the cache.
 
 ## Credits
 
@@ -104,8 +131,6 @@ python3 tools/modkit.py pack mods/potato_voxel
   of (v1.6.2, github.com/DramaticShape/DramaticShapeVoxelMod). Its own
   code carries no license; PotatoVoxel is a derived work.
 - **pret/pokered** — the tile and sprite data the geometry is derived from.
-- **pret/pokestadium** — the decompilation the STADIUM extractor was
-  written against (no code or data from it is included or redistributed).
 - **AverageConsumer** — battle UI/sprite interoperability improvements and
   the cold mesh-build loading cover.
 

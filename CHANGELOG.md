@@ -1,84 +1,70 @@
 # Changelog
 
-## [1.6.0] - 2026-08-14
+## [1.6.1] - 2026-08-15
 
-### Fixed
+This is the sandbox release: PotatoVoxel now runs entirely inside the
+engine's mod sandbox -- no raw file access, no OS checks, no native
+interop. A few features that needed those things are gone (listed below),
+the mesh cache moved into the game's own scoped storage, and the build
+is one code path for every device.
 
-- Cache controls are now hidden from the main menu. To build or manage the
-  cache, load a save first and use the in-game options. The cache can also be
-  built while loading into a save.
-- Moving between maps is smoother because cached map data loads in small steps
-  instead of stopping the game on the crossing frame.
-- Fixed stretched terrain and grass, black voids, broken shadows, and other
-  graphics glitches caused by bad cached mesh data.
-- Cache loading now does less duplicate work, so revisiting maps is less likely
-  to cause a long pause.
+### What players need to know
 
-### Performance note
+- **Build the cache once, in-game, then SAVE.** The mesh cache is stored
+  per save file now (the sandbox scopes storage per playthrough), and the
+  save has to be written once for the game to remember the link. When the
+  game offers BUILD NOW after CONTINUE, accept it, let it finish, then
+  save the game. From then on, that save loads its prebuilt maps without
+  asking again. Other save files get their own cache and ask once each.
+- **Stadium models are gone.** Importing a Pokemon Stadium ROM needs to
+  read files the sandbox forbids, so 3D-BTL is now 2D-3D A / 2D-3D B /
+  OFF. Stored STADIUM choices from older saves fall back to 2D-3D A.
+- **FOREST FX is gone** (the Viridian Forest haze and light beams), and
+  battle HUDs draw on plain panels instead of frosted glass.
+- **VR is gone.** The OpenXR loader needed native access the sandbox
+  removed.
+- **Shadows now run on every device** that can do them -- the old
+  iPhone/iPad blanket ban is removed, and when shadows genuinely cannot
+  run the game says why in its log.
+- **Old cache folders are obsolete.** The previous `mod-derived/`
+  cache folder is no longer used or touched; it can be deleted by hand.
+- **A hidden diagnostic is included**: press F9 in-game to show the
+  debug overlay (F10 switches detail level, F8 exports its log). It is
+  off until you press F9.
 
-- This release has a known performance hit while the new precaching system is
-  being optimized. Cache building and some map changes may still take longer
-  than they will in a future update. The new system is a work in progress, and
-  later releases will focus on reducing that overhead.
+### What changed under the hood
 
-## [1.5.4] - 2026-08-14
+- The mod loads under the engine's mod sandbox: no `io`, no
+  `love.filesystem`, no `os.getenv`, no `ffi`, no `love.system`, no
+  `package` -- every banned surface was replaced with the sanctioned
+  one (`mod.storage`, `mod:read`, `mod.hooks`/`mod.events`, plain Lua).
+- The mesh cache now lives in `mod.storage` -- the game's own crash-safe,
+  per-save-file storage -- with small summary records per payload so the
+  boot-time READY check stays fast. Payloads store as byte records when
+  the engine supports them and fall back to table records when it does
+  not, and caches written by one shape read fine on the other.
+- The float number handling moved to pure Lua (this engine's data API
+  has no float helpers inside the sandbox). The saved file format is
+  unchanged, so old geometry knowledge still applies.
+- **Performance regression fixes:** the first sandbox builds spiked
+  frames because big chunks of pure-Lua packing ran in one go; the work
+  is now sliced finely across frames, and map meshes upload to the GPU
+  in budgeted pieces instead of one giant upload -- the 100-500 ms
+  freezes on big maps are gone.
+- Mod options were updated for the current engine (the manager page
+  shows toggles and choices again), and a "rebuild?" prompt that
+  appeared on every launch is fixed.
 
-### Fixed
+### Removed
 
-- PREBUILD CACHE, CACHE STATUS, and WIPE CACHE are now shown only after an
-  overworld playthrough is active. The title menu keeps the visual settings
-  without offering cache actions outside their valid lifecycle.
-- Entering an uncooked map no longer reads, decompresses, decodes, and uploads
-  its entire cached mesh synchronously inside the crossing-frame request.
-  Cached destinations now use the same cooperative worker as fresh builds.
-- Scoped cache reconstruction now yields between bounded `mod.storage`
-  records, and large vertex and index decoders yield throughout their loops.
-- Runtime cache loads decode each terrain, water, and auxiliary payload once
-  instead of validating it with a full decode and immediately decoding it a
-  second time for upload.
-
-## [1.5.3] - 2026-08-14
-
-### Fixed
-
-- Title boot no longer mistakes a non-empty launcher stack for restored
-  gameplay. The early cache probe stays unavailable instead of allocating a
-  temporary playthrough ID, so OPTIONS precaching and CONTINUE bind the same
-  selected save.
-- Cached grass, flowers, and authored figures now use dense Lua vertex rows.
-  The sparse sandbox layout collided every sixth vertex with an older row and
-  produced giant stretched triangles, black voids, and broken shadows.
-- A failed GPU vertex-map upload now rejects and releases the mesh instead of
-  drawing its quad vertices as corrupt unindexed triangles.
-- Cache geometry version 19 invalidates version 18's malformed auxiliary
-  meshes. One clean rebuild is required after updating.
+FOREST FX, the frosted battle-HUD glass, STADIUM models (rung, import
+screen and readers), VR, and the DEBUG diagnostics panel -- see
+docs/adr/0004-feature-removals.md for the reasoning.
 
 ## [1.5.2] - 2026-08-14
 
 ### Fixed
 
-- Title-screen precaching now binds `mod.storage:selected()` instead of
-  allocating cache data under the temporary boot save. A cache completed from
-  OPTIONS remains visible after CONTINUE.
-- Precache startup now rescans the newly bound storage scope, preventing resume
-  records from one playthrough from skipping jobs in another.
-- Precache auxiliary encoding now handles large table-backed flower fields,
-  preventing partial commits that surfaced as `FAILED complete`.
-- Precache failure reporting no longer masks cache verification or storage
-  errors with the mesher's successful `complete` status.
-- Precache cleanup no longer reads the sandbox-removed `package` global,
-  preventing a crash when a build finishes or fails.
-- The mesh precache now uses bounded, committed `mod.storage` records instead
-  of treating scoped storage like a raw filesystem. Large terrain, water, and
-  auxiliary payloads can resume after interruption, failed writes stay visible
-  on the cache screen, and existing unchunked records migrate lazily without
-  forcing a cold rebuild.
-- Stadium send-outs no longer play the hurt-looking entrance for the band of
-  species whose arrival dips to just under standing height -- the motion a
-  hit reaction makes. The entrance verdict's threshold moved from 0.65 to
-  0.8 of standing height, so a species that drops to anywhere near the
-  ground on arrival (Charmander among them) now arrives on its standby loop
-  instead, and the ones that still play an entrance are genuine flourishes.
 - The pinned DUSK and DAWN settings now have shadows. Both pins parked the
   clock exactly ON the horizon, where the designed shadow fade (the last
   12 degrees of elevation) had already taken the shadow strength to zero --

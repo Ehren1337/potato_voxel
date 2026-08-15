@@ -31,7 +31,7 @@ local ModSetting = V.require("ModSetting")
 
 local ShadowSettings = {}
 
--- the keys under options.modOptions.potato_voxel, shared by the row in
+-- the keys under options.modOptions.DRAMATIC_SHAPE, shared by the row in
 -- OPTIONS and the mod manager's own settings page for this mod
 ShadowSettings.KEY = "shadows"
 ShadowSettings.LABEL = "SHADOWS"

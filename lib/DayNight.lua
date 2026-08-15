@@ -41,7 +41,7 @@
 -- already rests on; the caller passes its answer in (applyRig/tint).
 --
 -- Persistence: the running cycle's clock is written into the mod's own
--- save-file bucket (save.modData.potato_voxel, via mod.save) on the
+-- save-file bucket (save.modData.DRAMATIC_SHAPE, via mod.save) on the
 -- engine's save.writing event, and read back on save.loaded/created. A save
 -- with no clock in it starts at noon.
 
@@ -76,11 +76,14 @@ DayNight.setting = ModSetting.new(DayNight.KEY, DayNight.LABEL,
                                   { "SYNC", "DAY", "NIGHT", "DUSK",
                                     "DAWN", "CYCLE" })
 
--- The one writer for the HIGH pin. While VOXEL sits on HIGH the DAYTIME
--- value is held HERE at SYNC -- the mode's sky follows the clock on the
--- wall, whatever was chosen before. Called from the manager's
--- options_changed (main.lua), which is the one path that can act under
--- HIGH without going through the OPTIONS row.
+-- The one writer for the FULL pin. While VOXEL sits on FULL the DAYTIME
+-- row is off the menu with the rest of the rows the preset owns, and the
+-- value is held HERE at SYNC -- the diorama preset's sky follows the clock
+-- on the wall, whatever was chosen before. Called from every path that can
+-- arrive at or act under FULL (main.lua: the preset itself, the rows hook,
+-- and the pipeline's always-running update, which re-asserts the pin every
+-- tick now that the manager's options_changed event is gone), mirroring
+-- OverworldBattle.forceOG.
 function DayNight.forceSync(game)
   if DayNight.setting:get() ~= "sync" then
     DayNight.setting:setIndex(1, game)
@@ -405,15 +408,16 @@ end
 
 -- Point the shared light rig at the clock -- or at noon, indoors. This
 -- writes the same fields everything already reads (ShadowMap.KX/KZ for the
--- sun pass and its frustum, Voxel3D.SHADOW_ALPHA for the decal fallback and
--- the sunDark uniform), so no draw path changes to follow the sun; they
--- follow the rig, and the rig follows the clock.
+-- sun pass and its frustum, Voxel3D.SHADOW_* for the decal fallback and the
+-- sunDark uniform), so no draw path changes to follow the sun; they follow
+-- the rig, and the rig follows the clock.
 function DayNight.applyRig(outdoor)
   local ShadowMap = V.require("ShadowMap")
   local Voxel3D = V.require("Voxel3D")
   local t = outdoor and DayNight.rigTime() or DayNight.T.day
   local kx, kz, moon = DayNight.shearAt(t)
   ShadowMap.KX, ShadowMap.KZ = kx, kz
+  Voxel3D.SHADOW_KX, Voxel3D.SHADOW_KZ = kx, kz
   local base = moon and DayNight.ALPHA_MOON or DayNight.ALPHA_SUN
   Voxel3D.SHADOW_ALPHA = base * DayNight.strengthAt(t)
   return t

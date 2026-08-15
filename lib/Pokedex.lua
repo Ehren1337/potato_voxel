@@ -32,7 +32,10 @@ local V = ...
 
 local Mat4 = V.require("Mat4")
 local Voxel3D = V.require("Voxel3D")
-local VRRig = V.require("VRRig")
+-- VRRig died with VR; the pokedex is only ever placed from a headset
+-- frame, so nothing here is reached without one. Optional, not fatal.
+local okVRRig, VRRig = pcall(V.require, "VRRig")
+if not okVRRig then VRRig = nil end
 
 local Pokedex = {}
 

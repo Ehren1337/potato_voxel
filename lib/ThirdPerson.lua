@@ -1,8 +1,4 @@
--- Voxel world mode: the third-person camera -- the upstream 3RD rung.
---
--- Inert on this build: the potato ladder has no rung that selects it
--- (Voxel.isThirdPerson is constant-false); it stays as the retained VR
--- restore path's boom rig.
+-- Voxel world mode: the third-person camera -- the 3RD rung.
 --
 -- 3RD is 1ST with the eye pulled off the back of the head. Everything that
 -- makes the first-person rung work -- the steered attitude, the placed

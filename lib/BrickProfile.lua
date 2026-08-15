@@ -63,9 +63,6 @@ end
 -- would silently read a nil GLOBAL of the same name instead.
 local profileShadowMap = nil
 
--- the VOXEL rung the battle arena's actor shadow map turns on at
-BrickProfile.HIGH_LEVEL = 1
-
 function BrickProfile.battleActorShadowMap(level)
   -- Mali GPUs break on the decal fallback path -- frozen last frame, black
   -- frames, missing actor shadows -- while the sprite-layer map works, so
@@ -74,7 +71,7 @@ function BrickProfile.battleActorShadowMap(level)
   -- frame, and the rung ladder exists to spend less on exactly that. OFF
   -- (level 0) has no shadows anywhere, Mali included.
   level = level or 0
-  return level == BrickProfile.HIGH_LEVEL
+  return level == BrickProfile.DESKTOP_HIGH_LEVEL
      or (level > 0 and profileShadowMap and profileShadowMap.isMali())
 end
 
@@ -87,6 +84,8 @@ end
 -- world around them gets. The contact/blob decal remains only as the
 -- no-shadow-map fallback (see VoxelScene.drawScene). The world layer stays
 -- governed by the renderer's existing shadow gates.
+BrickProfile.DESKTOP_HIGH_LEVEL = 1
+BrickProfile.DESKTOP_MEDIUM_LEVEL = 2
 
 function BrickProfile.actorShadowMapEnabled(level)
   return (level or 0) > 0
@@ -108,14 +107,13 @@ local function replaceInPlace(target, values)
   return target
 end
 
--- Pin a setting ladder to one tuned rung. Clearing the cached index makes
--- the next ModSetting:read re-evaluate against the new ladder, so a value
--- already read during load still lands on the pinned rung.
+-- Pin a setting ladder to one tuned rung. Reads are live (ModSetting:read
+-- goes through the options API on every call), so a value already read
+-- during load still lands on the pinned rung with nothing to clear.
 local function pin(V, name, values, labels)
   local module = V.require(name)
   module.setting.values = values
   module.setting.labels = labels
-  module.setting.index = nil
 end
 
 function BrickProfile.apply(V)
@@ -160,14 +158,15 @@ function BrickProfile.apply(V)
   -- flat card (~36 quads a tree), still ~80x cheaper than the carve.
   Structures.BILLBOARD_CROSS = true
 
-  -- VOXEL becomes OFF / HIGH / MEDIUM / LOW / POTATO / CUSTOM. Every
-  -- on-rung is the same classic 35-degree diorama framing; the rungs
-  -- differ in what QualityMode's preset applies -- the RENDER SCALE and
-  -- the quality knobs. CUSTOM is the player's own combination, reached
-  -- the moment any knob leaves its mode's preset (QualityMode).
-  -- FULL_LEVEL stays 1 so the HIGH-is-the-headline-rung gates (DayNight's
-  -- SYNC pin, the menu's crossing check) keep matching by the name the
-  -- upstream build gave that rung.
+  -- VOXEL becomes OFF / HIGH / MEDIUM / LOW / POTATO / CUSTOM. Every on-rung
+  -- is the same classic 35-degree diorama framing (the FULL preset's camera);
+  -- the rungs differ in what QualityMode's preset applies -- the RENDER
+  -- SCALE and the quality knobs. CUSTOM is the player's own combination,
+  -- reached the moment any knob leaves its mode's preset (QualityMode).
+  -- FULL_LEVEL stays 1 because HIGH is FULL -- the engine's FULL branches
+  -- still match -- and main.lua gates applyFull and the rows hook so the
+  -- preset cannot re-enable the expensive rungs it would otherwise set
+  -- on arrival.
   replaceInPlace(Voxel.ANGLES_DEG, { 0, 35, 35, 35, 35, 35 })
   replaceInPlace(Voxel.ANGLE_LABELS,
                  { "OFF", "HIGH", "MEDIUM", "LOW", "POTATO", "CUSTOM" })

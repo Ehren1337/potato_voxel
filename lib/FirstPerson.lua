@@ -1,9 +1,4 @@
--- Voxel world mode: the free-roam camera -- the upstream 1ST and 3RD
--- rungs.
---
--- Inert on this build: the potato ladder has no rung that selects it
--- (Voxel.isFreeCam is constant-false), so everything here sits dormant
--- until the VR restore path drives it through FirstPerson.engaged().
+-- Voxel world mode: the free-roam camera -- the 1ST and 3RD rungs.
 --
 -- Every other rung is the same camera at a different pitch: an orbit over
 -- the view centre, described by one number. 1ST is a different rig
@@ -117,10 +112,11 @@ FirstPerson.blend = 0
 
 -- A multiplier on the first-person field of view, for anything that wants
 -- to narrow the lens without owning the rig: 1 is the ordinary 65
--- degrees, and callers may ease it down toward 40 for a sighted view.
--- Kept here rather than in the caller because the fov is folded into the
--- orbit blend below, and because signature() has to know -- a lens that
--- narrows while the player stands still still has to re-fit the shadow box.
+-- degrees, and horde mode's iron sights ease it down toward 40 while the
+-- player is looking down them (lib/HordeGun). Kept here rather than in
+-- the caller because the fov is folded into the orbit blend below, and
+-- because signature() has to know -- a lens that narrows while the player
+-- stands still still has to re-fit the shadow box.
 FirstPerson.fovScale = 1
 
 local wasEngaged = false
@@ -692,68 +688,245 @@ function FirstPerson.install()
   if installed then return end
   installed = true
 
-  -- Input callbacks are engine-owned in the sandbox. The public pointer
-  -- seam is the supported replacement for mutating love.mouse* and the
-  -- Game touch handlers. It delivers only gameplay pointers that the
-  -- TouchControls overlay did not capture, so the old hit-test/forwarding
-  -- dance is no longer needed here.
-  local hooks = V.mod and V.mod.hooks
-  if not hooks or type(hooks.wrap) ~= "function" then return end
+  local Game = require("src.core.Game")
 
+  -- ------- right stick
+  do
+    local inner = Game.gamepadaxis
+    function Game:gamepadaxis(joystick, axis, value)
+      if axis == "rightx" then stick.x = value
+      elseif axis == "righty" then stick.y = value end
+      return inner(self, joystick, axis, value)
+    end
+  end
+  -- generic (non-gamepad) sticks: axes 1/2 are the left stick by SDL
+  -- convention and Input already claims them; 3/4 are the usual right
+  -- pair on the same class of device. Real gamepads are excluded -- they
+  -- already spoke through the mapped rightx/righty above, and their RAW
+  -- axis 3 is as likely a trigger as a stick.
+  --
+  -- Two more exclusions, both learned the hard way on Android, where this
+  -- wrap runs BEFORE the engine's own generic-joystick guards:
+  --
+  --   the accelerometer arrives as a joystick named for what it is, with
+  --   gravity pinning an axis well past any deadzone -- the same device
+  --   Game:joystickaxis refuses for movement (#459), refused here by the
+  --   same name test, or the view spins on its own the moment 1ST opens.
+  --
+  --   and a raw axis is only BELIEVED after it has been seen near centre
+  --   once. A stick at rest sits at zero, so a real one earns trust with
+  --   its first touch; a gravity-pinned sensor axis or a trigger resting
+  --   at an extreme never centres and so never steers the look.
+  local function isAccelerometer(joystick)
+    local ok, name = pcall(function() return joystick:getName() end)
+    return ok and type(name) == "string"
+           and name:lower():find("accelerometer", 1, true) ~= nil
+  end
+  local rawCentred = {}
+  do
+    local inner = Game.joystickaxis
+    function Game:joystickaxis(joystick, axis, value)
+      local mapped = joystick and joystick.isGamepad and joystick:isGamepad()
+      if not mapped and (axis == 3 or axis == 4)
+         and not isAccelerometer(joystick) then
+        if math.abs(value) < 0.3 then rawCentred[axis] = true end
+        if rawCentred[axis] then
+          if axis == 3 then stick.x = value else stick.y = value end
+        end
+      end
+      return inner(self, joystick, axis, value)
+    end
+  end
+
+  -- ------- mouse
+  --
+  -- The sandbox forbids assigning the engine's love callbacks, so the
+  -- mouse read rides the engine's input.pointer hook -- the seam that
+  -- sees every pointer event with the same relative counts the old
+  -- love.mousemoved callback carried. Claimed only while captured;
+  -- pass-through otherwise (letting the chain run is the old inner(...)
+  -- call, including the mouse-as-touch path).
+  do
+    local mod = V.mod
+    if mod and mod.hooks then
+      mod.hooks:wrap("input.pointer", function(next, game, evt)
+        if evt and evt.phase == "moved" and captured
+           and evt.source ~= "touch" then
+          mouseDX = mouseDX + (evt.dx or 0)
+          mouseDY = mouseDY + (evt.dy or 0)
+          return true
+        end
+        return next(game, evt)
+      end)
+    end
+  end
   -- While the mouse is captured there is no cursor to click UI with, so
-  -- the buttons become GB buttons: left is A, right is B. What WE pressed
-  -- is remembered per button so cancellation/release cannot strand a hold.
+  -- the buttons become GB buttons: left is A, right is B -- through the
+  -- overlay's own press path, which a rebind can never detach. What WE
+  -- pressed is remembered per button, so the release always reaches the
+  -- overlay even if the capture ended while the button was down --
+  -- otherwise a click that outlives the rung strands A held forever.
+  --
+  -- HORDE MODE re-reads the same two buttons as a weapon: left fires,
+  -- right holds the sights. Claimed BEFORE the A/B mapping below rather
+  -- than on top of it, so a click during the mode never also lands as a
+  -- GB button -- otherwise the A that ends the GAME OVER card would be
+  -- spent by the shot that ended the run.
   local mouseHeld = {}
   local MOUSE_BTN = { [1] = "a", [2] = "b" }
+  local function hordeMouse(button, down)
+    local Horde = V.require("Horde")
+    if not Horde.playing() then return false end
+    if button == 1 then
+      if down then V.require("HordeGun").fire() end
+      return true
+    elseif button == 2 then
+      V.require("HordeGun").setAds(down)
+      return true
+    end
+    return false
+  end
+  -- The A/B click mapping rides the same input.pointer hook (the sandbox
+  -- forbids assigning love callbacks): pressed/released phases take the
+  -- place of the old love.mousepressed/love.mousereleased callbacks.
+  do
+    local mod = V.mod
+    if mod and mod.hooks then
+      mod.hooks:wrap("input.pointer", function(next, game, evt)
+        if not evt or evt.source == "touch" then
+          return next(game, evt)
+        end
+        local button = evt.button
+        if evt.phase == "pressed" then
+          if captured and hordeMouse(button, true) then return true end
+          if captured and MOUSE_BTN[button] then
+            local Input = require("src.core.Input")
+            mouseHeld[button] = true
+            Input:overlayPressed(MOUSE_BTN[button])
+            return true
+          end
+        elseif evt.phase == "released" then
+          -- a release always reaches whoever owns the press: the horde's
+          -- aim-hold has to let go even if the mode ended mid-click
+          if not mouseHeld[button] and hordeMouse(button, false) then
+            return true
+          end
+          if mouseHeld[button] then
+            local Input = require("src.core.Input")
+            mouseHeld[button] = nil
+            Input:overlayReleased(MOUSE_BTN[button])
+            return true
+          end
+        end
+        return next(game, evt)
+      end)
+    end
+  end
 
-  hooks:wrap("input.pointer", function(nextFn, game, ev)
-    if type(ev) ~= "table" then return nextFn(game, ev) end
+  -- ------- touch
+  --
+  -- A finger on open screen -- not on the overlay's d-pad or buttons --
+  -- becomes the look drag. One finger owns the look at a time; every
+  -- other touch flows to TouchControls untouched, so a thumb can drag the
+  -- view while the other walks the d-pad. That d-pad finger is also read
+  -- back ANALOG here: TouchControls quantises it to four directions for
+  -- the grid game, but the deflection it quantised is exactly the move
+  -- vector a free walk wants.
+  local TouchControls = require("src.core.TouchControls")
 
-    local phase, source = ev.phase, ev.source
-    if source == "mouse" then
-      if phase == "moved" and captured then
-        mouseDX = mouseDX + (ev.dx or 0)
-        mouseDY = mouseDY + (ev.dy or 0)
-      elseif phase == "pressed" and captured and MOUSE_BTN[ev.button] then
-        local Input = require("src.core.Input")
-        mouseHeld[ev.button] = true
-        Input:overlayPressed(MOUSE_BTN[ev.button])
-      elseif (phase == "released" or phase == "cancelled")
-          and mouseHeld[ev.button] then
-        local Input = require("src.core.Input")
-        mouseHeld[ev.button] = nil
-        Input:overlayReleased(MOUSE_BTN[ev.button])
+  local function dpadVector(x, y)
+    local ok, v = pcall(function()
+      local L = TouchControls:layout()
+      local dz = L.dpad
+      local half = dz.w * 0.65
+      return { x = math.max(-1, math.min(1, (x - dz.cx) / half)),
+               y = math.max(-1, math.min(1, (y - dz.cy) / half)) }
+    end)
+    return ok and v or nil
+  end
+
+  do
+    local inner = Game.touchpressed
+    function Game:touchpressed(id, x, y)
+      if FirstPerson.driving() then
+        local onControl = nil
+        pcall(function() onControl = TouchControls:hitTest(x, y) end)
+        if not onControl and not lookTouch then
+          -- HORDE MODE: a tap on open screen is a SHOT, fired on the press
+          -- rather than on a release that turned out not to be a drag --
+          -- a shooter that waits to find out whether you meant it is a
+          -- shooter that misses. The same finger still becomes the look
+          -- drag below, so aiming and firing are one gesture.
+          if V.require("Horde").playing() then
+            V.require("HordeGun").fire()
+          end
+          lookTouch = { id = id, x = x, y = y }
+          return
+        end
+        inner(self, id, x, y)
+        if onControl == "dpad" and TouchControls.dpadTouch == id then
+          touchMove = dpadVector(x, y)
+        end
+        return
       end
-    elseif source == "touch" then
-      if phase == "pressed" and FirstPerson.driving() and not lookTouch then
-        lookTouch = { id = ev.id, x = ev.x, y = ev.y }
-      elseif phase == "moved" and lookTouch and lookTouch.id == ev.id then
+      return inner(self, id, x, y)
+    end
+  end
+  do
+    local inner = Game.touchmoved
+    function Game:touchmoved(id, x, y)
+      if lookTouch and lookTouch.id == id then
         local w = 1280
         pcall(function() w = love.graphics.getWidth() end)
         local per = FirstPerson.TOUCH_TURN / math.max(320, w)
         if FirstPerson.driving() then
-          FirstPerson.lookBy(-(ev.dx or 0) * per, (ev.dy or 0) * per)
+          -- negated yaw for the same reason as the mouse (see update):
+          -- drag right, look right, the mobile-shooter convention
+          FirstPerson.lookBy(-(x - lookTouch.x) * per,
+                             (y - lookTouch.y) * per)
         end
-        lookTouch.x, lookTouch.y = ev.x, ev.y
-      elseif (phase == "released" or phase == "cancelled")
-          and lookTouch and lookTouch.id == ev.id then
-        lookTouch = nil
+        lookTouch.x, lookTouch.y = x, y
+        return
       end
+      if touchMove and TouchControls.dpadTouch == id then
+        touchMove = dpadVector(x, y) or touchMove
+      end
+      return inner(self, id, x, y)
     end
+  end
+  do
+    local inner = Game.touchreleased
+    function Game:touchreleased(id, x, y)
+      if lookTouch and lookTouch.id == id then
+        lookTouch = nil
+        return
+      end
+      if TouchControls.dpadTouch == id then touchMove = nil end
+      return inner(self, id, x, y)
+    end
+  end
 
-    if phase == "cancelled" then
+  -- a reset that drops held input state drops ours with it
+  do
+    local inner = Game.focus
+    function Game:focus(f)
       lookTouch, touchMove = nil, nil
       stick.x, stick.y = 0, 0
       mouseDX, mouseDY = 0, 0
-      for button in pairs(mouseHeld) do
-        local Input = require("src.core.Input")
-        Input:overlayReleased(MOUSE_BTN[button])
-        mouseHeld[button] = nil
-      end
+      return inner(self, f)
     end
-
-    return nextFn(game, ev)
-  end)
+  end
+  -- a disconnected controller cannot send the centering event for whatever
+  -- its stick last held -- the engine drops all input state here, and the
+  -- look rate (plus the raw axes' earned trust) goes with it
+  do
+    local inner = Game.joystickremoved
+    function Game:joystickremoved(joystick)
+      stick.x, stick.y = 0, 0
+      rawCentred[3], rawCentred[4] = nil, nil
+      return inner(self, joystick)
+    end
+  end
 end
 
 return FirstPerson

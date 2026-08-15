@@ -191,6 +191,7 @@ local SHADER = [[
 
 ShadowMap._source = function() return SHADER end   -- named for the suite
 
+local shader = nil            -- nil = untried, false = unavailable
 local canvas = nil            -- nil = untried, false = unavailable
 local canvasRes = 0           -- the edge `canvas` was made at
 local spriteCanvas = nil      -- the CAST layer: sprites only (see below)
@@ -244,10 +245,12 @@ function ShadowMap._maliReset()
   maliDevice = nil
 end
 
-local ShaderCache = V.require("ShaderCache")
-
 local function getShader()
-  return ShaderCache.get(SHADER)
+  if shader == nil then
+    local ok, sh = pcall(love.graphics.newShader, SHADER)
+    shader = (ok and sh) or false
+  end
+  return shader or nil
 end
 
 -- The map canvas at edge `res`, rebuilt when the rung changes (a zoom

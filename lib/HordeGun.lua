@@ -32,7 +32,9 @@ local V = ...
 
 local Mat4 = V.require("Mat4")
 local Voxel3D = V.require("Voxel3D")
-local VRRig = V.require("VRRig")
+-- VRRig died with VR (see the removals ADR); the one flat-screen value
+-- it carried survives as a constant.
+local FP_SCALE = 10      -- the old VRRig.FP_SCALE: first-person gun scale
 local FirstPerson = V.require("FirstPerson")
 local Horde = V.require("Horde")
 local HordeSfx = V.require("HordeSfx")
@@ -409,7 +411,11 @@ function HordeGun.place(pose, pivot, anchor, scale, yaw)
     HordeGun.clear()
     return
   end
-  local m = VRRig.propMatrix(pose, pivot, anchor, scale, yaw)
+  -- The tracked-hand mapping died with VR; no caller supplies a pose
+  -- any more, so this line is never reached. Kept as a guard so a
+  -- future caller learns to supply its own mapping.
+  local m = nil
+  if not m then HordeGun.clear() return end
   m = Mat4.mul(m, Mat4.translate(HordeGun.HAND_OFFSET[1],
                                  HordeGun.HAND_OFFSET[2],
                                  HordeGun.HAND_OFFSET[3]))
@@ -481,7 +487,7 @@ local function flatModel()
   local m = Mat4.translate(eye[1], eye[2], eye[3])
   m = Mat4.mul(m, Mat4.rotateY(FirstPerson.yaw))
   m = Mat4.mul(m, Mat4.rotateX(FirstPerson.pitch - 0.34 * k))
-  m = Mat4.mul(m, Mat4.scale(VRRig.FP_SCALE, VRRig.FP_SCALE, VRRig.FP_SCALE))
+  m = Mat4.mul(m, Mat4.scale(FP_SCALE, FP_SCALE, FP_SCALE))
   m = Mat4.mul(m, Mat4.translate(ox, oy, oz))
   if gun.reloading then
     local t = math.min(1, gun.reloadT / HordeGun.RELOAD_TIME)

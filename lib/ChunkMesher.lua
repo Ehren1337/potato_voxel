@@ -57,6 +57,10 @@ local Voxel3D = V.require("Voxel3D")
 local Budget = V.require("BuildBudget")
 local MeshCache = V.require("MeshCache")
 
+-- ffi is gone (sandbox) and this engine's love.data ByteData carries no
+-- accessors, so the native float buffers are gone with them: the table
+-- sink (plain 1-based Lua tables) is the one build path.
+
 local ChunkMesher = {}
 
 -- Ring of border blocks meshed around the body, matching the width
@@ -106,8 +110,49 @@ end
 -- A sink accepts quads (4 corners, 4 uv pairs, flat or per-corner shade)
 -- and finishes into a drawable mesh. The TABLE sink reproduces the
 -- historical pure-Lua output -- geometry() returns its arrays for the
--- headless suite. The same table representation is also the sandbox runtime
--- path, so cached and fresh meshes share one shape.
+-- headless suite, buffer() flattens them for the cache codecs, and
+-- finish() uploads through Voxel3D.newMesh, the exact path the
+-- pre-sandbox table build used.
+-- Slice a table upload across frames: the mesh is created with the full
+-- vertex count, then vertices and the index map land in budgeted pieces
+-- (setVertices/setVertexMap accept a start index). The old ffi sink
+-- sliced exactly this way; a one-shot newMesh(rows) on a 500k-vertex
+-- map is a 100-500ms hitch in pure Lua, which is what the sliced path
+-- exists to avoid. Budget.check() is a no-op outside the build
+-- coroutine, so the warp-covered synchronous cache-hit path still
+-- uploads whole -- the fade covers that one by design. (Declared BEFORE
+-- its users: this LuaJIT resolves a later chunk-local as a global --
+-- the forward-local bug class.)
+local UPLOAD_CHUNK = 8192
+local function uploadTableMesh(rows, indices)
+  local n = #rows
+  if n == 0 then return nil end
+  local ok, mesh = pcall(love.graphics.newMesh, Voxel3D.FORMAT, n,
+                         "triangles", "static")
+  if not ok or not mesh then return nil end
+  local i = 0
+  while i < n do
+    local c = math.min(UPLOAD_CHUNK, n - i)
+    local slice = {}
+    for j = 1, c do slice[j] = rows[i + j] end
+    pcall(mesh.setVertices, mesh, slice, i + 1)
+    i = i + c
+    Budget.check()
+  end
+  if indices and #indices > 0 then
+    local m = #indices
+    local k = 0
+    while k < m do
+      local c = math.min(UPLOAD_CHUNK * 2, m - k)
+      local slice = {}
+      for j = 1, c do slice[j] = indices[k + j] end
+      pcall(mesh.setVertexMap, mesh, slice, k + 1)
+      k = k + c
+      Budget.check()
+    end
+  end
+  return mesh
+end
 
 local function newTableSink()
   local verts, indices, quads = {}, {}, 0
@@ -125,8 +170,24 @@ local function newTableSink()
     results = function()
       return verts, indices, quads
     end,
+    -- The flat streams the cache codecs consume: the rows the sink keeps
+    -- (a table of 6-float rows) flattened into one 1-based float table,
+    -- and the 1-based u32 vertex map as-is. The wire format conversion
+    -- (0-based) happens inside the encoders.
     buffer = function()
-      return verts, #verts, indices, #indices
+      local flat = {}
+      for i, row in ipairs(verts) do
+        local b = (i - 1) * 6 + 1
+        flat[b] = row[1]
+        flat[b + 1] = row[2]
+        flat[b + 2] = row[3]
+        flat[b + 3] = row[4]
+        flat[b + 4] = row[5]
+        flat[b + 5] = row[6]
+      end
+      local imap = {}
+      for i, v in ipairs(indices) do imap[i] = v end
+      return flat, #verts, imap, #indices
     end,
     finish = function()
       return Voxel3D.newMesh(verts, indices)
@@ -134,6 +195,9 @@ local function newTableSink()
   }
 end
 
+-- The sandbox build has one sink: plain Lua tables. ffi is banned and
+-- this engine's love.data ByteData carries no accessors, so the native
+-- float buffers are gone with them.
 local function newSink()
   return newTableSink()
 end
@@ -915,6 +979,7 @@ local function releaseEntry(c)
   releaseFigures(c.figures)
   c.figures = nil
   c.stale = nil
+  c.noDisk = nil
 end
 
 -- ---------------------------------------------------------- async builds
@@ -929,8 +994,29 @@ local function jobKey(id, slot)
   return id .. ":" .. slot
 end
 
+local DebugOverlay = nil
+local function debugNote(fmt, ...)
+  if not DebugOverlay then
+    local okD, mod = pcall(V.require, "DebugOverlay")
+    if okD then DebugOverlay = mod end
+  end
+  if DebugOverlay then DebugOverlay.note(fmt, ...) end
+end
 local function finishJob(job, ok, err)
   local key = jobKey(job.id, job.slot)
+  local jobMs = nil
+  if job.queuedAt and love and love.timer and love.timer.getTime then
+    jobMs = math.floor((love.timer.getTime() - job.queuedAt) * 1000 + 0.5)
+  end
+  if not ok then
+    local okD, Overlay = pcall(V.require, "DebugOverlay")
+    if okD and Overlay then Overlay.count("jobFails") end
+    debugNote("mesh job failed %s: %s", key, tostring(err))
+  else
+    local okD, Overlay = pcall(V.require, "DebugOverlay")
+    if okD and Overlay then Overlay.count("jobs") end
+    debugNote("mesh done %s (%dms)", key, jobMs or 0)
+  end
   jobIndex[key] = nil
   completion[key] = ok and "complete" or "failed"
   for i, j in ipairs(jobs) do
@@ -950,20 +1036,32 @@ local function finishJob(job, ok, err)
 end
 
 -- Upload a serialized vertex stream (the MeshCache load records) into a
--- fresh love mesh from the table records used by the sandbox cache. Every
--- record is indexed: four unique vertices per quad plus a table vertex map.
+-- fresh love mesh. Table-based: verts and indices are plain 1-based Lua
+-- tables -- the same shape the table sink's fresh builds produce -- so
+-- both halves share Voxel3D.newMesh. Returns nil for an empty stream or
+-- a failed upload. Every record is INDEXED since brick.13 (terrain/water
+-- since brick.11, aux since 12): 4 verts per quad plus a u32 vertex map.
 local function meshFromData(d)
   if not d then return nil end
-  if d.vertices then
-    return Voxel3D.newMesh(d.vertices, d.indices)
-  elseif type(d.buf) == "table" then
-    return Voxel3D.newMesh(d.buf, d.idx)
+  -- Accept BOTH record shapes: cache-load records carry verts/indices
+  -- (flat 1-based float tables) while fresh-build records from
+  -- flattenAux carry buf/idx -- flat tables either way. Voxel3D.newMesh
+  -- wants ROWS, so the flat stream is folded into rows here; the index
+  -- map is already 1-based.
+  local flat, indices = d.verts or d.buf, d.indices or d.idx
+  if not flat or d.n == 0 then return nil end
+  local rows = {}
+  for i = 1, d.n do
+    local b = (i - 1) * 6 + 1
+    rows[i] = { flat[b], flat[b + 1], flat[b + 2],
+                flat[b + 3], flat[b + 4], flat[b + 5] }
+    if i % 4096 == 0 then Budget.check() end
   end
-  return nil
+  return uploadTableMesh(rows, indices)
 end
 
 -- Flatten the map's grass/flower quads and authored figures into the
--- INDEXED vertex streams the persistent cache stores, in one pass each. Only
+-- INDEXED vertex streams the disk cache stores, in one pass each. Only
 -- reached on a fresh build -- a cache hit never needs Structures'
 -- analysis. Records carry { n, buf, m, idx } to match the indexed
 -- payload format (brick.13).
@@ -971,7 +1069,8 @@ local function flattenAux(map)
   local S = Structures.forMap(map)
   local function flatten(quads)
     if #quads == 0 then return nil end
-    local buf, idx = {}, {}
+    local buf = {}
+    local idx = {}
     local k, m = MeshCache.flattenQuads(quads, buf, idx)
     return { n = k / 6, buf = buf, m = m, idx = idx }
   end
@@ -1033,9 +1132,8 @@ local function fillAux(job)
     end
   end
 
-  -- fresh build: on the Brick, flatten to the native stream once and
-  -- build from it (and save it); elsewhere keep the historical table
-  -- path byte-identical
+  -- fresh build: flatten to the indexed stream once and build from it
+  -- (and save it)
   local grass, flowers, figures
   if MeshCache.available() then
     local okFlat, flat = pcall(flattenAux, map)
@@ -1086,7 +1184,7 @@ local function runJob(job)
     if not fillAux(job) then return end
   end
 
-  -- the terrain slot: serve it from the persistent cache when the pair is
+  -- the terrain slot: serve it from the disk cache when the pair is
   -- there, else build it fresh (and write it back). A cache hit skips
   -- Structures' analysis AND geometry generation -- the whole point of
   -- precompiled meshes -- leaving only the same sliced upload a fresh
@@ -1158,10 +1256,51 @@ function ChunkMesher.request(map, bodyOnly, masks, urgent, force)
   -- time the player crosses into it, or the full build would wrongly
   -- go urgent.
   local c = entry(map.id)
-  -- Storage reads, decompression, decode, and GPU upload always belong to the
-  -- cooperative job. Doing that work here blocks the exact frame that crosses
-  -- into an uncooked neighbour; the prefetched body remains the visual
-  -- fallback while the full slot completes over budgeted slices.
+  -- Cold-entry cache fast path: a destination with a VALID prebuilt
+  -- payload loads it right here, synchronously, on the entry frame. The
+  -- read + decompress + decode is bounded work the warp fade already
+  -- covers -- and taking it out of the job queue is what makes a
+  -- prebuilt map enter without the BUILDING VOXELS cover: a queued load
+  -- sliced through 12ms pump budgets and outlived the fade on large
+  -- maps, flashing the cover over terrain the cache had all along. The
+  -- async queue still owns real builds, seam crossings (a body mesh
+  -- stands in there, so the full cooks at idle) and the prebuilder
+  -- (force). One attempt per entry: a rejected payload falls through to
+  -- the job, which rebuilds and rewrites it, and noDisk stops later
+  -- frames from re-attempting the same synchronous read.
+  if not force and not bodyOnly and MeshCache.available()
+     and c[slot] == nil and c.body == nil and not c.noDisk then
+    local tdata, wdata = MeshCache.loadTerrain(map, slot)
+    if tdata and wdata then
+      local mesh = meshFromData(tdata)
+      local water = meshFromData(wdata)
+      swapSlot(c, slot, mesh or false)
+      swapSlot(c, waterSlot(slot), water or false)
+      if c.stale then c.stale[slot] = nil end
+      -- the aux pair rides along now rather than hitching the first
+      -- visible frame (ChunkMesher.get loads it on demand otherwise)
+      local aux = MeshCache.loadAux(map, slot)
+      if aux then
+        local grass = meshFromData(aux.grass)
+        local flowers = meshFromData(aux.flowers)
+        local figures = {}
+        for _, fd in ipairs(aux.figures) do
+          local m = meshFromData(fd)
+          if m then
+            figures[#figures + 1] = { mesh = m, wx = fd.wx, wz = fd.wz,
+                                      y = fd.y, w = fd.w }
+          end
+        end
+        swapSlot(c, "grass", grass or false)
+        swapSlot(c, "flowers", flowers or false)
+        releaseFigures(c.figures)
+        c.figures = figures or false
+        if c.stale then c.stale.aux = nil end
+      end
+      return c[slot] or nil
+    end
+    c.noDisk = true
+  end
   if force then
     -- Force the job to validate/load the disk payloads or rebuild them.
     -- Mark aux too: a populated in-memory slot can otherwise skip
@@ -1178,7 +1317,9 @@ function ChunkMesher.request(map, bodyOnly, masks, urgent, force)
   if not job then
     job = { id = map.id, map = map, slot = slot, masks = masks,
             urgent = urgent or false, prebuild = force or false,
-            gen = gen[map.id] or 0 }
+            gen = gen[map.id] or 0,
+            queuedAt = love and love.timer and love.timer.getTime
+                       and love.timer.getTime() or nil }
     jobIndex[key] = job
     jobs[#jobs + 1] = job
   else
@@ -1205,7 +1346,7 @@ function ChunkMesher.jobStatus(mapId, bodyOnly)
 end
 
 -- Release a completed prebuild map immediately. Unlike invalidate(), this
--- intentionally leaves persistent cache records intact and only drops runtime GPU/
+-- intentionally leaves disk cache files intact and only drops runtime GPU/
 -- Structures state.
 function ChunkMesher.release(mapId)
   local c = cache[mapId]

@@ -50,7 +50,7 @@ local Mat4 = V.require("Mat4")
 local Voxel3D = V.require("Voxel3D")
 local ShadowMap = V.require("ShadowMap")
 
-local StadiumStage = {}
+local DiscArena = {}
 
 local floor = math.floor
 local sin, cos = math.sin, math.cos
@@ -78,9 +78,9 @@ local pi = math.pi
 -- mon's own footprint fits inside that centre rather than out over the
 -- stipple -- 1.8 x 0.70 is a little over 1.25, so a big Pokemon still has
 -- solid ground under its edges.
-StadiumStage.RADIUS = 18
-StadiumStage.MAX_RADIUS = 34
-StadiumStage.PAD = 1.8
+DiscArena.RADIUS = 18
+DiscArena.MAX_RADIUS = 34
+DiscArena.PAD = 1.8
 
 -- The platform for a mon of this footprint. `r` may be nil -- nothing is
 -- standing there yet, which is every frame of the send-out before the model
@@ -88,10 +88,10 @@ StadiumStage.PAD = 1.8
 -- Pokemon is a battle pic sized to cover exactly one map cell and RADIUS is
 -- already a little over that. Either way the platform is the plain one, and
 -- it has to be there BEFORE the Pokemon lands on it.
-function StadiumStage.radiusFor(r)
-  local want = (r or 0) * StadiumStage.PAD
-  if want < StadiumStage.RADIUS then return StadiumStage.RADIUS end
-  if want > StadiumStage.MAX_RADIUS then return StadiumStage.MAX_RADIUS end
+function DiscArena.radiusFor(r)
+  local want = (r or 0) * DiscArena.PAD
+  if want < DiscArena.RADIUS then return DiscArena.RADIUS end
+  if want > DiscArena.MAX_RADIUS then return DiscArena.MAX_RADIUS end
   return want
 end
 
@@ -138,11 +138,11 @@ end
 -- room's own flat light indoors, and the shadow pass darkens whatever the
 -- Pokemon standing on it occludes. So one texture is a sunlit platform, a
 -- dusk platform and a cave platform, without a variant for each.
-StadiumStage.TEX = 128
+DiscArena.TEX = 128
 
 -- Where the solid centre ends, as a fraction of the disc's radius. Inside
 -- this everything is opaque; from here to the rim the dither thins out.
-StadiumStage.SOLID = 0.76
+DiscArena.SOLID = 0.76
 
 local TOP = { 0.74, 0.71, 0.63 }
 local TOP_ALT = { 0.67, 0.64, 0.57 }
@@ -157,11 +157,11 @@ local texture = nil
 -- Per-pixel it came out as a fine mottle that fought the dithered rim for
 -- attention -- and the rim is the thing worth looking at. At this size the
 -- grain is roughly the size of the voxels everywhere else in the mode.
-StadiumStage.GRAIN = 4
+DiscArena.GRAIN = 4
 
 local function grain(x, y)
-  local bx = (x - x % StadiumStage.GRAIN) / StadiumStage.GRAIN
-  local by = (y - y % StadiumStage.GRAIN) / StadiumStage.GRAIN
+  local bx = (x - x % DiscArena.GRAIN) / DiscArena.GRAIN
+  local by = (y - y % DiscArena.GRAIN) / DiscArena.GRAIN
   local v = (bx * 37 + by * 71 + ((bx * by) % 13) * 17) % 100
   return v < 34
 end
@@ -180,13 +180,13 @@ local BAYER = {
   { 63, 31, 55, 23, 61, 29, 53, 21 },
 }
 
-function StadiumStage.texture()
+function DiscArena.texture()
   if texture ~= nil then return texture or nil end
   local ok, img = pcall(function()
-    local n = StadiumStage.TEX
+    local n = DiscArena.TEX
     local data = love.image.newImageData(n, n)
     local half = (n - 1) / 2
-    local solid = StadiumStage.SOLID
+    local solid = DiscArena.SOLID
     for y = 0, n - 1 do
       local dy = (y - half) / half
       for x = 0, n - 1 do
@@ -246,12 +246,12 @@ local function build()
   return Voxel3D.newMesh(verts, { 1, 2, 3, 1, 3, 4 })
 end
 
-function StadiumStage.mesh()
+function DiscArena.mesh()
   if mesh == nil then mesh = build() or false end
   return mesh or nil
 end
 
-function StadiumStage.invalidate()
+function DiscArena.invalidate()
   if texture and texture.release then pcall(texture.release, texture) end
   if mesh and mesh.release then pcall(mesh.release, mesh) end
   texture, mesh = nil, nil
@@ -260,13 +260,13 @@ end
 -- How far under the ground plane the disc actually sits. A hair, and only so
 -- that a flat-footed Pokemon's sole -- which is AT the ground plane -- is not
 -- coplanar with it and left to the depth buffer's mercy.
-StadiumStage.SINK = 0.06
+DiscArena.SINK = 0.06
 
 -- Where one disc sits: centred on a cell, at the ground plane, so a Pokemon
 -- placed at that same height stands ON it rather than in it.
-function StadiumStage.matrix(x, groundY, z, radius)
-  radius = radius or StadiumStage.RADIUS
-  return Mat4.mul(Mat4.translate(x, groundY - StadiumStage.SINK, z),
+function DiscArena.matrix(x, groundY, z, radius)
+  radius = radius or DiscArena.RADIUS
+  return Mat4.mul(Mat4.translate(x, groundY - DiscArena.SINK, z),
                   Mat4.scale(radius, 1, radius))
 end
 
@@ -278,8 +278,8 @@ local function each(arena, groundY, fn)
     local cell = arena[side]
     if cell then
       local footprint = ok and Stadium and Stadium.footprint(side) or nil
-      fn(StadiumStage.matrix(cell[1], groundY, cell[2],
-                             StadiumStage.radiusFor(footprint)))
+      fn(DiscArena.matrix(cell[1], groundY, cell[2],
+                             DiscArena.radiusFor(footprint)))
     end
   end
 end
@@ -295,11 +295,11 @@ end
 -- solve, the sun's frustum fit and the projection to Game Boy pixels, and
 -- putting a stage at (0, 0) is the kind of thing that hides a sign error for
 -- months.
-StadiumStage.ORIGIN = { 16, 16 }
+DiscArena.ORIGIN = { 16, 16 }
 
-function StadiumStage.arena(map)
+function DiscArena.arena(map)
   local BattleArena = V.require("BattleArena")
-  local arena = BattleArena.at(StadiumStage.ORIGIN[1], StadiumStage.ORIGIN[2],
+  local arena = BattleArena.at(DiscArena.ORIGIN[1], DiscArena.ORIGIN[2],
                                "wide")
   if not arena then return nil end
   -- the map is carried for its SKY and its palette only -- what kind of place
@@ -314,10 +314,10 @@ end
 -- The discs, in the main pass. No wireframe: everything else in this frame is
 -- built a unit per voxel and wears the seams that fall out of that, and a
 -- disc is a turned solid with no grid to draw.
-function StadiumStage.draw(arena, groundY)
+function DiscArena.draw(arena, groundY)
   if not (arena and arena.discs) then return end
-  local m = StadiumStage.mesh()
-  local tex = StadiumStage.texture()
+  local m = DiscArena.mesh()
+  local tex = DiscArena.texture()
   if not (m and tex) then return end
   Voxel3D.seams(false)
   Voxel3D.glass(false)
@@ -330,12 +330,12 @@ end
 -- are standing on. Without this the shadow map is empty where the discs are
 -- and a mon casts onto nothing at all -- which, with no ground behind it
 -- either, reads as the pair floating.
-function StadiumStage.cast(shadowMap, arena, groundY)
+function DiscArena.cast(shadowMap, arena, groundY)
   if not (arena and arena.discs and shadowMap) then return end
-  local m = StadiumStage.mesh()
-  local tex = StadiumStage.texture()
+  local m = DiscArena.mesh()
+  local tex = DiscArena.texture()
   if not (m and tex) then return end
   each(arena, groundY, function(matrix) shadowMap.draw(m, tex, matrix) end)
 end
 
-return StadiumStage
+return DiscArena

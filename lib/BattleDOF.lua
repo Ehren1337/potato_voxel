@@ -20,9 +20,6 @@
 
 local BattleDOF = {}
 
--- the mod namespace (see main.lua): V.require loads a sibling module
-local V = ...
-
 -- Switched off for now. The pass is kept whole -- band maths, shader,
 -- canvases -- because the reason to have it has not gone away: it is the one
 -- cue that separates the pair from the ground behind them. It is off because
@@ -85,11 +82,15 @@ local SHADER = [[
   }
 ]]
 
-local ShaderCache = V.require("ShaderCache")
+local shader = nil            -- nil = untried, false = unavailable
 local ping, pong, cw, ch = nil, nil, 0, 0
 
 local function getShader()
-  return ShaderCache.get(SHADER)
+  if shader == nil then
+    local ok, sh = pcall(love.graphics.newShader, SHADER)
+    shader = (ok and sh) or false
+  end
+  return shader or nil
 end
 
 -- Its own pair of canvases rather than the tilt-shift pass's: those are
