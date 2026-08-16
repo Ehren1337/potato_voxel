@@ -407,6 +407,81 @@ if brick then
     DebugOverlay.toggle()
     _G.love = oldLove
   end
+  -- The log-send consent gate: F8 / SEND LOGS / the START chord all land
+  -- on Overlay.export, and a first export that would send stops to ask.
+  -- The engine under test has neither postLog nor a manifest log_url, so
+  -- the gate is exercised with fakes installed -- and with them removed
+  -- the export must pass straight through, exactly as a local-only
+  -- engine does.
+  do
+    local mod = exports.lib.mod
+    local oldPostLog, oldManifest = mod.postLog, mod.manifest
+    local oldTextBox = package.loaded["src.render.TextBox"]
+    local sends, stackPushed = 0, nil
+    -- The prompt is engine UI (src.render.TextBox); stub it so the gate
+    -- can be driven headlessly. The stub records the text and options the
+    -- mod asked with, so the test can answer the choice itself.
+    package.loaded["src.render.TextBox"] = {
+      new = function(_, text, onDone, opts)
+        stackPushed = { text = text, opts = opts }
+        return stackPushed
+      end,
+    }
+    local fakeStack = { push = function(_, s) stackPushed = s end }
+    local consentGame = { save = { options = optionsState },
+                          writeOptions = function() stackPushed = "wrote" end,
+                          stack = fakeStack }
+    local function answeredYes()
+      local box = stackPushed
+      stackPushed = nil
+      T.check(type(box) == "table" and type(box.opts) == "table",
+              "the consent prompt carries a choice")
+      T.check(box.opts.defaultNo == true, "the consent prompt defaults to NO")
+      box.opts.choice(true)
+    end
+    -- Without a send capability the export must never ask: the local
+    -- dump is the whole action there.
+    T.check(not DebugOverlay.canSend(),
+            "no postLog or log_url means nothing can be sent")
+    DebugOverlay.export(consentGame)
+    T.check(stackPushed == nil, "a local-only export does not prompt")
+    mod.postLog = function() sends = sends + 1 return true end
+    mod.manifest = { log_url = "https://logs.example.invalid/logs" }
+    T.check(DebugOverlay.canSend(),
+            "postLog plus a log_url makes a send possible")
+    T.check(not DebugOverlay.consent(),
+            "log-send consent is off before the first export")
+    DebugOverlay.export(consentGame)
+    T.check(stackPushed ~= nil, "the first sendable export asks first")
+    T.eq(sends, 0, "nothing is sent before the prompt is answered")
+    -- YES persists the consent (the same options store every setting
+    -- lives in) and re-runs the export, which now sends.
+    answeredYes()
+    T.check(DebugOverlay.consent(), "a YES is recorded as consent")
+    T.check(optionsState.modOptions.potato_voxel.log_consent == true,
+            "consent is stored in the mod's options")
+    T.eq(sends, 1, "a consented export sends the log")
+    stackPushed = nil
+    DebugOverlay.export(consentGame)
+    T.check(stackPushed == nil, "a consented export never asks again")
+    T.eq(sends, 2, "a consented export sends directly")
+    -- NO sends nothing and leaves the flag unset, so the next export
+    -- asks again.
+    optionsState.modOptions.potato_voxel.log_consent = nil
+    T.check(not DebugOverlay.consent(), "a declined consent stays unset")
+    DebugOverlay.export(consentGame)
+    T.check(stackPushed ~= nil, "an unconsented export asks again")
+    stackPushed.opts.choice(false)
+    T.eq(sends, 2, "a declined prompt sends nothing")
+    T.check(not DebugOverlay.consent(), "declining leaves the flag unset")
+    -- No UI to ask on: refuse rather than ship logs silently.
+    stackPushed = nil
+    DebugOverlay.export({})
+    T.check(stackPushed == nil and sends == 2,
+            "an export with no prompt available sends nothing")
+    mod.postLog, mod.manifest = oldPostLog, oldManifest
+    package.loaded["src.render.TextBox"] = oldTextBox
+  end
 end
 
 -- The MeshCache storage format: encode/decode must round-trip

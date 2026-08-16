@@ -384,7 +384,7 @@ mod.content.render_pipelines:register("voxel", {
     end
     if HoldChord.update("start", dt, chordable and DebugOverlay.running()
                                                and Input:isDown("start")) then
-      DebugOverlay.export()
+      DebugOverlay.export(holdGame)
     end
     if not Voxel.active() then
       if not worldDiag.inactiveNoted then
@@ -934,7 +934,7 @@ do
       return
     end
     if key == "f8" and not (top and top.onKeyPressed) then
-      DebugOverlay.export()
+      DebugOverlay.export(self)
       return
     end
     -- A screen with its own key handler gets the key first, exactly as the
@@ -1199,8 +1199,8 @@ local function voxelSettingsRows(game)
     id = "potato_voxel:send_logs",
     label = "SEND LOGS",
     value = function() return "SEND" end,
-    activate = function()
-      DebugOverlay.export()
+    activate = function(g)
+      DebugOverlay.export(g)
     end,
   }
   return rows

@@ -578,11 +578,73 @@ function Overlay.sendLogs()
   return true
 end
 
+-- ------- log-send consent
+--
+-- F8, the SEND LOGS row and the START chord all ship the stored evidence
+-- to the manifest's log_url -- the ONE action that leaves the device.
+-- It is gated behind a one-time prompt: the first export that would
+-- send asks first, and a YES is persisted as the log_consent option so
+-- later exports never ask again. A NO sends nothing and leaves the flag
+-- unset, so the next export asks again. Engines or manifests without a
+-- log_url never prompt -- there is no send to consent to.
+
+local CONSENT_TEXT =
+  "LOGS GO TO THE\nDEVELOPER.\fSENT OVER THE\nINTERNET.\fSEND?"
+
+-- Whether this engine can send at all: engine feature #1363 (mod.postLog)
+-- plus a manifest log_url. The gate only exists where a send would
+-- actually happen, so a local-only export never asks.
+function Overlay.canSend()
+  local mod = V.mod
+  return not not (mod and type(mod.postLog) == "function"
+                  and mod.manifest and mod.manifest.log_url)
+end
+
+-- The persisted answer. Read live through the options API (ModSetting),
+-- the same store every other setting lives in, so a consent written
+-- anywhere is seen on the next read.
+function Overlay.consent()
+  return Overlay.consentSetting:get() == true
+end
+
+-- The one-time prompt, pushed as a modal over whatever the key found.
+-- The YES/NO defaults to NO -- this is opt-in -- and a YES is written
+-- to the log_consent option before the export runs, so it is asked
+-- exactly once. A NO leaves the flag unset.
+function Overlay.askConsent(g)
+  if not (g and g.stack and g.stack.push) then
+    Overlay.note("log send refused: no consent and no prompt available")
+    return false
+  end
+  local TextBox = require("src.render.TextBox")
+  g.stack:push(TextBox.new(g, CONSENT_TEXT, nil, {
+    defaultNo = true,
+    choice = function(yes)
+      if yes then
+        Overlay.consentSetting:setValue(true, g)
+        Overlay.trace("log send consented")
+        Overlay.export(g)
+      else
+        Overlay.note("log send declined")
+      end
+    end,
+  }))
+  return true
+end
+
 -- F8: export. Force the storage flush so the on-disk debug/log is
 -- current, dump every line to the console in one block (terminal users
 -- can copy it straight out), and stamp the boundary. Works even while
 -- the debugger is toggled off -- exporting is the retrieval action.
-function Overlay.export()
+--
+-- A first export that would send stops to ask first: until the player
+-- opts in, the whole export waits on the answer -- F8 / SEND LOGS is the
+-- send action, and a decline ships nothing at all.
+function Overlay.export(g)
+  g = g or game
+  if Overlay.canSend() and not Overlay.consent() then
+    return Overlay.askConsent(g)
+  end
   Overlay.runProbe()
   persist(true)
   Overlay.sendLogs()
@@ -840,5 +902,15 @@ end
 local ModSetting = V.require("ModSetting")
 Overlay.setting = ModSetting.new("debugger", "DEBUGGER", { false, true },
                                  { "OFF", "ON" })
+
+-- The log-send consent flag: false until the player answers YES to the
+-- one-time prompt in askConsent. Stored through the same options store
+-- as every other setting (the live save's options, the loader's copy
+-- mod.options:get reads, then the options file), so the answer survives
+-- restarts and New Game. It is not registered as a row anywhere -- it is
+-- the prompt's memory, not a setting to fiddle with -- but it lives in
+-- the shared store, so a future row could read it.
+Overlay.consentSetting = ModSetting.new("log_consent", "LOG CONSENT",
+                                        { false, true }, { "NO", "YES" })
 
 return Overlay

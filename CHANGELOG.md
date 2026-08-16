@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.6.5] - 2026-08-16
+
+### Diagnostics / privacy
+
+- F8 / SEND LOGS ask before the first upload: the first export that
+  would send shows a one-time prompt (the log goes to the mod's
+  developer over the internet), defaults to NO, and a YES is stored in
+  the mod's options so it is never asked again. A NO ships nothing and
+  asks again next time; engines with no log_url never prompt.
+
 ## [1.6.4] - 2026-08-16
 
 The map-corruption and cold-cache release: the two most-reported issues
