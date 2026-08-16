@@ -258,7 +258,7 @@ local SHADER = [[
   uniform float glassGlint;   // and its strength: 0 while standing still
   uniform float glassOn;      // 0 for sprite-sheet draws (see Voxel3D.glass)
 
-  vec4 effect(EFFECT_PREC vec4 color, Image tex, EFFECT_PREC vec2 tc,
+  EFFECT_PREC vec4 effect(EFFECT_PREC vec4 color, Image tex, EFFECT_PREC vec2 tc,
               EFFECT_PREC vec2 sc) {
     vec4 p = Texel(tex, tc);
     // sprite sheets key GB OBJ color 0 to alpha 0; discarding rather than
@@ -324,9 +324,13 @@ local SHADER = [[
 -- LOVE's wrapper forward-declares effect() using its stage default precision.
 -- Some mobile compilers treat a definition whose implicit parameter precision
 -- differs from that prototype as a second overload and reject the shader.
--- Keep the proven Water.lua two-variant seam: pin the effect parameters to
--- mediump first, then retry with no qualifier for runtimes whose prototype
--- uses the default instead.
+-- Keep the proven Water.lua two-variant seam: pin the effect parameters AND
+-- its return type to mediump first, then retry with no qualifier for runtimes
+-- whose prototype uses the default instead. The return matters as much as the
+-- parameters: a stage-default highp return vs the wrapper's mediump-default
+-- prototype is a redeclaration error (S0023) on Mali-family ES compilers
+-- (the Pixel log: "Function 'effect' redeclared with a different precision
+-- qualifier on the return type"), even with the parameters matched.
 local function source(grid, bare)
   local head = ""
   if grid then head = head .. "#define VOXEL_GRID 1\n" end
@@ -1256,13 +1260,26 @@ function Voxel3D.beginWater(paint)
     held.mirror = c
   end
   love.graphics.setShader()
-  -- the frame's own depth rides along, so the paint below can test against
-  -- it; the copy underneath switches the test off rather than detaching it
-  local ok = pcall(love.graphics.setCanvas,
-                   { held.mirror, depthstencil = held.depth })
-  if not ok then
-    pcall(love.graphics.setCanvas, depthTarget())
-    return nil
+  -- The full target first: the mirror with the frame's readable depth
+  -- attached, so the paint below can test against it. Some mobile drivers
+  -- (the Pixel's Mali) refuse to re-attach a readable depth to a second
+  -- colour canvas -- the scene bind is fine, the mirror's is not. The
+  -- copy itself does not need the depth, so retry without it; the loss is
+  -- the cast-sprite paint, which cannot depth-test and is skipped.
+  local withDepth = pcall(love.graphics.setCanvas,
+                          { held.mirror, depthstencil = held.depth })
+  if not withDepth then
+    local okP, err = pcall(love.graphics.setCanvas, held.mirror)
+    if not okP then
+      pcall(love.graphics.setCanvas, depthTarget())
+      return nil
+    end
+    paint = nil   -- no depth to test against: skip the cast pass
+    local okD, Overlay = pcall(V.require, "DebugOverlay")
+    if okD and Overlay then
+      Overlay.note("water mirror capture: depthless fallback (%s)",
+                   tostring(err))
+    end
   end
   love.graphics.setDepthMode("always", false)
   -- COLOUR only. The last two arguments are what keep the depth buffer the

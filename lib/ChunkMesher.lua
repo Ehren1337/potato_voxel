@@ -51,7 +51,6 @@
 local V = ...
 
 local Assets = require("src.render.Assets")
-local Platform = V.require("Platform")
 local Structures = V.require("Structures")
 local TileShape = V.require("TileShape")
 local Voxel3D = V.require("Voxel3D")
@@ -1040,6 +1039,16 @@ local function finishJob(job, ok, err)
     if okD and Overlay then Overlay.count("jobs") end
     debugNote("mesh done %s (%dms)", key, jobMs or 0)
   end
+  -- Per-job build health for the status snapshot: slices taken, the
+  -- longest single resume (the freeze evidence), and how many resumes
+  -- blew their budget.
+  do
+    local okD, Overlay = pcall(V.require, "DebugOverlay")
+    if okD and Overlay then
+      Overlay.buildDone(job.id, job.slot, job.slices or 0,
+                        job.maxGapMs or 0, job.overshoots or 0)
+    end
+  end
   jobIndex[key] = nil
   completion[key] = ok and "complete" or "failed"
   for i, j in ipairs(jobs) do
@@ -1199,10 +1208,17 @@ end
 -- job was queued under -- invalidate/evict bump it to cancel in-flight
 -- work whose inputs went stale.
 local function runJob(job)
-  local map = job.map
   local c = entry(job.id)
+  job.phase = "load"
+  local map = job.map
+  if not map and job.loader then map = job.loader() end
+  if not map then
+    error("mesh build has no map for " .. tostring(job.id), 0)
+  end
+  job.map = map
   if c.grass == nil or c.flowers == nil or c.figures == nil
      or (c.stale and c.stale.aux) then
+    job.phase = "aux"
     if not fillAux(job) then return end
   end
 
@@ -1211,6 +1227,7 @@ local function runJob(job)
   -- Structures' analysis AND geometry generation -- the whole point of
   -- precompiled meshes -- leaving only the same sliced upload a fresh
   -- build's finish() would have done.
+  job.phase = "cache-load"
   local current = (gen[job.id] or 0) == job.gen
   if MeshCache.available() then
     local tdata, wdata = MeshCache.loadTerrain(map, job.slot)
@@ -1233,17 +1250,20 @@ local function runJob(job)
       return
     end
   end
+  job.phase = "geometry"
   local sink = newSink()
   local waterSink = newSink()
   runGeometry(map, job.slot == "body", job.masks, sink, waterSink)
   local mesh = sink.finish()
   local water = waterSink.finish()
   if MeshCache.available() then
+    job.phase = "save"
     local buf, n, idx, m = sink.buffer()
     MeshCache.saveTerrain(map, job.slot, buf, n, idx, m)
     local wbuf, wn, widx, wm = waterSink.buffer()
     MeshCache.saveWater(map, job.slot, wbuf, wn, widx, wm)
   end
+  job.phase = "mesh"
   if (gen[job.id] or 0) ~= job.gen then
     if mesh and mesh.release then pcall(mesh.release, mesh) end
     if water and water.release then pcall(water.release, water) end
@@ -1351,6 +1371,38 @@ function ChunkMesher.request(map, bodyOnly, masks, urgent, force)
   return (c and c[slot]) or nil
 end
 
+-- Queue a prebuilder job whose map object is produced inside the pumped
+-- coroutine by `loader` (the engine's MapLoader.load is too slow to run
+-- on the update tick outside the pump, and inside the coroutine it is at
+-- least measured and warned about like every other slice overshoot).
+-- Every other field behaves exactly like request(): same queue, same
+-- force/prebuild semantics, same completion record.
+function ChunkMesher.requestMapId(mapId, bodyOnly, masks, urgent, force, loader)
+  local slot = bodyOnly and "body" or "full"
+  local c = entry(mapId)
+  if force then
+    c.stale = c.stale or {}
+    c.stale.aux = true
+    c.stale[slot] = true
+  end
+  local key = jobKey(mapId, slot)
+  local job = jobIndex[key]
+  if force then completion[key] = nil end
+  if not job then
+    job = { id = mapId, loader = loader, slot = slot, masks = masks,
+            urgent = urgent or false, prebuild = force or false,
+            gen = gen[mapId] or 0,
+            queuedAt = love and love.timer and love.timer.getTime
+                       and love.timer.getTime() or nil }
+    jobIndex[key] = job
+    jobs[#jobs + 1] = job
+  else
+    if urgent then job.urgent = true end
+    if force then job.prebuild = true end
+  end
+  return (c and c[slot]) or nil
+end
+
 function ChunkMesher.pending()
   return #jobs
 end
@@ -1425,6 +1477,28 @@ function ChunkMesher.pump(covered)
     Budget.begin(pick.co, deadline - clock())
     local ok, err = coroutine.resume(pick.co, pick)
     Budget.finish()
+    -- The cooperative budget is the contract: a resume that runs far past
+    -- its slice froze the frames it landed on (field logs: 590-1083ms on a
+    -- Deck, a 20.3s frame on an Adreno 830). Name the job and its phase
+    -- once per phase so a support log says exactly which step to slice.
+    local elapsedMs = (clock() - t0) * 1000
+    pick.slices = (pick.slices or 0) + 1
+    if elapsedMs > (pick.maxGapMs or 0) then pick.maxGapMs = elapsedMs end
+    local overshootThreshold = slice * 1000 * 4
+    if elapsedMs > overshootThreshold then
+      pick.overshoots = (pick.overshoots or 0) + 1
+      if pick.warnedPhase ~= pick.phase then
+        pick.warnedPhase = pick.phase
+        local okD, Overlay = pcall(V.require, "DebugOverlay")
+        if okD and Overlay then
+          Overlay.warn("mesh build overshot its slice: %s/%s in %s "
+                       .. "(%.0fms resume vs %.0fms slice)",
+                       tostring(pick.id), tostring(pick.slot),
+                       tostring(pick.phase), elapsedMs,
+                       overshootThreshold)
+        end
+      end
+    end
     if not ok then
       finishJob(pick, false, err)
     elseif coroutine.status(pick.co) == "dead" then
@@ -1675,31 +1749,33 @@ end
 
 -- The engine fires every registered invalidator at boot too: the mod
 -- loader's Assets.installLoader -> Assets.invalidate handoff runs on
--- every launch.  That first call is an asset-search-path handoff, not a
--- geometry change -- no map has loaded yet -- and a full
+-- every launch, and on desktop it has been observed to fire TWICE (the
+-- Steam Deck logs: "cache invalidate ALL" twice, 0.2s apart, 3 seconds
+-- before the first frame sample). Those calls are an asset-search-path
+-- handoff, not a geometry change -- no map has loaded yet -- and a full
 -- MeshCache.invalidate() there would drop the manifest and force a cold
 -- 444-job prebuild on every boot (observed: 162s rebuilds on Linux).
 -- The runtime mesh cache is empty at that point, and the disk cache is
--- fingerprint-protected, so skipping exactly the first callback keeps
--- restarts warm while real asset changes (dev hot reload) still empty
--- the mesh cache.
+-- fingerprint-protected, so boot-time handoffs are skipped on EVERY
+-- platform until the first real mesh entry exists -- a boot-time
+-- handoff is never that. The moment any mesh work starts the guard
+-- releases, so genuine invalidations (dev hot reload, a real asset
+-- swap) still land.
 local bootAssetsHandedOff = false
 Assets.register(function()
   if not bootAssetsHandedOff then
     bootAssetsHandedOff = true
     return
   end
-  -- On Switch the engine's installLoader -> Assets.invalidate handoff
-  -- has been observed to fire TWICE at boot: the guard above skips only
-  -- the first, and the second drops the manifest and forces a cold
-  -- 444-job prebuild on every launch (port log: "cache invalidate ALL"
-  -- 18ms after boot, before save.created). No map can have meshed at
-  -- that point, so skip handoffs until the first real entry exists --
-  -- a boot-time handoff is never that, and Switch cannot hot-reload
-  -- assets during boot anyway. The moment any mesh work starts the
-  -- guard releases, so genuine invalidations still land.
-  if Platform.isSwitch() and not builtAnything then return end
+  if not builtAnything then return end
   ChunkMesher.invalidate()
 end)
+
+-- Test seam: the boot-handoff guard keys on the session-level
+-- builtAnything flag; the headless suite replays boot scenarios in one
+-- process and needs to re-arm it between blocks.
+function ChunkMesher._resetBootHandoffForTests()
+  builtAnything = false
+end
 
 return ChunkMesher

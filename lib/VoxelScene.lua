@@ -732,6 +732,7 @@ end
 -- GPUs they don't reliably (that fight is what put the Android port back on
 -- flat water). Confined to the curve there is no regression to reach: the
 -- flat world never had the far-shore bug in the first place.
+local waterDiagShown = false
 function VoxelScene.drawWater(draws, cast, waterProfile)
   -- prepass only under the bend; see the header
   local curved = (Voxel3D.curveK or 0) > 0  if curved then
@@ -758,6 +759,17 @@ function VoxelScene.drawWater(draws, cast, waterProfile)
       end
       Water.finish()
       plain = false
+    elseif not waterDiagShown then
+      -- The reflective pass bailed: say which gate refused it, once, so
+      -- a support log can tell a driver limitation from a shader bug.
+      waterDiagShown = true
+      local reason = (not mirror or not depth)
+        and "mirror capture failed" or "water shader/uniforms failed"
+      local okD, Overlay = pcall(V.require, "DebugOverlay")
+      if okD and Overlay then
+        Overlay.note("water pass skipped: %s (flat water fallback)",
+                     reason)
+      end
     end
     -- Unconditionally, and OUTSIDE the success branch: beginWater unbinds
     -- the shader and the depth mode BEFORE it can discover it cannot go on,
@@ -765,6 +777,15 @@ function VoxelScene.drawWater(draws, cast, waterProfile)
     -- exactly like one that succeeded -- otherwise every pass after it runs
     -- with no shader and no depth test.
     Voxel3D.endWater()
+  elseif not waterDiagShown then
+    waterDiagShown = true
+    local reason = (not Water.enabled() and "WATER row off")
+      or "depth canvas not readable on this driver"
+    local okD, Overlay = pcall(V.require, "DebugOverlay")
+    if okD and Overlay then
+      Overlay.note("water pass skipped: %s (flat water fallback)",
+                   reason)
+    end
   end
   -- the fallback flat draw -- unless the curve's prepass already put the
   -- same meshes down, in which case a bailed frame is already whole

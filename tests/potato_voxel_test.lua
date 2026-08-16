@@ -183,8 +183,8 @@ if brick then
   T.check(scenePinned:find("#define EFFECT_PREC mediump\n", 1, true),
           "scene shader pins effect parameters for mobile prototypes")
   T.check(scenePinned:find(
-            "vec4 effect(EFFECT_PREC vec4 color", 1, true),
-          "scene shader routes effect parameters through the precision define")
+            "EFFECT_PREC vec4 effect(EFFECT_PREC vec4 color", 1, true),
+          "scene shader pins the effect RETURN type too (Mali S0023)")
   T.check(sceneBare:find("#define EFFECT_PREC\n", 1, true),
           "scene shader has a bare-precision retry variant")
   local shadowPinned = ShadowMap._source(false)
@@ -192,8 +192,8 @@ if brick then
   T.check(shadowPinned:find("#define EFFECT_PREC mediump\n", 1, true),
           "shadow shader pins effect parameters for mobile prototypes")
   T.check(shadowPinned:find(
-            "vec4 effect(EFFECT_PREC vec4 color", 1, true),
-          "shadow shader routes effect parameters through the precision define")
+            "EFFECT_PREC vec4 effect(EFFECT_PREC vec4 color", 1, true),
+          "shadow shader pins the effect RETURN type too (Mali S0023)")
   T.check(shadowBare:find("#define EFFECT_PREC\n", 1, true),
           "shadow shader has a bare-precision retry variant")
   do
@@ -329,6 +329,22 @@ if brick then
   T.eq(Water.level(), 3, "FULL is the full-budget reflective rung")
   Water.setting:setValue("off", fakeGame)
   T.eq(Water.level(), 0, "WATER back OFF")
+  do
+    -- The Android water flag: the reflective pass's Mali stripes are
+    -- unresolved, so Android runs flat water regardless of the row -- a
+    -- persisted FULL must be ignored, and the row gate reads the same
+    -- answer (Water.onAndroid is also the row's `when`).
+    local oldOverride = Water._androidOverride
+    Water._androidOverride = true
+    Water.setting:setValue("full", fakeGame)
+    T.eq(Water.level(), 0, "Android forces WATER off (flat water)")
+    T.eq(Water.enabled(), false, "Android never runs the reflective pass")
+    T.eq(Water.onAndroid(), true, "the row gate reads the same flag")
+    Water._androidOverride = false
+    T.eq(Water.level(), 3, "off-Android keeps the FULL rung")
+    Water._androidOverride = oldOverride
+    Water.setting:setValue("off", fakeGame)
+  end
   -- FOREST FX was removed with the sandbox release (see the removals ADR):
   -- no setting exists to assert.
   T.eq(AntiAlias.setting.values[1], 0, "AA defaults off")
@@ -479,6 +495,63 @@ if brick then
             "debug status preserves capability details")
     local probe = DebugOverlay.runProbe()
     T.check(type(probe) == "table", "debug capability probe returns data")
+  end
+  T.check(type(DebugOverlay.slowStorageBackoff) == "function",
+          "the debugger exposes the slow-storage backoff policy")
+  T.check(DebugOverlay.slowStorageBackoff(5) == nil,
+          "fast storage never backs off the persist cadence")
+  T.eq(DebugOverlay.slowStorageBackoff(25), 30,
+       "a 25ms write backs off 30s (flash floor)")
+  T.eq(DebugOverlay.slowStorageBackoff(105), 30,
+       "the Switch's ~100ms writes back off 30s")
+  T.eq(DebugOverlay.slowStorageBackoff(5000), 150,
+       "multi-second writes scale the backoff")
+  T.eq(DebugOverlay.slowStorageBackoff(20000), 300,
+       "backoff caps at 300s")
+  do
+    DebugOverlay.buildDone("PALLET_TOWN", "full", 120, 843.5, 3)
+    local b = DebugOverlay.status().build
+    T.eq(b.jobs, 1, "build health counts finished mesh jobs")
+    T.eq(b.slices, 120, "build health counts pumped slices")
+    T.eq(b.overshoots, 3, "build health counts slice overshoots")
+    T.eq(b.worstResumeMs, 843.5, "build health keeps the worst resume gap")
+    T.eq(b.worstResumeJob, "PALLET_TOWN/full",
+         "build health names the job with the worst resume")
+    DebugOverlay.buildDone("VIRIDIAN_FOREST", "body", 40, 1200, 1)
+    b = DebugOverlay.status().build
+    T.eq(b.worstResumeMs, 1200, "build health keeps the global worst gap")
+    T.eq(b.worstResumeJob, "VIRIDIAN_FOREST/body",
+         "build health renames the worst job")
+  end
+  do
+    local Budget = exports.lib.require("BuildBudget")
+    T.check(Budget.inBuild and Budget.inBuild() == false,
+            "the build budget reports out-of-build outside the pump")
+  end
+  do
+    -- Void-fill churn must invalidate the cache once, or never for a
+    -- round trip: the field log showed trees -> water -> trees in 0.7s
+    -- dropping the whole cache twice.
+    local Debounce = exports.lib.require("VoidFillDebounce")
+    Debounce.reseed("trees")
+    T.eq(Debounce.tick("trees", 0), "none", "an unchanged value does nothing")
+    T.eq(Debounce.tick("water", 1), "hold", "a change waits for the settle window")
+    T.eq(Debounce.tick("water", 1.5), "hold", "still settling")
+    local action, from = Debounce.tick("water", 2)
+    T.eq(action, "invalidate", "a settled change invalidates once")
+    T.eq(from, "trees", "the invalidate names the pre-burst value")
+    T.eq(Debounce.tick("water", 2.1), "none", "no repeat invalidations")
+    Debounce.reseed("trees")
+    Debounce.tick("water", 10)
+    T.eq(Debounce.tick("trees", 10.5), "none",
+         "a round trip cancels the invalidate")
+    Debounce.reseed("trees")
+    Debounce.tick("water", 20)
+    Debounce.tick("grass", 20.3)
+    Debounce.tick("sand", 20.6)
+    action, from = Debounce.tick("sand", 21.6)
+    T.eq(action, "invalidate", "a churn burst invalidates exactly once")
+    T.eq(from, "trees", "the burst invalidate names the pre-burst value")
   end
   do
     local oldLove = _G.love
@@ -858,6 +931,38 @@ if MeshCache and MeshCache.encodeMesh then
           "the cache lives in scoped storage, not a raw dir")
   T.check(MeshCache.available(),
           "cache availability resolves the storage facade")
+
+  do
+    -- A successful persist clears the boot's expected failure state: the
+    -- not_in_playthrough entries from before the playthrough existed
+    -- must not poison every later status snapshot.
+    local DebugOverlay = exports.lib.require("DebugOverlay")
+    local goodStore = exports.lib.mod.storage
+    local badStore = setmetatable({}, {
+      __index = function(_, k)
+        if k == "writeBytes" then
+          return function() return false, "not_in_playthrough",
+            "Storage is available only inside an identified playthrough." end
+        end
+        return nil
+      end,
+    })
+    exports.lib.mod.storage = badStore
+    DebugOverlay.note("storage failure probe")
+    local failed = DebugOverlay.status().storage
+    T.eq(failed.state, "not_in_playthrough",
+         "a failing write records the failure state")
+    T.check(failed.lastError ~= nil,
+            "a failing write records the failure reason")
+    exports.lib.mod.storage = goodStore
+    DebugOverlay.export()
+    local cleared = DebugOverlay.status().storage
+    T.eq(cleared.state, "ok",
+         "a successful write clears the stale storage failure state")
+    T.check(cleared.lastError == nil,
+            "a successful write clears the stale storage lastError")
+    exports.lib.mod.storage = goodStore
+  end
 
   -- a small run of six-float vertices (2 triangles' worth)
   local n = 6

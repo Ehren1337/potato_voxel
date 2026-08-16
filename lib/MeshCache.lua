@@ -1311,8 +1311,12 @@ function MeshCache.loadTerrain(map, slot)
         Overlay.count("slowLoads")
         -- A warning, not an error: a slow-but-successful load must not
         -- inflate counters.errors (it never did before the counter split).
-        Overlay.warn("SLOW load terrain %s/%s: %dms", tostring(map.id),
-                     tostring(slot), ms)
+        -- The tag says WHERE it hitched: in-build loads are budgeted (the
+        -- pump's overshoot warn covers them); sync loads run on the entry
+        -- frame and ARE the freeze.
+        local where = Budget.inBuild() and "in-build" or "sync"
+        Overlay.warn("SLOW load terrain %s/%s: %dms (%s)", tostring(map.id),
+                     tostring(slot), ms, where)
       end
     end
   end

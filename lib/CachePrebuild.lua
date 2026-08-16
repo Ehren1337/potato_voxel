@@ -76,13 +76,19 @@ function Prebuild.bootstrap(game)
   -- mid-session (F3) left complete atomic payloads behind, and a rescan
   -- of the actual files recovers exactly which jobs survived. Those
   -- become the resume set -- start() skips them and only the missing
-  -- remainder gets rebuilt.
-  local completed = {}
-  if not ready then completed, done = MeshCache.scanComplete(jobs) end
+  -- remainder gets rebuilt. The rescan itself is ~2 storage reads per
+  -- job -- seconds of cold-flash reads on the game.ready frame (the NX
+  -- boot log: a 3.0s first frame with a cold cache) -- so it is
+  -- DEFERRED: start() runs it once, when a build actually begins,
+  -- never on the boot frame. completed == nil is the deferred marker;
+  -- a ready cache and a wipe both leave a real (empty) table.
+  local completed = ready and {} or nil
+  if not ready then done = 0 end
   state = { running = false, cancelled = false, maps = jobs, index = 0,
             slot = nil, done = ready and #jobs or done, total = #jobs,
             game = nil, startedAt = nil, eta = nil, ready = ready,
-            failed = false, error = nil, completed = completed }
+            failed = false, error = nil, completed = completed,
+            declined = false, gateRan = false }
   -- Boot diagnostics: log the full cache identity, the resolved cache dir,
   -- and -- when the cache was rejected -- exactly why, plus how it compares
   -- to the build.info sidecar written at build time. This is the only window
@@ -214,6 +220,11 @@ function Prebuild.start(game)
     state.cancelled = true
     return false
   end
+  -- An explicit start overrides nothing: the session's decline and gate
+  -- history survive the row build (so a cancel then a wipe cannot
+  -- silently re-arm the auto-start). Only bootstrap -- a fresh boot --
+  -- clears them.
+  local sessionDeclined, sessionGateRan = state.declined, state.gateRan
   local data = game and game.data
   local jobs = Prebuild.enumerate(data and data.maps)
   if #jobs == 0 or not MeshCache.available() then return false end
@@ -221,8 +232,15 @@ function Prebuild.start(game)
   -- RESUME (F3): jobs the boot scan found complete are skipped, so a
   -- prebuild interrupted mid-session finishes the remainder instead of
   -- rebuilding everything from zero. A fresh build (empty completed)
-  -- starts at the first job as before.
-  local completed = state.completed or {}
+  -- starts at the first job as before. The boot scan was deferred off
+  -- the first frame (cold-flash reads measured seconds there); it runs
+  -- here, once, only when a build actually starts.
+  local completed = state.completed
+  if completed == nil then
+    completed = {}
+    local okS, records = pcall(MeshCache.scanComplete, jobs)
+    if okS and records then completed = records end
+  end
   local index = 1
   for i, job in ipairs(jobs) do
     local key = tostring(job.id) .. "/" .. tostring(job.slot)
@@ -232,12 +250,46 @@ function Prebuild.start(game)
   state = { running = true, cancelled = false, maps = jobs, index = index,
             slot = nil, done = index - 1, total = #jobs, game = game,
             startedAt = now(), eta = nil, ready = false,
-            failed = false, error = nil, completed = completed }
+            failed = false, error = nil, completed = completed,
+            declined = sessionDeclined, gateRan = sessionGateRan }
   local okD, Overlay = pcall(V.require, "DebugOverlay")
   if okD and Overlay then
     Overlay.trace("prebuild start: %d/%d done, %d jobs",
                  index - 1, #jobs, #jobs)
   end
+  return true
+end
+
+-- Hands-off boot fill: an incomplete cache starts building on its own
+-- once a playthrough's overworld is up -- the OPTIONS row and the boot
+-- prompt both need in-game storage and the save's live options, and a
+-- fresh device should not depend on the player finding either. Gated to
+-- exactly the PREBUILD (never started) state, so an explicit cancel, a
+-- declined prompt, a FAILED build, a completed READY cache or a running
+-- build all block it, and the cooperative pump slices keep it invisible
+-- on the frame.
+function Prebuild.autoStart(game)
+  if state.gateRan then return false end
+  if state.declined then return false end
+  if Prebuild.status() ~= "PREBUILD" then return false end
+  local ow = game and (game.overworld or game)
+  if not (ow and ow.map and ow.camera) then return false end
+  local okD, Overlay = pcall(V.require, "DebugOverlay")
+  if okD and Overlay then
+    Overlay.trace("prebuild auto-start: cache incomplete, filling in "
+                  .. "the background")
+  end
+  return Prebuild.start(game)
+end
+
+-- The boot gate's "MAP CACHE NOT READY. BUILD NOW?" prompt answered NO:
+-- the auto-start must not override an explicit decline (it did once --
+-- field log: the player said no, the fill started anyway). Per-session:
+-- bootstrap re-arms it, a wipe re-arms it, and the OPTIONS row still
+-- starts a build whenever the player wants one.
+function Prebuild.decline()
+  if state.running then return false end
+  state.declined = true
   return true
 end
 
@@ -254,6 +306,10 @@ function Prebuild.wipe(game)
   if ok then
     ChunkMesher.invalidate()
     state.ready, state.cancelled, state.failed = false, false, false
+    -- A decline stays sticky through a wipe: the player answered NO to
+    -- the prompt this session, and wiping must not silently override
+    -- that (field log: a wipe started the fill anyway). The OPTIONS row
+    -- and a fresh boot are the re-arm paths.
     state.done, state.total, state.error = 0, #jobs, nil
     state.completed = {}
   end
@@ -271,7 +327,11 @@ end
 -- (CONTINUE's restoreSave / NEW GAME's onNewGame): the game.ready-time
 -- check ran under the skeleton save's defaults, and a player's VOID FILL
 -- choice would otherwise read as a stale cache on every launch (F1).
+-- Running the gate IS the consent event: the prompt (or its ready-skip)
+-- answers the fill question, so the hands-off auto-start must never act
+-- on a boot the gate already handled.
 function Prebuild.refresh(game)
+  state.gateRan = true
   if state.running then return end
   local data = game and game.data
   local jobs = Prebuild.enumerate(data and data.maps)
@@ -303,24 +363,37 @@ function Prebuild.activationDecision(status, running)
   return "start"
 end
 
-function Prebuild.update()
+function Prebuild.update(covered)
   if not state.running then return end
   if state.cancelled then finish(true); return end
   local job = state.maps[state.index]
   if not job then finish(false); return end
   if not state.slot then
+    -- The map loads INSIDE the pumped job coroutine (ChunkMesher owns the
+    -- build now): a slow engine load is measured and warned like any other
+    -- slice overshoot instead of freezing the frame unaccounted, and the
+    -- completed job is still reachable through MapLoader.cached for the
+    -- verification below.
     local MapLoader = require("src.world.MapLoader")
-    local map = MapLoader.load(state.game.data, job.id)
-    state.slot = map
-    ChunkMesher.request(map, job.slot == "body", job.masks, false, true)
+    local data = state.game and state.game.data
+    state.slot = true
+    ChunkMesher.requestMapId(job.id, job.slot == "body", job.masks,
+                             false, true, function()
+      return MapLoader.load(data, job.id)
+    end)
   end
-  -- Prebuild runs alongside normal gameplay; use the ordinary cooperative
-  -- slice rather than the 30ms covered/menu budget.
-  ChunkMesher.pump(false)
+  -- Prebuild runs alongside normal gameplay; the covered flag (menus,
+  -- warps, the title screen, the loading canvas) opens the wider 30ms
+  -- slice -- nothing visible can hitch there, and fills run several
+  -- times faster.
+  ChunkMesher.pump(covered)
   local bodyOnly = job.slot == "body"
   local jobStatus = ChunkMesher.jobStatus(job.id, bodyOnly)
   if jobStatus == "pending" then return end
-  if jobStatus ~= "complete" or not MeshCache.verifyJob(state.slot, job.slot) then
+  local okLoader, MapLoader = pcall(require, "src.world.MapLoader")
+  local slotMap = okLoader and MapLoader and MapLoader.cached(job.id)
+  if jobStatus ~= "complete" or not slotMap
+     or not MeshCache.verifyJob(slotMap, job.slot) then
     -- A single bad job must not abort the whole build: record it, release
     -- the map, and move on. writeProgress has already left a manifest
     -- naming every job that survived, so the next boot's resume set
@@ -352,7 +425,7 @@ function Prebuild.update()
     return
   end
   state.completed[tostring(job.id) .. "/" .. tostring(job.slot)] =
-    MeshCache.jobRecord(state.slot, job.slot)
+    MeshCache.jobRecord(slotMap, job.slot)
   -- Update the manifest per completed job (F3): an interrupted build now
   -- leaves a manifest naming exactly the jobs whose files survived, so
   -- the next boot resumes instead of prompting forever.

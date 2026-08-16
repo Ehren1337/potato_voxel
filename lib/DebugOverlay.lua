@@ -83,6 +83,8 @@ local health = {
   capabilities = {},
   renderer = {},
   storage = { writes = 0, failures = 0, available = nil },
+  build = { jobs = 0, slices = 0, overshoots = 0, worstResumeMs = 0,
+            worstResumeJob = nil },
   probe = { ok = nil },
   lastEvent = nil,
   lastError = nil,
@@ -174,6 +176,7 @@ local function snapshot()
     capabilities = dataCopy(health.capabilities),
     renderer = dataCopy(health.renderer),
     storage = dataCopy(health.storage),
+    build = dataCopy(health.build),
     probe = dataCopy(health.probe),
     platform = health.platform or platformName(),
     settings = settingsLine(),
@@ -374,9 +377,28 @@ local function storageWrite(store, method, key, value)
   return true
 end
 
+-- A storage write this slow means the platform's flash (Switch) makes the
+-- support log stutter the very game it diagnoses: after such a write,
+-- non-forced persists back off until the returned expiry. Errors and
+-- exports still force through -- losing crash evidence is worse than one
+-- slow write. Exposed for the headless suite; returns seconds or nil.
+local SLOW_WRITE_MS = 25
+local slowUntil = 0
+
+function Overlay.slowStorageBackoff(elapsedMs)
+  if not elapsedMs or elapsedMs < SLOW_WRITE_MS then return nil end
+  return math.max(30, math.min(300, elapsedMs / 1000 * 30))
+end
+
 local function persist(force)
   local c = clock()
-  if not force and (c - lastPersist) < 1 then return end
+  if not force then
+    -- The 5s sample cadence would persist ~once per window; on flash
+    -- that is a ~100ms hitch every window. Skip until the backoff from
+    -- the last slow write expires (errors/exports bypass via force).
+    if c < slowUntil then return end
+    if (c - lastPersist) < 1 then return end
+  end
   lastPersist = c
   local mod = V.mod
   if not (mod and mod.storage) then return end
@@ -389,6 +411,7 @@ local function persist(force)
     storageFailure("resolve", "storage_unavailable")
     return
   end
+  local t0 = clock()
   local context = store.context
   if context then
     local okC, value = pcall(context, store, game)
@@ -403,6 +426,7 @@ local function persist(force)
   else
     wrote, code, message, key = storageWrite(store, "write", "debug/log", logText())
   end
+  local okAll = wrote
   if not wrote then
     storageFailure("debug/log", code, message, key or "debug/log")
   else
@@ -413,9 +437,22 @@ local function persist(force)
     local statusOk, statusCode, statusMessage, statusKey =
       storageWrite(store, "write", "debug/status", snapshot())
     if not statusOk then
+      okAll = false
       storageFailure("debug/status", statusCode, statusMessage, statusKey or "debug/status")
     end
   end
+  -- A successful write clears the previous failure state: without this,
+  -- the boot's expected not_in_playthrough failures stayed in every
+  -- session's final status snapshot, reading as broken storage even
+  -- though the log wrote fine all session.
+  if okAll then
+    health.storage.state = "ok"
+    health.storage.lastError = nil
+  end
+  -- Slow flash (Switch): stretch the non-forced cadence so the support
+  -- log cannot keep stuttering every 5s window for the whole session.
+  local backoff = Overlay.slowStorageBackoff((clock() - t0) * 1000)
+  if backoff then slowUntil = clock() + backoff end
 end
 
 local function append(line)
@@ -562,8 +599,13 @@ function Overlay.pipelineAvailable(ok, reason, detail)
   p.lastAvailabilityFrame = health.frame
   health.capabilities.voxel = dataCopy(detail or {})
   if changed then
-    Overlay.note("pipeline voxel available=%s reason=%s",
-                 tostring(available), tostring(normalized))
+    -- Carry the compile error text when a driver refuses the shader:
+    -- the plain note ("reason=scene_shader_compile") names the failure
+    -- class but not the GLSL line a Mali support log needs.
+    local why = (not available and detail and detail.error)
+      and (" -- " .. tostring(detail.error)) or ""
+    Overlay.note("pipeline voxel available=%s reason=%s%s",
+                 tostring(available), tostring(normalized), why)
   end
 end
 
@@ -584,6 +626,21 @@ end
 function Overlay.event(name, detail)
   health.lastEvent = { name = tostring(name), detail = dataCopy(detail or {}),
                        frame = health.frame }
+end
+
+-- Per-job mesh-build totals, pushed by the pump when a job finishes. The
+-- resume gap is the freeze evidence: a gap far past its slice is a build
+-- step the cooperative budget does not cover, and the support log must
+-- name the job so the region can be found.
+function Overlay.buildDone(id, slot, slices, maxGapMs, overshoots)
+  local b = health.build
+  b.jobs = b.jobs + 1
+  b.slices = b.slices + (slices or 0)
+  b.overshoots = b.overshoots + (overshoots or 0)
+  if (maxGapMs or 0) > b.worstResumeMs then
+    b.worstResumeMs = maxGapMs
+    b.worstResumeJob = tostring(id) .. "/" .. tostring(slot)
+  end
 end
 
 -- Session counters feed the summary and run from boot with the background
@@ -861,9 +918,11 @@ function Overlay.frame(dt, renderMs)
     if love and love.graphics and love.graphics.getStats then
       local okS, st = pcall(love.graphics.getStats)
       if okS and st then
-        gpu = (" draws=%d sw=%d texMB=%.1f")
-          :format(st.drawcalls or 0, st.canvasswitches or 0,
-                  (st.texturememory or 0) / 1048576)
+        -- texMB only: getStats().drawcalls / canvasswitches are
+        -- unpopulated on the engine's LOVE builds (field logs showed
+        -- draws=0 sw=0 on every platform while rendering thousands of
+        -- frames), so those fields were pure noise.
+        gpu = (" texMB=%.1f"):format((st.texturememory or 0) / 1048576)
       end
     end
     local p = health.pipeline

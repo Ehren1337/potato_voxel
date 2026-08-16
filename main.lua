@@ -201,7 +201,8 @@ local function sceneSize(ctx)
   return ctx.width, ctx.height
 end
 
-local voidFill = { last = nil }
+local voidFill = {}
+local VoidFillDebounce = V.require("VoidFillDebounce")
 -- Called after the engine applies a save's options (Game:applyOptions):
 -- the fill that just landed IS the save's declared value, so the change
 -- detector is re-seeded instead of treating the boot/load transition as
@@ -214,7 +215,7 @@ local voidFill = { last = nil }
 -- applyOptions, so check() catches it on the next tick.
 function voidFill.reseed()
   local TileRenderer = require("src.render.TileRenderer")
-  voidFill.last = TileRenderer.voidFill
+  VoidFillDebounce.reseed(TileRenderer.voidFill)
 end
 -- The last drawWorld's render duration, fed into the debug overlay's
 -- frame aggregation by the update tick (drawn before the next update).
@@ -228,15 +229,21 @@ local renderMs = 0
 local worldDiag = { loadingEntered = 0, loadingReported = false,
                     inactiveNoted = false, firstRender = false }
 
+-- The boot gate's "MAP CACHE NOT READY. BUILD NOW?" prompt is a real
+-- question: while it is up -- and after a NO answer -- the hands-off
+-- auto-start must not override it (field log: the fill started 8s after
+-- a decline). Pending blocks the auto-start tick; a NO records a
+-- session-wide decline; a wipe re-arms.
+local cacheGatePending = false
+
 function voidFill.check()
   local TileRenderer = require("src.render.TileRenderer")
-  local now = TileRenderer.voidFill
-  if voidFill.last ~= nil and now ~= voidFill.last then
+  local action, from = VoidFillDebounce.tick(TileRenderer.voidFill)
+  if action == "invalidate" then
     DebugOverlay.trace("void fill changed %s -> %s (invalidate)",
-                       tostring(voidFill.last), tostring(now))
+                       tostring(from), tostring(TileRenderer.voidFill))
     ChunkMesher.invalidate()   -- no map id: every ring on every map is stale
   end
-  voidFill.last = now
 end
 
 do
@@ -347,7 +354,21 @@ mod.content.render_pipelines:register("voxel", {
     VR.update(dt)
     -- The cache prebuilder is deliberately independent of the active display
     -- mode: an Options-menu press must keep progressing while VOXEL is OFF.
-    DebugOverlay.try("prebuild-tick", CachePrebuild.update)
+    -- An incomplete cache also starts on its own once the overworld is up
+    -- (hands-off: a fresh device needs no menu hunt, and the cooperative
+    -- pump slices keep it off the frame). The covered flag passes through
+    -- to the prebuild pump: while a menu, warp or the title screen hides
+    -- the world, fills use the wider 30ms covered slice -- 3-6x faster
+    -- with nothing visible to hitch.
+    DebugOverlay.try("prebuild-tick", function()
+      local Game = require("src.core.Game")
+      local ow = Game and Game.overworld
+      local covered = Game and Game.stack and Game.stack:top() ~= ow
+      if not cacheGatePending then
+        CachePrebuild.autoStart(Game)
+      end
+      CachePrebuild.update(covered)
+    end)
     -- The DEBUGGER row (and the mod manager's page) write the stored
     -- option; F9 and the SELECT chord flip visibility directly, so the
     -- stored value is only re-applied here when it CHANGES -- never
@@ -713,7 +734,11 @@ local SETTINGS = {
       "on water. FULL",
       "adds the shore;",
       "SKY is sun and",
-      "moon alone." } },
+      "moon alone." },
+    -- Off on Android: the reflective pass's stripes on Mali GPUs are
+    -- unresolved (see Water.onAndroid), so the row is hidden rather than
+    -- offered broken -- Android draws flat water until the fix lands.
+    when = function() return not Water.onAndroid() end },
   -- `full` marks a row FULL does not take away. FULL owns the diorama's own
   -- knobs; what a battle is drawn over, and how it is framed, are not that.
   -- Off the OPTIONS menu while VR is on: the headset REQUIRES staged
@@ -1314,12 +1339,18 @@ local function gateCacheBuild(game)
   CachePrebuild.refresh(game)
   if CachePrebuild.isReady() or not CachePrebuild.available() then return end
   local TextBox = require("src.render.TextBox")
+  cacheGatePending = true
   game.stack:push(TextBox.new(game, "MAP CACHE\nNOT READY.\fBUILD NOW?", nil, {
     defaultNo = true,
     choice = function(yes)
-      if yes and CachePrebuild.start(game) then
-        local Progress = V.require("CachePrebuildScreen")
-        game.stack:push(Progress.new(game))
+      cacheGatePending = false
+      if yes then
+        if CachePrebuild.start(game) then
+          local Progress = V.require("CachePrebuildScreen")
+          game.stack:push(Progress.new(game))
+        end
+      else
+        CachePrebuild.decline()
       end
     end,
   }))

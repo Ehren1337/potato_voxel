@@ -1,5 +1,110 @@
 # Changelog
 
+## [1.7.3] - 2026-08-16
+
+### Fixed: mesh builds froze frames for seconds at a time
+
+- Field logs (Deck, Android 830/740, Windows): cache fills froze the
+  game in 590-1083ms hitches, with a 20.3s single frame and a 37.9s
+  CELADON_CITY build on an Adreno 830. The pump now times every build
+  resume and warns when one runs past 4x its slice, naming the job and
+  phase; the prebuilder's engine map load moved inside the pumped job
+  coroutine (it used to run unmeasured on the update tick); and every
+  finished job reports slices taken, the worst resume gap and overshoot
+  count into the status snapshot's new `build` section -- so a support
+  log says exactly which step needs slicing.
+
+### Changed: prebuild fills run 3-6x faster while hidden
+
+- The prebuild pump now receives the covered flag (menus, warps, the
+  title screen): fills use the wider 30ms slice when nothing visible
+  can hitch instead of always creeping at the 5ms idle slice. A full
+  446-job fill measured 709s at 0.6 jobs/s on an Adreno 740; hidden
+  phases now run several times faster.
+
+### Fixed: boot-time cache handoffs dropped the manifest on every launch
+
+- The engine's Assets boot handoff fires twice on desktop too (Steam
+  Deck log: "cache invalidate ALL" twice, 0.2s apart), dropping the
+  manifest and forcing a cold refill per boot. Boot-time handoffs are
+  now skipped on every platform until the first mesh entry exists; dev
+  hot-reload still lands.
+
+### Fixed: void-fill churn dropped the cache once per change
+
+- trees -> water -> trees in 0.7s invalidated the whole cache twice.
+  Changes now debounce: one invalidation after a one-second settle, or
+  none at all if the value settles back where it started.
+
+### Fixed: SLOW cache loads now say where they hitched
+
+- A 250ms+ cache load inside the budgeted build coroutine is sliced,
+  not a freeze; the same load on the entry frame is the freeze. The
+  SLOW load warning now tags each case (sync / in-build).
+
+### Fixed: the status snapshot lied about storage health
+
+- A successful write now clears the boot's expected failure state: the
+  not_in_playthrough entries from before the playthrough existed no
+  longer poison every later snapshot's storage fields.
+
+### Changed: sample lines drop the dead draws/sw fields
+
+- love.graphics.getStats().drawcalls / canvasswitches are unpopulated
+  on the engine's LOVE builds (draws=0 on every platform while
+  rendering thousands of frames), so the per-sample line reports
+  texture memory only.
+
+### Changed: the cold-cache boot rescan is deferred off the first frame
+
+- The resume-set scan reads ~2 storage records per job (444 jobs =
+  seconds of cold-flash reads on the game.ready frame, the NX boot's
+  3.0s first frame). The scan now runs once, when a build actually
+  starts, never on the boot frame.
+
+### Fixed: support log hitches every 5 seconds on slow flash (Switch)
+
+- The debugger's 5-second sample line forced a storage persist per
+  window, and on Switch flash each write measured ~100ms -- a visible
+  hitch every 5 seconds even with nothing rendering. Persists now
+  measure their own write time and back off the non-forced cadence to
+  30-300s after a slow write. Errors and exports still force through,
+  so crash evidence and manual exports are unchanged; fast storage
+  (desktop) never trips the backoff.
+
+### Added: incomplete mesh cache auto-fills with no user action
+
+- On a fresh device the cache used to stay empty until the player found
+  OPTIONS > PREBUILD CACHE or answered the MAP CACHE prompt -- a
+  controller user could tap the prompt away and never get the fill.
+  Now, once the overworld is up (in-game storage and the save's live
+  options exist), an incomplete cache starts building itself in the
+  background with the same cooperative pump slices as a menu-started
+  build. An explicit cancel, a declined prompt, a FAILED build, a READY
+  cache or a running build all block the auto-start, and the boot
+  scan's survivors are resumed rather than rebuilt.
+
+### Fixed: declining the MAP CACHE prompt no longer starts the fill anyway
+
+- The field log caught the auto-start firing 8 seconds after the player
+  answered NO to the boot gate's "MAP CACHE NOT READY. BUILD NOW?"
+  prompt -- the hands-off fill overrode an explicit decline. A NO now
+  blocks the auto-start for the whole session (sticky through a cache
+  wipe), and a boot whose gate ran at all -- prompt answered or cache
+  ready -- never auto-starts: the fill starts only on a YES, an OPTIONS
+  row press, or a boot where no gate existed. A fresh boot re-arms
+  everything.
+
+### Known issue: Android runs flat water for now
+
+- The reflective water pass renders with hard banded stripes on
+  Mali-family GPUs (the field log's "shadow stripes all the way down"
+  survived every toggle: shadows off, march off, sky only). The
+  lowp-sampler precision fix reduced but did not remove them, so until
+  the shader work lands, Android hides the WATER row and forces the
+  flat water fallback -- a save with WATER set to FULL is ignored there,
+  and the pond looks like the 2D tileset art with no reflections.
+
 ## [1.7.2] - 2026-08-16
 
 ### Changed: logs send every 90 seconds

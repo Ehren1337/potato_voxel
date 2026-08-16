@@ -102,7 +102,31 @@ Water.setting = ModSetting.new(Water.KEY, Water.LABEL,
                                { "off", "sky", "half", "full" },
                                { "OFF", "SKY", "HALF", "FULL" })
 
+-- Android water flag (2026-08-16): the reflective pass renders with hard
+-- banded stripes on Mali-family GPUs -- the lowp-sampler fix did not
+-- fully land (the field log's "shadow stripes all the way down" survived
+-- every toggle). Until the shader is fixed, Android runs the flat water
+-- fallback: the WATER row is hidden and a persisted FULL setting is
+-- ignored. Lazy so the headless suite can flip it mid-run.
+local androidChecked = false
+local android = false
+
+function Water.onAndroid()
+  if Water._androidOverride ~= nil then return Water._androidOverride end
+  if not androidChecked then
+    androidChecked = true
+    local ok, Platform = pcall(require, "src.core.Platform")
+    if ok and type(Platform) == "table" then
+      local okP, info = pcall(Platform.detect)
+      android = okP and type(info) == "table"
+                and tostring(info.os or "") == "Android"
+    end
+  end
+  return android
+end
+
 function Water.level()
+  if Water.onAndroid() then return 0 end
   local v = Water.setting:get()
   if v == "off" then return 0 end
   if v == "sky" then return 1 end
@@ -523,8 +547,13 @@ uniform vec4 fogInfo;
 // the frame as it stood before the water went down, and its depth. The
 // depth sampler is qualified because GLSL ES defaults samplers to LOWP no
 // matter what floats are set to, and eight bits of depth is a march with
-// nothing to land on. The frame copy is honest 8-bit colour and can stay.
-uniform Image reflectTex;
+// nothing to land on. The frame copy is honest 8-bit colour and can stay
+// -- but the SKY RAMP is not: its texels are a smooth gradient, and on
+// Mali-family GPUs LOWP is fixed point, so the reflected sky's bands
+// quantise into the hard steps a field log read as "shadow stripes all
+// the way down". Same precedent, same fix.
+uniform LOVE_HIGHP_OR_MEDIUMP Image reflectTex;
+uniform LOVE_HIGHP_OR_MEDIUMP Image skyRamp;
 uniform LOVE_HIGHP_OR_MEDIUMP Image depthTex;
 
 uniform float rays;          // 0 = sky only, 1 = march the screen too
@@ -554,7 +583,6 @@ uniform float rayThick;
 uniform float edgeFade;
 
 // the sky, as Sky paints it
-uniform Image skyRamp;
 uniform float skyCount;
 uniform float skyEdge;       // the sky's bottom, in canvas pixels
 uniform float skyStart;      // where the checker begins inside a band
@@ -998,8 +1026,11 @@ vec2 waveUV(vec2 tc, vec2 col) {
 // side, with the water falling back to flat. So the qualifier is a define
 // the Lua side fills in, and Water.shader compiles the pinned form first
 // and the bare one only if that is refused. Whichever prototype a runtime
-// brought, one of the two agrees with it.
-vec4 effect(EFFECT_PREC vec4 color, Image tex, EFFECT_PREC vec2 tc,
+// brought, one of the two agrees with it. The RETURN type is pinned the
+// same way: on Mali-family ES compilers a stage-default (highp) return
+// vs the wrapper's mediump-default prototype is a redeclaration error
+// (S0023), even with the parameters matched.
+EFFECT_PREC vec4 effect(EFFECT_PREC vec4 color, Image tex, EFFECT_PREC vec2 tc,
             EFFECT_PREC vec2 sc) {
   // THE DEPTH TEST, done here because the buffer that would have done it is
   // detached for the length of this pass so it can be READ (see the header).

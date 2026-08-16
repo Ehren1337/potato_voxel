@@ -578,13 +578,13 @@ if MeshCache.available() then
   end
 end
 
--- --- Switch: the boot-time Assets handoff must not drop the manifest ----
+-- --- boot-time Assets handoffs must not drop the manifest anywhere -------
 -- The port logs showed "cache invalidate ALL" 18ms after boot, before
 -- save.created: the engine's installLoader -> Assets.invalidate handoff
 -- fired twice, and the second call dropped the manifest, forcing a cold
--- 444-job prebuild on every launch. On Switch, handoff invalidations
--- are ignored until the first mesh entry exists; desktop keeps the
--- historical second-call behavior.
+-- 444-job prebuild on every launch. The Steam Deck logs showed the same
+-- double handoff on desktop. On every platform, handoff invalidations
+-- are ignored until the first mesh entry exists.
 local Assets = require("src.render.Assets")
 local function freshManifestCache()
   MeshCache.configure({ maps = maps, tilesets = {} })
@@ -601,14 +601,20 @@ local function manifestGone()
 end
 
 withOS("OS X", function()
+  ChunkMesher._resetBootHandoffForTests()
   freshManifestCache()
   Assets.invalidate()   -- the boot handoff (or a later one: loadMod may
   Assets.invalidate()   -- have fired the engine's handoff already)
+  T.check(not manifestGone(),
+          "desktop: boot-time invalidations must keep the manifest")
+  ChunkMesher.request(fakeMap, true, {}, false, true)
+  Assets.invalidate()
   T.check(manifestGone(),
-          "desktop: invalidations land once the boot handoff is past")
+          "desktop: invalidation lands once mesh work has started")
 end)
 
 withOS("NX", function()
+  ChunkMesher._resetBootHandoffForTests()
   freshManifestCache()
   Assets.invalidate()
   Assets.invalidate()   -- the observed double boot handoff
@@ -619,6 +625,111 @@ withOS("NX", function()
   T.check(manifestGone(),
           "Switch: invalidation lands once mesh work has started")
 end)
+
+-- --- hands-off auto-start: an incomplete cache fills itself ------------
+-- A fresh device must not depend on the player finding the PREBUILD row
+-- or answering the boot prompt: once the overworld is up (in-game storage
+-- + live options exist), the tick auto-starts the fill. The gate is
+-- exactly the PREBUILD state, so running/cancelled/failed/ready all block
+-- it, and the resume set from the boot scan is respected.
+local stubGame = { data = { maps = maps, tilesets = {} } }
+T.check(not Prebuild.bootstrap(stubGame),
+        "auto-start setup: cache not ready at boot")
+T.eq(Prebuild.status(), "PREBUILD", "auto-start setup: never started")
+T.check(not Prebuild.autoStart(nil),
+        "auto-start needs a game")
+T.check(not Prebuild.autoStart({ data = { maps = maps } }),
+        "auto-start waits for the overworld to exist")
+T.check(not Prebuild.autoStart({ data = { maps = maps },
+                                 overworld = {} }),
+        "auto-start waits for a live map")
+local owGame = { data = { maps = maps, tilesets = {} },
+                 overworld = { map = { id = "A" }, camera = {} } }
+T.check(Prebuild.autoStart(owGame),
+        "incomplete cache auto-starts once the overworld is up")
+local aDone, aTotal, aRunning = Prebuild.progress()
+T.check(aRunning, "auto-started prebuild is running")
+T.eq(aTotal, 4, "auto-started prebuild covers the full job set")
+T.eq(aDone, 1, "auto-start resumes from the boot scan's survivors")
+T.check(not Prebuild.autoStart(owGame),
+        "no second auto-start while a build is running")
+T.check(Prebuild.cancel(), "running auto-started build cancels")
+Prebuild.update()   -- the always-on tick lands the cooperative cancel
+T.check(not Prebuild.autoStart(owGame),
+        "auto-start respects an explicit cancel")
+T.check(Prebuild.wipe(owGame),
+        "wipe re-arms the auto-start gate")
+T.check(Prebuild.autoStart(owGame),
+        "auto-start fires again after a wipe")
+Prebuild.cancel()
+Prebuild.update()   -- land the cancel before the decline block
+
+-- --- the boot prompt's NO must override the auto-start ------------------
+-- The field log caught the fill starting 8 seconds after the player
+-- declined the MAP CACHE prompt: the auto-start never consulted the
+-- answer. decline() records a session-wide block; wipe re-arms it; the
+-- OPTIONS row still starts a build whenever the player wants one.
+T.check(not Prebuild.autoStart(owGame),
+        "setup: declined cache does not auto-start yet")
+T.check(Prebuild.decline(), "declining the boot prompt records the block")
+T.check(not Prebuild.autoStart(owGame),
+        "a declined prompt blocks the auto-start")
+local dDone, dTotal, dRunning = Prebuild.progress()
+T.check(not dRunning, "no build is running after a decline")
+T.eq(dTotal, 4, "the decline leaves the job set intact")
+T.check(Prebuild.start(owGame),
+        "the OPTIONS row still starts a build after a decline")
+T.check(Prebuild.cancel(), "row-started build cancels")
+Prebuild.update()
+T.check(not Prebuild.autoStart(owGame),
+        "still blocked after the row build is cancelled")
+T.check(Prebuild.wipe(owGame),
+        "wipe works after a decline")
+T.check(not Prebuild.autoStart(owGame),
+        "a decline stays sticky through a wipe (no silent fill)")
+
+-- --- the gate's CONTINUE check is itself consent ------------------------
+-- refresh() runs from the boot gate; once it has run, the prompt (or
+-- its ready-skip) answered the fill question and the hands-off
+-- auto-start must not act on that boot at all -- a wipe of a READY
+-- cache mid-session must not silently start a rebuild either.
+Prebuild.bootstrap(owGame)
+T.check(Prebuild.autoStart(owGame),
+        "setup: a boot without the gate still auto-starts")
+Prebuild.cancel()
+Prebuild.update()
+Prebuild.bootstrap(owGame)
+Prebuild.refresh(owGame)
+T.check(not Prebuild.autoStart(owGame),
+        "a boot the gate ran never auto-starts")
+T.check(Prebuild.wipe(owGame), "wipe works after the gate ran")
+T.check(not Prebuild.autoStart(owGame),
+        "wiping a gated boot does not start a silent fill")
+T.check(Prebuild.start(owGame),
+        "the OPTIONS row still starts the rebuild after the wipe")
+Prebuild.cancel()
+Prebuild.update()
+
+-- --- prebuilder map loads ride the pumped job coroutine -----------------
+-- The engine's MapLoader.load used to run on the update tick OUTSIDE the
+-- pump -- the unaccounted freeze behind the field logs' 20.3s frames.
+-- requestMapId queues the job and defers the load into runJob, so the
+-- load is measured and warned like every other slice overshoot.
+ChunkMesher.release("A")
+local loaderRan = false
+ChunkMesher.requestMapId("A", true, {}, false, true, function()
+  loaderRan = true
+  return fakeMap
+end)
+T.check(ChunkMesher.jobPending("A", true),
+        "requestMapId queues the job by map id")
+T.check(not loaderRan,
+        "the map loader does not run until the job is pumped")
+ChunkMesher.release("A")
+T.check(not ChunkMesher.jobPending("A", true),
+        "release cancels a loader-backed job like any other")
+T.eq(ChunkMesher.jobStatus("A", true), "cancelled",
+     "a cancelled loader-backed job records its status")
 
 run.release()
 T.finish("potato_voxel_cache")
