@@ -202,12 +202,33 @@ end
 -- <platform>-<engine>-<mod>-<DD_MM_YYYY> name and the server's per-platform
 -- subfolder both key off it.  Kept stable and folder-safe (lowercase
 -- letters only) so the server never has to sanitise a free-text platform.
+-- L4T (Linux for Tegra -- Ubuntu running on Switch hardware) answers
+-- "Linux" to every OS question, so the OS name alone can never tag a
+-- Switch-under-Linux session. The GPU string still names the chip, and
+-- getRendererInfo is the one hardware witness the sandbox leaves this
+-- mod. A Linux session whose renderer is a Tegra slugs as `switch`: the
+-- same SoC also powers Jetson devkits, which this folds in on purpose --
+-- support triage wants the console, and no other device this mod ships
+-- for draws a Tegra (the Brick's GE8300 keeps its honest `linux`).
+local function tegraRenderer()
+  local ri = health.renderer and health.renderer.renderer
+  if not ri then return false end
+  local s = ("%s %s %s"):format(tostring(ri.name or ""),
+                                 tostring(ri.vendor or ""),
+                                 tostring(ri.device or "")):lower()
+  return s:find("tegra", 1, true) ~= nil
+      or s:find("nv13", 1, true) ~= nil
+      or s:find("gm20", 1, true) ~= nil
+end
+
 local function platformSlug()
   local p = tostring(health.platform or platformName()):lower()
   if p:find("switch") or p:find("nx") then return "switch" end
   if p:find("ios") or p:find("iphone") or p:find("ipad") then return "ios" end
   if p:find("android") then return "android" end
-  if p:find("linux") then return "linux" end
+  if p:find("linux") then
+    return tegraRenderer() and "switch" or "linux"
+  end
   if p:find("windows") or p:find("win") then return "windows" end
   -- The engine names macOS both "OS X" and "macOS" depending on build.
   if p:find("mac") or p:find("os x") or p:find("osx") or p:find("darwin")
@@ -215,6 +236,8 @@ local function platformSlug()
   if p:find("web") or p:find("browser") then return "web" end
   return "unknown"
 end
+
+Overlay._platformSlug = platformSlug   -- named for the suite
 
 -- Identity fields for the remote payload.  The server derives the
 -- filename (<platform>-<engine>-<mod>-<date>.json) and the platform

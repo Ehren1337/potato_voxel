@@ -550,6 +550,42 @@ if brick then
               "the status snapshot carries the VOXEL SETTINGS line")
       DebugOverlay.export(sendGame)
       T.eq(sends, 3, "a consented export sends after the platform capture")
+      -- L4T (Switch hardware running Linux) reports OS=Linux with a
+      -- Tegra renderer; the slug must answer `switch` from the GPU
+      -- witness -- and a non-Tegra Linux handheld (the Brick's GE8300)
+      -- must keep its honest `linux`.
+      do
+        Platform._resetForTests()
+        _G.love = {
+          system = { getOS = function() return "Linux" end },
+          graphics = {
+            getRendererInfo = function()
+              return { name = "OpenGL", vendor = "Mesa",
+                       device = "Tegra X1 (NV13B)", version = "4.5" }
+            end,
+          },
+        }
+        DebugOverlay.captureEnvironment()
+        Platform._resetForTests()
+        _G.love = oldLove
+        T.eq(DebugOverlay._platformSlug(), "switch",
+             "a Tegra renderer under Linux slugs as switch (L4T)")
+        Platform._resetForTests()
+        _G.love = {
+          system = { getOS = function() return "Linux" end },
+          graphics = {
+            getRendererInfo = function()
+              return { name = "OpenGL", vendor = "Mesa",
+                       device = "GE8300", version = "4.5" }
+            end,
+          },
+        }
+        DebugOverlay.captureEnvironment()
+        Platform._resetForTests()
+        _G.love = oldLove
+        T.eq(DebugOverlay._platformSlug(), "linux",
+             "a non-Tegra Linux handheld keeps the linux slug")
+      end
       -- The send is ONE organized JSON document (schema 3): identity
       -- fields at the top (the server names and sorts the file from
       -- them), boot evidence once per session, a ring DELTA, and the
