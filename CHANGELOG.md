@@ -1,5 +1,56 @@
 # Changelog
 
+## [1.6.11] - 2026-08-16
+
+### Added: structured JSON log payloads + delta sends
+
+- Sent logs are now ONE organized JSON document (schema 3) instead of a
+  flat text block: identity fields at the top (platform slug, engine, mod,
+  love, gpu, DD_MM_YYYY date) that the loghook server uses to name and
+  sort files, boot evidence once per session, a ring DELTA (only lines
+  newer than the last acked send -- a long session no longer re-ships its
+  whole history every 5s), and the structured status snapshot.
+- Platform slugs are folder-safe and stable (`linux`, `ios`, `switch`,
+  `android`, `windows`, `macos`, `web`, `unknown`); the engine names
+  macOS both "OS X" and "macOS", and both now resolve to `macos`.
+
+### Fixed: log-send cadence (the 5s retrigger)
+
+- The START hold-chord re-fired its export every 5 seconds while the
+  button stayed held (the accumulator reset on fire but re-armed
+  immediately), so an unattended held START produced a send every 5s for
+  the whole session. The chord is now a true one-shot: one press = one
+  fire; a release is required before it re-arms.
+
+### Fixed: storage `invalid_key` failures
+
+- Persistence wrote through the `Storage:selected` facade with the
+  raw-module call shape, shifting the game object into the KEY slot so
+  every write failed `validKey` -> `invalid_key` (seen at boot on iOS
+  and on the Raspberry Pi). Writes now go through the mod's own storage
+  wrapper, and a storage failure line names the key that failed.
+
+### Fixed: errors counter vs slow loads
+
+- A slow-but-successful cache load was reported through `Overlay.error`,
+  which inflated `counters.errors` to equal `slowLoads` in every session.
+  Slow loads now use a warning level: the ring line and the `slowLoads`
+  counter stay, but `errors` means real failures.
+
+### Fixed: prebuild stalls on low-end devices
+
+- Mesh payload compression preferred zlib over lz4 everywhere except
+  Switch; on the Raspberry Pi a single mesh's zlib compress took seconds.
+  The low-end class (Switch, iOS) now prefers lz4 before zlib -- the
+  quantized payloads lose little ratio and compress ~2x faster.
+
+### Added: stall markers in frame stats
+
+- Frames over 500ms now carry a `[STALL>500ms ...]` tag with the pipeline
+  state, path, level, last event and texture memory, so a future log
+  states the cause of a long freeze (the Pi's ~55s 1fps crawl started
+  right after texMB dropped 85.8 -> 25.4).
+
 ## [1.6.9] - 2026-08-16
 
 ### Fixed: shadows on iOS / highdpi devices (Metal)

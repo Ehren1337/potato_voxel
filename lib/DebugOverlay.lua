@@ -36,9 +36,13 @@ local Overlay = {}
 local MAX_LINES = 20
 local lines = {}         -- the on-screen ring buffer
 local log = {}           -- the recent deduped line ring
+local logSeq = {}        -- parallel monotonic sequence per ring line (delta sends)
 local bootLog = {}       -- first boot lines, kept even after the ring rolls
 local LOG_KEEP = 600
 local BOOT_KEEP = 128
+local seq = 0            -- next ring sequence number
+local lastSentSeq = 0    -- watermark: ring lines with seq > lastSentSeq are unsent
+local bootSent = false   -- boot evidence ships once per session
 local running = true     -- capture starts at boot, even while hidden
 local visible = false    -- F9 only changes panel visibility
 local verbose = true     -- F10: true = all lines, false = important only
@@ -136,8 +140,13 @@ local function stamp(msg)
          math.floor(((clock() % 1) * 1000))) .. " " .. msg
 end
 
+-- Deep enough for the full probe result (shadows.depth.failures[*] is
+-- five levels down); deep data is still bounded, so a pathological table
+-- cannot recurse forever.
+local DATA_COPY_MAX_DEPTH = 8
+
 local function dataCopy(value, depth)
-  if depth and depth > 4 then return tostring(value) end
+  if depth and depth > DATA_COPY_MAX_DEPTH then return tostring(value) end
   if type(value) ~= "table" then
     if type(value) == "number" or type(value) == "string"
        or type(value) == "boolean" then
@@ -189,10 +198,29 @@ local function logText()
   return table.concat(out, "\n")
 end
 
--- Identity header for the remote payload.  The server's filename only
--- carries the client id, so without this a received log cannot be
+-- Platform slug for the remote filename/folder: the send's
+-- <platform>-<engine>-<mod>-<DD_MM_YYYY> name and the server's per-platform
+-- subfolder both key off it.  Kept stable and folder-safe (lowercase
+-- letters only) so the server never has to sanitise a free-text platform.
+local function platformSlug()
+  local p = tostring(health.platform or platformName()):lower()
+  if p:find("switch") or p:find("nx") then return "switch" end
+  if p:find("ios") or p:find("iphone") or p:find("ipad") then return "ios" end
+  if p:find("android") then return "android" end
+  if p:find("linux") then return "linux" end
+  if p:find("windows") or p:find("win") then return "windows" end
+  -- The engine names macOS both "OS X" and "macOS" depending on build.
+  if p:find("mac") or p:find("os x") or p:find("osx") or p:find("darwin")
+     then return "macos" end
+  if p:find("web") or p:find("browser") then return "web" end
+  return "unknown"
+end
+
+-- Identity fields for the remote payload.  The server derives the
+-- filename (<platform>-<engine>-<mod>-<date>.json) and the platform
+-- subfolder from these, so without them a received log cannot be
 -- attributed to an engine build, a mod version, or a session.
-local function headerText()
+local function identityFields()
   local mod = V.mod
   local manifest = mod and mod.manifest
   local ctx = health.storage.context or {}
@@ -205,116 +233,68 @@ local function headerText()
   local ri = health.renderer and health.renderer.renderer
   local gpu = ri and ((tostring(ri.name or "") .. " " .. tostring(ri.device or ""))
     :gsub("%s+$", "")) or "?"
-  return ("-- potato_voxel diagnostic send --\nmod: %s %s\nengine: %s\nlove: %s\nplatform: %s\ngpu: %s\nsession: %s\nframe: %s")
-    :format(tostring(manifest and manifest.name or "potato_voxel"),
-            tostring(manifest and manifest.version or "?"),
-            tostring(ctx.engineVersion or "?"),
-            loveVer, tostring(health.platform or platformName()),
-            gpu, tostring(sessionId), tostring(health.frame))
+  return {
+    platform = platformSlug(),
+    engine = tostring(ctx.engineVersion or "?"),
+    mod = tostring(manifest and manifest.version or "?"),
+    love = loveVer,
+    gpu = gpu,
+  }
 end
 
--- Flat status excerpt.  The ring only covers what has happened since boot,
--- so a send made early in a session would otherwise carry no rendering,
--- prebuild, or cache evidence; the snapshot aggregates all of it.  The
--- playthroughId stays local: the upload adds no identifiers.
-local function snapshotText()
-  local out = {}
-  local function kv(label, value)
-    out[#out + 1] = label .. ": " .. tostring(value)
+-- The organized JSON document the send carries (schema 3).  Top-level
+-- identity fields let the server name and sort the file without parsing
+-- log lines; boot evidence ships once per session; the ring is a delta
+-- (only lines newer than the last acked send); status is the structured
+-- snapshot, not a flat text excerpt.
+local function jsonPayload()
+  local id = identityFields()
+  local out = {
+    schema = 3,
+    session = tostring(sessionId),
+    frame = health.frame,
+    platform = id.platform,
+    engine = id.engine,
+    mod = id.mod,
+    love = id.love,
+    gpu = id.gpu,
+    date = os.date("%d_%m_%Y"),
+  }
+  if not bootSent and #bootLog > 0 then
+    out.boot = {}
+    for _, line in ipairs(bootLog) do out.boot[#out.boot + 1] = line end
   end
-  kv("platform", health.platform or platformName())
-  local c = counters
-  kv("counters", ("jobs=%d errors=%d jobFails=%d cacheHits=%d slowLoads=%d storageFails=%d")
-    :format(c.jobs, c.errors, c.jobFails, c.cacheHits, c.slowLoads, c.storageFails))
-  local p = health.pipeline
-  if p then
-    kv("pipeline", ("availability=%s reason=%s level=%s rendered=%d path=%s")
-      :format(tostring(p.availability), tostring(p.reason), tostring(p.level),
-              p.rendered or 0, tostring(p.lastPath)))
-    if p.lastPathDetail then
-      kv("lastRender", ("renderMs=%s frame=%s")
-        :format(tostring(p.lastPathDetail.renderMs), tostring(p.lastPathFrame)))
+  if #log > 0 then
+    local first = nil
+    for i = 1, #log do
+      if logSeq[i] and logSeq[i] > lastSentSeq then first = i break end
+    end
+    if first then
+      out.ring = {}
+      for i = first, #log do out.ring[#out.ring + 1] = log[i] end
     end
   end
-  -- The GPU and screen behind every render and shadow issue: which
-  -- backend (Metal/GL), which vendor/device, and the DPI scale (a
-  -- fractional scale is where canvas and scissor bugs come from).
-  local env = health.renderer
-  local ri = env and env.renderer
-  if ri then
-    kv("renderer", ("%s %s %s %s"):format(tostring(ri.name or "?"),
-      tostring(ri.vendor or ""), tostring(ri.device or ""),
-      tostring(ri.version or "")))
-  end
-  if env and env.dimensions and env.pixelDimensions
-     and env.dimensions.w and env.dimensions.w > 0 then
-    kv("screen", ("%dx%d dpi=%s"):format(env.dimensions.w, env.dimensions.h,
-      ("%.2f"):format(env.pixelDimensions.w / env.dimensions.w)))
-  end
-  local line = settingsLine()
-  if line then kv("settings", line) end
-  local v = health.capabilities and health.capabilities.voxel
-  if v then
-    local depthFailed = v.depth and (#v.depth.failures or 0) > 0
-    kv("voxel", ("available=%s reason=%s shader=%s precision=%s depth=%s")
-      :format(tostring(v.available), tostring(v.reason),
-              tostring(v.shader and (v.shader.plain and "ok" or "missing") or "?"),
-              tostring(v.shaderPrecision and v.shaderPrecision.plain or "?"),
-              tostring(depthFailed and "failed" or "ok")))
-  end
-  local pr = health.probe and health.probe.result
-  if pr then
-    if pr.shadows then
-      local s = pr.shadows
-      kv("shadows", ("available=%s reason=%s res=%s precision=%s depth=%s sprites=%s aborts=%d")
-        :format(tostring(s.available), tostring(s.reason), tostring(s.resolution),
-                tostring(s.shaderPrecision or "?"),
-                tostring(s.depth and s.depth.binding or "?"),
-                tostring(s.spriteReady == true and "on"
-                         or (s.spriteReady == false and "off" or "?")),
-                (s.passCounts and s.passCounts.aborts) or 0))
-      -- An unavailable pass ships the retained failure text -- which shader
-      -- would not compile, which canvas could not be allocated, what the
-      -- driver said -- instead of a bare unavailable=no.
-      if not s.available then
-        local d = s.depth or {}
-        kv("shadowFail", ("shader=%s canvas=%s depth=%s last=%s")
-          :format(tostring(s.shaderError or s.shaderFallbackError or "?"),
-                  tostring(s.canvasError or "?"),
-                  tostring(d.error or d.fallbackError or "?"),
-                  tostring(s.lastFailure or "?")))
-      end
-      -- A pass that fell back off the explicit depth canvas ships the
-      -- per-format creation errors -- the driver's own words about why
-      -- depth24/depth24stencil8/... were refused. The highdpi dpiscale
-      -- mismatch is the usual suspect; this is what proves it from a log.
-      if s.depth and s.depth.binding ~= "explicit"
-         and s.depth.failures and s.depth.failures[1] then
-        local parts = {}
-        for _, f in ipairs(s.depth.failures) do
-          parts[#parts + 1] = tostring(f.format) .. "=" .. tostring(f.error or "?")
-        end
-        kv("shadowDepthFail", table.concat(parts, " "))
-      end
-    end
-    if pr.cache then
-      kv("cache", ("identity=%s saveFailures=%d")
-        :format(tostring(pr.cache.identity or "?"), pr.cache.saveFailures or 0))
-    end
-    if pr.prebuild then
-      kv("prebuild", ("status=%s %s/%s")
-        :format(tostring(pr.prebuild.status), tostring(pr.prebuild.done),
-                tostring(pr.prebuild.total)))
-    end
-  end
-  kv("worstFrame", worstFrame)
-  local st = health.storage
-  if st then
-    kv("storage", ("state=%s writes=%d failures=%d")
-      :format(tostring(st.state), st.writes or 0, st.failures or 0))
-  end
-  return table.concat(out, "\n")
+  out.status = snapshot()
+  return out
 end
+
+-- The engine's link-protocol JSON encoder (data-only tables, arrays,
+-- strings, numbers, booleans, null).  Resolved once at first send.
+local Json = nil
+local function jsonEncode(v)
+  if Json == nil then
+    local ok, mod = pcall(require, "src.link.Json")
+    Json = ok and mod and mod.encode or false
+  end
+  return Json and Json(v) or nil
+end
+
+-- The structured status object ships inside the JSON payload (the
+-- server stores the organized document as-is).  The ring only covers
+-- what has happened since boot, so a send made early in a session would
+-- otherwise carry no rendering, prebuild, or cache evidence; the
+-- snapshot aggregates all of it.  The playthroughId stays local: the
+-- upload adds no identifiers.
 
 local function managerLog(kind, msg)
   local mod = V.mod
@@ -323,13 +303,16 @@ local function managerLog(kind, msg)
   if fn then pcall(fn, logger, "%s", msg) end
 end
 
-local function storageFailure(op, code, message)
+local function storageFailure(op, code, message, key)
   local detail = tostring(code or message or "unknown")
   if message and code then detail = detail .. ": " .. tostring(message) end
   health.storage.available = false
   health.storage.state = tostring(code or "unavailable")
   health.storage.failures = (health.storage.failures or 0) + 1
+  -- The key is the first thing a support log needs when the state is
+  -- invalid_key: it names WHICH write the engine refused.
   health.storage.lastError = op .. " " .. detail
+    .. (key and (" (key=" .. tostring(key) .. ")") or "")
   -- These are normal before a save is selected or while the title facade is
   -- not bound to a playthrough. Keep the state in the snapshot, but do not
   -- report expected lifecycle unavailability as a storage fault.
@@ -345,13 +328,20 @@ local function storageFailure(op, code, message)
   pcall(print, "[pv-debug] storage " .. health.storage.lastError)
 end
 
+-- Write through the MOD's storage API (mod.storage), never through a
+-- Storage:selected facade: the two have different call shapes.  The
+-- facade's write is function(_, key, value) with the game captured, so
+-- passing (store, game, key, value) as a colon-style call shifts the game
+-- into the KEY slot and every write fails validKey -> invalid_key.  The
+-- mod wrapper (function(_, game, key, value)) is the documented mod API
+-- and the one MeshCache already uses.
 local function storageWrite(store, method, key, value)
   local fn = store and store[method]
   if not fn then return false, "unsupported", method .. " unavailable" end
   local ok, result, code, message = pcall(fn, store, game, key, value)
-  if not ok then return false, "exception", tostring(result) end
+  if not ok then return false, "exception", tostring(result), key end
   if result == false or result == nil then
-    return false, code or "write_failed", message
+    return false, code or "write_failed", message, key
   end
   return true
 end
@@ -362,16 +352,11 @@ local function persist(force)
   lastPersist = c
   local mod = V.mod
   if not (mod and mod.storage) then return end
+  -- Use the MOD's own storage wrapper (mod.storage), never the
+  -- Storage:selected facade: the two have different call shapes (see
+  -- storageWrite). The wrapper resolves the playthrough scope from the
+  -- live game exactly as MeshCache's primary path does.
   local store = mod.storage
-  if mod.storage.selected then
-    local okS, selected, code, message =
-      pcall(mod.storage.selected, mod.storage, game)
-    if okS and selected then
-      store = selected
-    elseif not okS or selected == false then
-      storageFailure("selected", code or "exception", message or selected)
-    end
-  end
   if not store then
     storageFailure("resolve", "storage_unavailable")
     return
@@ -384,22 +369,24 @@ local function persist(force)
       health.storage.available = true
     end
   end
-  local wrote, code, message
+  local wrote, code, message, key
   if store.writeBytes then
-    wrote, code, message = storageWrite(store, "writeBytes", "debug/log", logText())
+    wrote, code, message, key = storageWrite(store, "writeBytes", "debug/log", logText())
   else
-    wrote, code, message = storageWrite(store, "write", "debug/log", logText())
+    wrote, code, message, key = storageWrite(store, "write", "debug/log", logText())
   end
   if not wrote then
-    storageFailure("debug/log", code, message)
+    storageFailure("debug/log", code, message, key or "debug/log")
   else
     health.storage.writes = (health.storage.writes or 0) + 1
     health.storage.available = true
   end
   if store.write then
-    local statusOk, statusCode, statusMessage =
+    local statusOk, statusCode, statusMessage, statusKey =
       storageWrite(store, "write", "debug/status", snapshot())
-    if not statusOk then storageFailure("debug/status", statusCode, statusMessage) end
+    if not statusOk then
+      storageFailure("debug/status", statusCode, statusMessage, statusKey or "debug/status")
+    end
   end
 end
 
@@ -407,9 +394,14 @@ local function append(line)
   lines[#lines + 1] = line
   if #lines > MAX_LINES then table.remove(lines, 1) end
   if #bootLog < BOOT_KEEP then bootLog[#bootLog + 1] = line end
+  seq = seq + 1
   log[#log + 1] = line
+  logSeq[#logSeq + 1] = seq
   if #log > LOG_KEEP then
-    for i = 1, #log - (LOG_KEEP / 2) do table.remove(log, 1) end
+    for i = 1, #log - (LOG_KEEP / 2) do
+      table.remove(log, 1)
+      table.remove(logSeq, 1)
+    end
   end
 end
 
@@ -476,6 +468,18 @@ function Overlay.error(fmt, ...)
   local ok, msg = pcall(string.format, fmt, ...)
   if not ok then msg = tostring(fmt) .. " " .. tostring(msg) end
   emit(msg, "error")
+end
+
+-- A warning: shown and stored like a note, but deliberately NOT counted
+-- as an error.  Slow cache loads and similar performance canaries used to
+-- route through Overlay.error, which made counters.errors equal
+-- counters.slowLoads in every session -- a support log could not tell a
+-- real failure from a slow-but-successful load.  Warnings keep the ring
+-- line and the stored log, but only the dedicated counter moves.
+function Overlay.warn(fmt, ...)
+  local ok, msg = pcall(string.format, fmt, ...)
+  if not ok then msg = tostring(fmt) .. " " .. tostring(msg) end
+  emit(msg, "warn")
 end
 
 -- Public, data-only support snapshot. Callers can serialize this through the
@@ -613,51 +617,45 @@ function Overlay.sendLogs()
   local mod = V.mod
   if not (mod and type(mod.postLog) == "function") then return false end
   if not (mod.manifest and mod.manifest.log_url) then return false end
-  -- Identity header + the persisted-evidence text + the aggregate status
-  -- excerpt, then the explicit-send session summary.  The engine's
-  -- postLog ceiling is 512 KiB since engine PR #1382 (64 KiB before), and
-  -- a long session's ring can exceed either, so the evidence text is
-  -- trimmed -- newest lines kept -- to a budget that always leaves room
-  -- for the header, excerpt and summary.
-  local function buildBody(budget)
-    local body = headerText()
-    local text = logText()
-    if text ~= "" then
-      budget = budget - #body - 3000
-      if #text > budget then
+  -- The organized JSON document (schema 3): identity fields at the top
+  -- (the server names and sorts the file from them), boot evidence once
+  -- per session, a ring DELTA (only lines newer than the last acked
+  -- send), and the structured status snapshot.  The engine's postLog
+  -- ceiling is 512 KiB since engine PR #1382 (64 KiB before); a delta is
+  -- normally <2 KiB, and the first send of a session (boot + full ring)
+  -- still fits the conservative budget.  If the engine rejects the JSON
+  -- as too large, retry once with boot omitted and the ring capped.
+  local function buildBody(slim)
+    local payload = jsonPayload()
+    if slim then
+      payload.boot = nil
+      if payload.ring and #payload.ring > 200 then
         local kept = {}
-        local size = 0
-        for line in text:gmatch("[^\n]+") do
-          kept[#kept + 1] = line
-          size = size + #line + 1
+        for i = #payload.ring - 199, #payload.ring do
+          kept[#kept + 1] = payload.ring[i]
         end
-        local drop = 0
-        while size > budget and drop < #kept - 1 do
-          drop = drop + 1
-          size = size - #kept[drop] - 1
-        end
-        local out = {}
-        for i = drop + 1, #kept do out[#out + 1] = kept[i] end
-        text = table.concat(out, "\n")
-        Overlay.trace("log send: trimmed %d evidence lines to fit the engine ceiling", drop)
+        payload.ring = kept
       end
-      body = body .. "\n" .. text
     end
-    body = body .. "\n-- status excerpt --\n" .. snapshotText()
-    body = body .. "\n" .. stamp("session: " .. tostring(counters.jobs)
-      .. " jobs, " .. tostring(counters.errors) .. " errors")
+    local body = jsonEncode(payload)
+    if not body then
+      Overlay.note("log send failed: JSON encoder unavailable")
+      return nil
+    end
     return body
   end
+  local body = buildBody(false)
+  if not body then return false end
   -- The engine rejects a send by returning nil plus a REASON (too large,
   -- too many in flight, bad URL...); pcall forwards both returns, so the
   -- reason is captured and shown instead of reading as a bare nil.
-  local body = buildBody(400000)
   local ok, handle, reason = pcall(mod.postLog, mod, body, { format = "text" })
   if not ok or not handle and reason and reason:find("too large") then
     -- An engine without PR #1382 caps at 64 KiB: retry once with the
     -- conservative budget before reporting a failure.
     Overlay.trace("log send: payload too large for this engine; retrying trimmed")
-    body = buildBody(48000)
+    body = buildBody(true)
+    if not body then return false end
     ok, handle, reason = pcall(mod.postLog, mod, body, { format = "text" })
   end
   if not ok or not handle then
@@ -665,6 +663,11 @@ function Overlay.sendLogs()
       tostring(handle or reason or "engine rejected the send"))
     return false
   end
+  -- Acknowledged: advance the delta watermark so the next send carries
+  -- only newer lines.  On a failed send the watermark stays put, so the
+  -- next send retries the same delta (at-least-once, same as today).
+  lastSentSeq = seq
+  bootSent = true
   sendHandle = handle
   sendAt = clock()
   Overlay.note("log sent to loghook")
@@ -839,10 +842,37 @@ function Overlay.frame(dt, renderMs)
       end
     end
     local p = health.pipeline
-    Overlay.trace("frame avg %.1fms max %.1fms render avg %.1fms%s%s "
+    -- A frame this long is a stall worth explaining: tag it with the
+    -- evidence that distinguishes a GPU driver freeze (texture memory
+    -- collapsed or re-uploading -- the Raspberry Pi's ~55s 1fps crawl
+    -- started exactly after texMB dropped 85.8 -> 25.4) from a mesh or
+    -- storage hitch, so the next support log states its cause.
+    local stall = ""
+    if statsMax > 500 then
+      local tex = ""
+      if love and love.graphics and love.graphics.getStats then
+        local okS, st = pcall(love.graphics.getStats)
+        if okS and st then
+          tex = (" texMB=%.1f"):format((st.texturememory or 0) / 1048576)
+        end
+      end
+      local lastEvent = health.lastEvent
+      local lastEventText = "none"
+      if type(lastEvent) == "table" then
+        lastEventText = tostring(lastEvent.mapId or lastEvent.name or lastEvent.kind or "?")
+      elseif lastEvent ~= nil then
+        lastEventText = tostring(lastEvent)
+      end
+      stall = (" [STALL>500ms %s %s path=%s level=%s lastEvent=%s]")
+        :format(tostring(p.availability), tostring(p.reason),
+                tostring(p.lastPath), tostring(p.level),
+                lastEventText) .. tex
+    end
+    Overlay.trace("frame avg %.1fms max %.1fms render avg %.1fms%s%s%s "
                   .. "pipeline avail=%s reason=%s updates=%d draws=%d path=%s",
                   avg, statsMax, renderAvg, gpu,
                   statsMax > 40 and " [HITCH]" or "",
+                  stall,
                   tostring(p.availability), tostring(p.reason),
                   p.updateCalls, p.drawWorldCalls, tostring(p.lastPath))
     statsFrames, statsTime, statsMax, statsRender = 0, 0, 0, 0

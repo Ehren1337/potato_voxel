@@ -39,6 +39,16 @@ function P.isIOS()
   return ok and type(info) == "table" and info.os == "iOS"
 end
 
+-- The constrained-device class this build targets: console (Switch) and
+-- mobile (iOS).  Compression and render-budget decisions use this to pick
+-- the fast path (lz4 before zlib) where a multi-hundred-ms zlib stall on
+-- a big payload would otherwise land on a device that can least afford
+-- it.  Desktop and the desktop-adjacent ports keep the historical
+-- zstd -> zlib -> lz4 chain.
+function P.lowEnd()
+  return P.isSwitch() or P.isIOS()
+end
+
 -- Tests swap the OS the engine module answers between cases; the engine
 -- module caches its answer, so the reset is forwarded for symmetry with
 -- the engine API.

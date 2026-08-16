@@ -580,13 +580,14 @@ local function packPayload(fp, body)
       return header(fp, COMPRESSED_FORMAT, #body, #packed, 0, ZSTD_CODEC)
              .. packed
     end
-    -- On Switch zstd is absent and zlib's compress is a multi-hundred-ms
-    -- main-thread stall per big payload; the same prebuild tail ran ~2x
-    -- faster with lz4 than with zlib in the Switch-port logs (zlib vs
-    -- lz4 manifests). The payloads are quantized (already entropy-coded),
-    -- so lz4's weaker ratio costs little -- prefer it before zlib there.
-    -- Everywhere else the chain stays zstd -> zlib -> lz4.
-    if Platform.isSwitch() then
+    -- On low-end platforms zstd is often absent and zlib's compress is a
+    -- multi-hundred-ms main-thread stall per big payload; the same
+    -- prebuild tail ran ~2x faster with lz4 than with zlib in the
+    -- Switch-port logs (zlib vs lz4 manifests). The payloads are
+    -- quantized (already entropy-coded), so lz4's weaker ratio costs
+    -- little -- prefer it before zlib on the constrained class (Switch,
+    -- iOS). Everywhere else the chain stays zstd -> zlib -> lz4.
+    if Platform.lowEnd() then
       ok, packed = pcall(data.compress, "string", "lz4", body)
       if ok and type(packed) == "string" and #packed < #body then
         return header(fp, COMPRESSED_FORMAT, #body, #packed, 0, LZ4_CODEC)
@@ -1308,7 +1309,9 @@ function MeshCache.loadTerrain(map, slot)
                    tostring(map.id), tostring(slot), ms, mesh.n or 0)
       if ms and ms > 250 then
         Overlay.count("slowLoads")
-        Overlay.error("SLOW load terrain %s/%s: %dms", tostring(map.id),
+        -- A warning, not an error: a slow-but-successful load must not
+        -- inflate counters.errors (it never did before the counter split).
+        Overlay.warn("SLOW load terrain %s/%s: %dms", tostring(map.id),
                      tostring(slot), ms)
       end
     end

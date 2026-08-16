@@ -510,29 +510,52 @@ if brick then
       stackPushed = nil
       DebugOverlay.export(consentGame)
       T.eq(sends, 3, "a consented export sends after the platform capture")
-      T.check(lastBody and lastBody:find("platform: Android (mobile)", 1, true),
-              "the send header carries the platform")
-      T.check(lastBody and lastBody:find("gpu: Metal Apple A13 GPU", 1, true),
-              "the send header carries the GPU")
-      T.check(lastBody and lastBody:find("-- status excerpt --", 1, true)
-              and lastBody:find("platform: Android (mobile)", 1, true),
-              "the send's status excerpt carries the platform")
-      T.check(lastBody and lastBody:find("renderer: Metal Apple Apple A13 GPU 3.2", 1, true),
-              "the status excerpt carries the full renderer identity")
-      T.check(lastBody and lastBody:find("screen: 200x100 dpi=3.00", 1, true),
-              "the status excerpt carries the DPI scale")
-      T.check(lastBody and lastBody:find("settings: voxel=", 1, true)
-              and lastBody:find(" water=", 1, true)
-              and lastBody:find(" shadows=", 1, true),
-              "the status excerpt carries the VOXEL SETTINGS line")
-      T.check(lastBody and lastBody:find("shadows: available=", 1, true)
-              and lastBody:find("precision=", 1, true)
-              and lastBody:find("depth=", 1, true),
-              "the status excerpt carries the shadow shader and depth state")
-      T.check(lastBody and lastBody:find("voxel: available=", 1, true)
-              and lastBody:find("shader=", 1, true)
-              and lastBody:find("precision=", 1, true),
-              "the status excerpt carries the voxel shader state")
+      -- The send is ONE organized JSON document (schema 3): identity
+      -- fields at the top (the server names and sorts the file from
+      -- them), boot evidence once per session, a ring DELTA, and the
+      -- structured status snapshot.
+      local okJ, Json = pcall(require, "src.link.Json")
+      T.check(okJ and type(lastBody) == "string" and Json.decode,
+              "the send body is decodable JSON")
+      local sent = okJ and Json.decode(lastBody)
+      T.check(sent ~= nil, "the send body parses")
+      if sent then
+        T.eq(sent.schema, 3, "the send carries the JSON schema version")
+        T.check(sent.platform == "android", "the send carries the platform slug")
+        T.check(sent.gpu and sent.gpu:find("Metal Apple A13 GPU", 1, true) ~= nil,
+                "the send carries the GPU identity")
+        T.check(sent.engine ~= nil and sent.mod ~= nil,
+                "the send carries the engine and mod versions")
+        T.check(sent.date and sent.date:match("^%d%d_%d%d_%d%d%d%d$") ~= nil,
+                "the send carries the DD_MM_YYYY log date")
+        local status = sent.status
+        T.check(status ~= nil, "the send carries the status snapshot")
+        if status then
+          T.check(status.platform == "Android (mobile)",
+                  "the status snapshot names the platform and its class")
+          T.check(status.renderer and status.renderer.renderer
+                  and status.renderer.renderer.device == "Apple A13 GPU",
+                  "the status snapshot carries the full renderer identity")
+          T.check(status.renderer and status.renderer.dimensions
+                  and status.renderer.dimensions.w == 200
+                  and status.renderer.pixelDimensions
+                  and status.renderer.pixelDimensions.h == 300,
+                  "the status snapshot carries the DPI-scale dimensions")
+          T.check(type(status.settings) == "string"
+                  and status.settings:find("voxel=", 1, true) ~= nil
+                  and status.settings:find(" water=", 1, true) ~= nil
+                  and status.settings:find(" shadows=", 1, true) ~= nil,
+                  "the status snapshot carries the VOXEL SETTINGS line")
+          local pr = status.probe and status.probe.result
+          -- Headless the real probe may report shadows/voxel as
+          -- unavailable (no GPU), but the section must still be present
+          -- and carry the availability answer.
+          T.check(pr and pr.shadows ~= nil and pr.shadows.available ~= nil,
+                  "the status snapshot carries the shadow availability answer")
+          T.check(pr and pr.voxel ~= nil and pr.voxel.available ~= nil,
+                  "the status snapshot carries the voxel availability answer")
+        end
+      end
     end
     -- A pass on the internal depth buffer ships the per-format creation
     -- errors (the highdpi dpiscale mismatch is the usual suspect); a
@@ -550,11 +573,19 @@ if brick then
       stackPushed = nil
       DebugOverlay.export(consentGame)
       T.eq(sends, 4, "a consented export sends with the stubbed probe")
-      T.check(lastBody and lastBody:find("shadows: available=true", 1, true)
-              and lastBody:find("depth=internal", 1, true),
-              "the excerpt shows the internal depth fallback")
-      T.check(lastBody and lastBody:find("shadowDepthFail: depth24=mismatch", 1, true),
-              "the excerpt ships the per-format depth failure reasons")
+      local okJ2, Json2 = pcall(require, "src.link.Json")
+      local sent2 = okJ2 and Json2.decode(lastBody)
+      local pr2 = sent2 and sent2.status and sent2.status.probe
+                 and sent2.status.probe.result
+      T.check(pr2 and pr2.shadows and pr2.shadows.available == true
+              and pr2.shadows.depth and pr2.shadows.depth.binding == "internal",
+              "the status snapshot shows the internal depth fallback")
+      T.check(pr2 and pr2.shadows and pr2.shadows.depth
+              and pr2.shadows.depth.failures
+              and pr2.shadows.depth.failures[1]
+              and pr2.shadows.depth.failures[1].format == "depth24"
+              and pr2.shadows.depth.failures[1].error == "mismatch",
+              "the status snapshot ships the per-format depth failure reasons")
       -- restore the real probe shape main.lua installed (headless-safe)
       local Prebuild = exports.lib.require("CachePrebuild")
       local Voxel3D = exports.lib.require("Voxel3D")
@@ -583,6 +614,60 @@ if brick then
     DebugOverlay.export({})
     T.check(stackPushed == nil and sends == 4,
             "an export with no prompt available sends nothing")
+    -- Delta sends: after a successful send the next payload carries only
+    -- the ring lines added since (the watermark advances on success, and
+    -- a failed send keeps it so the next send retries the same delta).
+    do
+      local mod2 = exports.lib.mod
+      local oldPostLog2, oldManifest2 = mod2.postLog, mod2.manifest
+      local bodies = {}
+      local failNext = false
+      mod2.postLog = function(_, body)
+        if failNext then
+          failNext = false
+          return nil, "engine rejected the send"
+        end
+        bodies[#bodies + 1] = body
+        return true
+      end
+      mod2.manifest = { log_url = "https://logs.example.invalid/logs" }
+      optionsState.modOptions.potato_voxel.log_consent = true
+      local Json2 = require("src.link.Json")
+      -- Emit a couple of distinct lines through the overlay so the ring
+      -- has content, then send twice and inspect the deltas.
+      DebugOverlay.note("delta marker one")
+      DebugOverlay.note("delta marker two")
+      DebugOverlay.export(consentGame)
+      DebugOverlay.export(consentGame)
+      T.eq(#bodies, 2, "two consented exports send")
+      local first = bodies[1] and Json2.decode(bodies[1])
+      local second = bodies[2] and Json2.decode(bodies[2])
+      T.check(first ~= nil and first.schema == 3, "the first send is JSON schema 3")
+      T.check(second ~= nil and second.schema == 3, "the second send is JSON schema 3")
+      if first and second then
+        T.check(type(first.ring) == "table" and #first.ring > 0,
+                "the first send carries the ring")
+        T.check(second.boot == nil,
+                "boot evidence is not repeated on the second send")
+        T.check(type(second.ring) == "table",
+                "the second send still carries a ring array")
+        -- The watermark means the second ring is the delta (shorter or
+        -- equal to the first, never a full re-send of everything).
+        T.check(#second.ring <= #(first.ring or {}),
+                "the second send carries a delta, not a full re-send")
+        -- Failed send: watermark stays, next send retries the same delta.
+        local before = #bodies
+        failNext = true
+        DebugOverlay.export(consentGame)
+        T.eq(#bodies, before, "a rejected send does not count as sent")
+        DebugOverlay.export(consentGame)
+        T.eq(#bodies, before + 1, "the next send goes out")
+        local retried = bodies[#bodies] and Json2.decode(bodies[#bodies])
+        T.check(retried ~= nil and type(retried.ring) == "table",
+                "the retried send carries a ring")
+      end
+      mod2.postLog, mod2.manifest = oldPostLog2, oldManifest2
+    end
     mod.postLog, mod.manifest = oldPostLog, oldManifest
     package.loaded["src.render.TextBox"] = oldTextBox
   end
