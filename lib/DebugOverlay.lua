@@ -284,6 +284,18 @@ local function snapshotText()
                   tostring(d.error or d.fallbackError or "?"),
                   tostring(s.lastFailure or "?")))
       end
+      -- A pass that fell back off the explicit depth canvas ships the
+      -- per-format creation errors -- the driver's own words about why
+      -- depth24/depth24stencil8/... were refused. The highdpi dpiscale
+      -- mismatch is the usual suspect; this is what proves it from a log.
+      if s.depth and s.depth.binding ~= "explicit"
+         and s.depth.failures and s.depth.failures[1] then
+        local parts = {}
+        for _, f in ipairs(s.depth.failures) do
+          parts[#parts + 1] = tostring(f.format) .. "=" .. tostring(f.error or "?")
+        end
+        kv("shadowDepthFail", table.concat(parts, " "))
+      end
     end
     if pr.cache then
       kv("cache", ("identity=%s saveFailures=%d")

@@ -387,8 +387,10 @@ local function newDepth(w, h)
   local c = nil
   depthFailures = {}
   for _, format in ipairs(DEPTH_FORMATS) do
+    -- dpiscale = 1, or the depth attachment mismatches its colour canvas
+    -- on a highdpi surface (iOS/Android) and the bind is rejected.
     local ok, made = pcall(love.graphics.newCanvas, w, h,
-                           { format = format, readable = true })
+                           { format = format, readable = true, dpiscale = 1 })
     if ok and made then c = made break end
     depthFailures[#depthFailures + 1] = {
       format = format,

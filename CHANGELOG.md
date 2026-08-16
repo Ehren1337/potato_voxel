@@ -1,5 +1,27 @@
 # Changelog
 
+## [1.6.9] - 2026-08-16
+
+### Fixed: shadows on iOS / highdpi devices (Metal)
+
+- The shadow map's explicit depth canvas was created without
+  `dpiscale = 1`. On a highdpi surface (iOS/Android) `newCanvas`
+  defaults to the surface scale, so a 1024 depth attachment came out
+  2048 physical pixels while the packed colour map stayed 1024 -- a
+  mismatched attachment pair that Metal rejects, silently dropping the
+  pass to the internal depth buffer and leaving the fill with an
+  uncleared depth test. Result: wrong shadow regions ("shadows across
+  half the screen"), detached shadows, and broken character shadow
+  decals on iOS. The depth canvas now matches the colour canvas (the
+  same `dpiscale = 1` PixelCanvas/TerrainAtlas/BattlePics fix, applied
+  to the one creation site that had missed it), in ShadowMap and in the
+  scene's own depth canvas.
+- The shadow fill now clears its depth buffer explicitly (the clear
+  call had left the depth buffer untouched, relying on the driver).
+- Sent logs now carry `shadowDepthFail:` -- the per-format depth-canvas
+  creation errors -- whenever the pass is on the internal depth
+  fallback, so a future regression states its cause in the log.
+
 ## [1.6.8] - 2026-08-16
 
 ### Cache (Switch)
@@ -31,7 +53,9 @@
   restarts stay warm; real invalidations still land the moment any mesh
   work starts.
 - `deleteKey` now returns the storage call's real result instead of
-  swallowing it; no caller's behavior changes off-Switch.## [1.6.7] - 2026-08-16
+  swallowing it; no caller's behavior changes off-Switch.
+
+## [1.6.7] - 2026-08-16
 
 ### Diagnostics
 

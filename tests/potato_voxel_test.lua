@@ -534,6 +534,41 @@ if brick then
               and lastBody:find("precision=", 1, true),
               "the status excerpt carries the voxel shader state")
     end
+    -- A pass on the internal depth buffer ships the per-format creation
+    -- errors (the highdpi dpiscale mismatch is the usual suspect); a
+    -- stubbed probe drives that path headlessly.
+    do
+      DebugOverlay.setProbe(function()
+        return { shadows = {
+          available = true, reason = "ready", resolution = 1024,
+          shaderPrecision = "mediump",
+          depth = { binding = "internal",
+                    failures = { { format = "depth24", error = "mismatch" } } },
+          spriteReady = false, passCounts = { aborts = 0 } } }
+      end)
+      DebugOverlay.runProbe()
+      stackPushed = nil
+      DebugOverlay.export(consentGame)
+      T.eq(sends, 4, "a consented export sends with the stubbed probe")
+      T.check(lastBody and lastBody:find("shadows: available=true", 1, true)
+              and lastBody:find("depth=internal", 1, true),
+              "the excerpt shows the internal depth fallback")
+      T.check(lastBody and lastBody:find("shadowDepthFail: depth24=mismatch", 1, true),
+              "the excerpt ships the per-format depth failure reasons")
+      -- restore the real probe shape main.lua installed (headless-safe)
+      local Prebuild = exports.lib.require("CachePrebuild")
+      local Voxel3D = exports.lib.require("Voxel3D")
+      local ShadowMap = exports.lib.require("ShadowMap")
+      DebugOverlay.setProbe(function()
+        local done, total, running, eta = Prebuild.progress()
+        return {
+          voxel = Voxel3D.diagnostics(),
+          shadows = ShadowMap.diagnostics(),
+          cache = { identity = "restored", saveFailures = 0 },
+          prebuild = { status = "x", done = done, total = total },
+        }
+      end)
+    end
     -- NO sends nothing and leaves the flag unset, so the next export
     -- asks again.
     optionsState.modOptions.potato_voxel.log_consent = nil
@@ -541,12 +576,12 @@ if brick then
     DebugOverlay.export(consentGame)
     T.check(stackPushed ~= nil, "an unconsented export asks again")
     stackPushed.opts.choice(false)
-    T.eq(sends, 3, "a declined prompt sends nothing")
+    T.eq(sends, 4, "a declined prompt sends nothing")
     T.check(not DebugOverlay.consent(), "declining leaves the flag unset")
     -- No UI to ask on: refuse rather than ship logs silently.
     stackPushed = nil
     DebugOverlay.export({})
-    T.check(stackPushed == nil and sends == 3,
+    T.check(stackPushed == nil and sends == 4,
             "an export with no prompt available sends nothing")
     mod.postLog, mod.manifest = oldPostLog, oldManifest
     package.loaded["src.render.TextBox"] = oldTextBox

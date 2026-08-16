@@ -334,8 +334,14 @@ local function getDepthCanvas(res)
     return nil
   end
   for _, format in ipairs(DEPTH_FORMATS) do
+    -- dpiscale = 1, or the attachment mismatches the colour canvas on a
+    -- highdpi surface (iOS/Android): newCanvas defaults dpiscale to the
+    -- surface's, so a 1024 depth canvas is 2048 physical there while the
+    -- packed map is 1024 -- Metal rejects the mismatched bind and the
+    -- pass silently falls back to the internal depth (the BattlePics
+    -- bug, one file earlier). Desktop never saw it: dpiscale is 1 there.
     local ok, made = pcall(love.graphics.newCanvas, res, res,
-                           { format = format })
+                           { format = format, dpiscale = 1 })
     if ok and made then
       depthCanvas = made
       depthCanvasRes = res
@@ -891,8 +897,10 @@ function ShadowMap.begin(cx, cy, vw, vh, sprites)
   local setupOk, setupErr = pcall(function()
     prevBlend, prevAlphaMode = love.graphics.getBlendMode()
     -- white clears to depth 1 + 1/255, past the far plane: a texel nothing
-    -- was drawn into can never shadow anything
-    love.graphics.clear(1, 1, 0, 1, true, true)
+    -- was drawn into can never shadow anything. The seventh argument is
+    -- the depth clear: the fill's depth test depends on a fresh buffer,
+    -- and Metal does not initialise one the way OpenGL drivers do.
+    love.graphics.clear(1, 1, 0, 1, true, true, true)
     love.graphics.setDepthMode("lequal", true)
     love.graphics.setMeshCullMode("none")
     -- replace, not alpha blend: these are packed numbers, not colors
