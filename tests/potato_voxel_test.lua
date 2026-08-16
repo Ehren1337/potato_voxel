@@ -734,11 +734,11 @@ if brick then
     T.check(DebugOverlay.sendingAllowed(), "the toggle reads the stored ON")
     DebugOverlay.export(sendGame)
     T.eq(sends, 5, "turning LOGS TO DEV back ON restores sending")
-    -- The automatic send: every 15 minutes (900 s) of accumulated game
-    -- time the frame tick ships the log with no keypress. The schedule
-    -- is a next-deadline, so a skipped interval fires at the first tick
-    -- past it -- and OFF silences it like every other send. The fake
-    -- fetch settles each handle so the next interval can send.
+    -- The automatic send: every 90 seconds of accumulated game time the
+    -- frame tick ships the log with no keypress. The schedule is a
+    -- next-deadline, so a skipped interval fires at the first tick past
+    -- it -- and OFF silences it like every other send. The fake fetch
+    -- settles each handle so the next interval can send.
     do
       mod.fetch = {
         poll = function() return { status = "ok" } end,
@@ -746,15 +746,15 @@ if brick then
         cancel = function() end,
       }
       optionsState.modOptions.potato_voxel.send_logs = false
-      DebugOverlay.frame(900)
+      DebugOverlay.frame(90)
       T.eq(sends, 5, "the auto-send respects LOGS TO DEV OFF")
       optionsState.modOptions.potato_voxel.send_logs = true
       DebugOverlay.frame(0.01)
-      T.eq(sends, 6, "the frame tick auto-sends once 15 minutes of game time pass")
-      DebugOverlay.frame(899.99)
-      T.eq(sends, 6, "the next interval needs its own 15 minutes of game time")
+      T.eq(sends, 6, "the frame tick auto-sends once 90 seconds of game time pass")
+      DebugOverlay.frame(89.99)
+      T.eq(sends, 6, "the next interval needs its own 90 seconds of game time")
       DebugOverlay.frame(0.01)
-      T.eq(sends, 7, "the auto-send repeats every 15 minutes of game time")
+      T.eq(sends, 7, "the auto-send repeats every 90 seconds of game time")
       mod.fetch = oldFetch
     end
     -- Delta sends: after a successful send the next payload carries only

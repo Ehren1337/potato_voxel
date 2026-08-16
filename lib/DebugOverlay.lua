@@ -800,7 +800,7 @@ end
 -- already in flight, or an engine without an endpoint all skip it, and
 -- the schedule is expressed as a next-deadline so a skipped interval
 -- fires at the next opportunity rather than backing up.
-Overlay.autoSendEvery = 900
+Overlay.autoSendEvery = 90
 local autoSendElapsed = 0
 local nextAutoAt = Overlay.autoSendEvery
 
