@@ -51,6 +51,7 @@
 local V = ...
 
 local Assets = require("src.render.Assets")
+local Platform = V.require("Platform")
 local Structures = V.require("Structures")
 local TileShape = V.require("TileShape")
 local Voxel3D = V.require("Voxel3D")
@@ -948,11 +949,17 @@ end
 
 -- ------------------------------------------------------------- the cache
 
+-- True once any map has created a mesh entry. The Assets boot-handoff
+-- guard below uses it to tell "engine still booting" from "real asset
+-- change" on Switch (see the guard for why that platform needs it).
+local builtAnything = false
+
 local function entry(id)
   local c = cache[id]
   if not c then
     c = {}
     cache[id] = c
+    builtAnything = true
   end
   return c
 end
@@ -1663,6 +1670,16 @@ Assets.register(function()
     bootAssetsHandedOff = true
     return
   end
+  -- On Switch the engine's installLoader -> Assets.invalidate handoff
+  -- has been observed to fire TWICE at boot: the guard above skips only
+  -- the first, and the second drops the manifest and forces a cold
+  -- 444-job prebuild on every launch (port log: "cache invalidate ALL"
+  -- 18ms after boot, before save.created). No map can have meshed at
+  -- that point, so skip handoffs until the first real entry exists --
+  -- a boot-time handoff is never that, and Switch cannot hot-reload
+  -- assets during boot anyway. The moment any mesh work starts the
+  -- guard releases, so genuine invalidations still land.
+  if Platform.isSwitch() and not builtAnything then return end
   ChunkMesher.invalidate()
 end)
 

@@ -19,9 +19,34 @@ local fakeGame = { save = { options = optionsState },
                    writeOptions = function() end }
 local Prebuild = exports.lib.require("CachePrebuild")
 local MeshCache = exports.lib.require("MeshCache")
+local ChunkMesher = exports.lib.require("ChunkMesher")
 local Brick = exports.brick
 local Battles = exports.lib.require("OverworldBattle")
 local QualityMode = exports.lib.require("QualityMode")
+
+-- Platform switching for the Switch-gated cache fixes: stub the OS the
+-- engine Platform module answers, exactly like the main suite does, and
+-- restore afterwards. The mod's own Platform wrapper has no state of its
+-- own (it forwards to the engine module), so only the engine cache needs
+-- the reset.
+local EnginePlatform = require("src.core.Platform")
+local function withOS(osName, fn)
+  local oldLove = _G.love
+  _G.love = oldLove or {}
+  _G.love.system = _G.love.system or {}
+  local oldOS = _G.love.system.getOS
+  _G.love.system.getOS = function() return osName end
+  EnginePlatform._resetForTests()
+  local ok, err = pcall(fn)
+  EnginePlatform._resetForTests()
+  -- Restore the shim's real getOS: _G.love is the SDK's SHARED love
+  -- table, so mutating it in place and only restoring the reference
+  -- leaks the stub to every later test (a leaked "NX" flipped the
+  -- off-Switch codec assertions on CI).
+  _G.love.system.getOS = oldOS
+  _G.love = oldLove
+  if not ok then error(err, 0) end
+end
 
 if Brick and Brick.isBrick() then
   T.eq(Brick.battleRenderScale(), 1.0,
@@ -209,6 +234,41 @@ if MeshCache.available() then
           and fakeStore.peekBytes()["maps/A/body/aux"] == nil,
           "wipe cache removes all payload variants")
 
+  -- --- Switch: a wipe that does not land is reported, not swallowed -----
+  -- The Switch-port logs showed deletes no-oping while reporting
+  -- success: after WIPE CACHE the prebuild restarted from zero (manifest
+  -- and metas gone) yet the old payloads kept serving cache hits. On
+  -- Switch the wipe verifies by read-back and answers false (plus a
+  -- storage-fail count) when keys survive; every other platform keeps
+  -- the historical fire-and-forget behavior.
+  local realDelete = fakeStore.delete
+  fakeStore.delete = function() return true end   -- a delete that no-ops
+  MeshCache.saveTerrain(fakeMap, "body", nil, 0)
+  MeshCache.saveWater(fakeMap, "body", nil, 0)
+  MeshCache.saveAux(fakeMap, "body", { figures = {} })
+  withOS("OS X", function()
+    T.check(MeshCache.wipe({ { id = "A", slot = "body" } }),
+            "off-Switch: wipe behavior unchanged when delete no-ops")
+    T.check(fakeStore.peekBytes()["maps/A/body/terrain"] ~= nil,
+            "off-Switch: surviving payload is not the wipe's problem")
+  end)
+  MeshCache.saveTerrain(fakeMap, "body", nil, 0)
+  MeshCache.saveWater(fakeMap, "body", nil, 0)
+  MeshCache.saveAux(fakeMap, "body", { figures = {} })
+  withOS("NX", function()
+    T.check(not MeshCache.wipe({ { id = "A", slot = "body" } }),
+            "Switch: wipe reports false when keys survive delete")
+    T.check(fakeStore.peekBytes()["maps/A/body/terrain"] ~= nil,
+            "Switch: surviving payload kept (delete really no-oped)")
+  end)
+  fakeStore.delete = realDelete
+  withOS("NX", function()
+    T.check(MeshCache.wipe({ { id = "A", slot = "body" } }),
+            "Switch: wipe reports true when delete actually lands")
+    T.check(fakeStore.peekBytes()["maps/A/body/terrain"] == nil,
+            "Switch: clean wipe removes the payloads")
+  end)
+
   local oldLove = love
   local testLove = oldLove or {}
   local oldData = testLove.data
@@ -300,6 +360,47 @@ if MeshCache.available() then
           "zlib cache reports READY from summaries")
   T.eq(MeshCache.codec(), "zlib",
        "cache status identifies the zlib codec")
+
+  -- --- Switch: lz4 preferred over zlib when zstd is absent --------------
+  -- The Switch-port logs showed the same prebuild tail running ~2x
+  -- faster with lz4 (codec lz4 manifest) than with zlib (codec zlib
+  -- manifest). With both zlib and lz4 available and no zstd, desktop
+  -- keeps the zlib preference; on Switch packPayload must pick lz4.
+  local function codecByte(bytes)
+    if not bytes then return nil end
+    return bytes:byte(9 + (bytes:byte(5) + bytes:byte(6) * 256
+                           + bytes:byte(7) * 65536
+                           + bytes:byte(8) * 16777216))
+  end
+  testLove.data.compress = function(_, format, body)
+    if format ~= "zlib" and format ~= "lz4" then return nil end
+    serial = serial + 1
+    local key = "dual" .. serial
+    packed[key] = body
+    return key
+  end
+  MeshCache.saveTerrain(fakeMap, "body", vertices, 128)
+  MeshCache.saveWater(fakeMap, "body", nil, 0)
+  MeshCache.saveAux(fakeMap, "body", { figures = {} })
+  T.eq(codecByte(fakeStore.peekBytes()["maps/A/body/terrain"]), 3,
+       "off-Switch: zlib still wins over lz4 when both are available")
+  T.check(MeshCache.ready({ { id = "A", slot = "body" } }),
+          "dual-codec cache reports READY (off-Switch)")
+  T.eq(MeshCache.codec(), "zlib",
+       "off-Switch: codec status stays zlib")
+  MeshCache.wipe({ { id = "A", slot = "body" } })
+  withOS("NX", function()
+    MeshCache.saveTerrain(fakeMap, "body", vertices, 128)
+    MeshCache.saveWater(fakeMap, "body", nil, 0)
+    MeshCache.saveAux(fakeMap, "body", { figures = {} })
+    T.eq(codecByte(fakeStore.peekBytes()["maps/A/body/terrain"]), 1,
+         "Switch: lz4 preferred over zlib when zstd is absent")
+    T.check(MeshCache.ready({ { id = "A", slot = "body" } }),
+            "dual-codec cache reports READY (Switch)")
+    T.eq(MeshCache.codec(), "lz4",
+         "Switch: codec status identifies lz4")
+    MeshCache.wipe({ { id = "A", slot = "body" } })
+  end)
 
   testLove.data = oldData
   _G.love = oldLove
@@ -476,6 +577,48 @@ if MeshCache.available() then
     MeshCache.wipe(jobSet)
   end
 end
+
+-- --- Switch: the boot-time Assets handoff must not drop the manifest ----
+-- The port logs showed "cache invalidate ALL" 18ms after boot, before
+-- save.created: the engine's installLoader -> Assets.invalidate handoff
+-- fired twice, and the second call dropped the manifest, forcing a cold
+-- 444-job prebuild on every launch. On Switch, handoff invalidations
+-- are ignored until the first mesh entry exists; desktop keeps the
+-- historical second-call behavior.
+local Assets = require("src.render.Assets")
+local function freshManifestCache()
+  MeshCache.configure({ maps = maps, tilesets = {} })
+  MeshCache.begin()
+  MeshCache.saveTerrain(fakeMap, "body", nil, 0)
+  MeshCache.saveWater(fakeMap, "body", nil, 0)
+  MeshCache.saveAux(fakeMap, "body", { figures = {} })
+  local rec = MeshCache.jobRecord(fakeMap, "body")
+  T.check(MeshCache.writeManifest({ [rec.key] = rec }, 1),
+          "handoff test: manifest written")
+end
+local function manifestGone()
+  return fakeStore.peekTables().manifest == nil
+end
+
+withOS("OS X", function()
+  freshManifestCache()
+  Assets.invalidate()   -- the boot handoff (or a later one: loadMod may
+  Assets.invalidate()   -- have fired the engine's handoff already)
+  T.check(manifestGone(),
+          "desktop: invalidations land once the boot handoff is past")
+end)
+
+withOS("NX", function()
+  freshManifestCache()
+  Assets.invalidate()
+  Assets.invalidate()   -- the observed double boot handoff
+  T.check(not manifestGone(),
+          "Switch: boot-time invalidations must keep the manifest")
+  ChunkMesher.request(fakeMap, true, {}, false, true)
+  Assets.invalidate()
+  T.check(manifestGone(),
+          "Switch: invalidation lands once mesh work has started")
+end)
 
 run.release()
 T.finish("potato_voxel_cache")
