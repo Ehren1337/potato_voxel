@@ -674,58 +674,31 @@ function Overlay.sendLogs()
   return true
 end
 
--- ------- log-send consent
+-- ------- log-send opt-out
 --
 -- F8, the SEND LOGS row and the START chord all ship the stored evidence
 -- to the manifest's log_url -- the ONE action that leaves the device.
--- It is gated behind a one-time prompt: the first export that would
--- send asks first, and a YES is persisted as the log_consent option so
--- later exports never ask again. A NO sends nothing and leaves the flag
--- unset, so the next export asks again. Engines or manifests without a
--- log_url never prompt -- there is no send to consent to.
-
-local CONSENT_TEXT =
-  "LOGS GO TO THE\nDEVELOPER.\fSENT OVER THE\nINTERNET.\fSEND?"
+-- Sending is ON by default: the send_logs option (LOGS TO DEV, ON by
+-- default) gates every send, and the frame tick sends automatically on
+-- its own schedule (see autoSendEvery below). Turning the row OFF stops
+-- all sends immediately and permanently -- there is no prompt to ask
+-- and nothing to decline. Engines or manifests without a log_url never
+-- send: there is no endpoint.
 
 -- Whether this engine can send at all: engine feature #1363 (mod.postLog)
 -- plus a manifest log_url. The gate only exists where a send would
--- actually happen, so a local-only export never asks.
+-- actually happen, so a local-only export never sends.
 function Overlay.canSend()
   local mod = V.mod
   return not not (mod and type(mod.postLog) == "function"
                   and mod.manifest and mod.manifest.log_url)
 end
 
--- The persisted answer. Read live through the options API (ModSetting),
--- the same store every other setting lives in, so a consent written
--- anywhere is seen on the next read.
-function Overlay.consent()
-  return Overlay.consentSetting:get() == true
-end
-
--- The one-time prompt, pushed as a modal over whatever the key found.
--- The YES/NO defaults to NO -- this is opt-in -- and a YES is written
--- to the log_consent option before the export runs, so it is asked
--- exactly once. A NO leaves the flag unset.
-function Overlay.askConsent(g)
-  if not (g and g.stack and g.stack.push) then
-    Overlay.note("log send refused: no consent and no prompt available")
-    return false
-  end
-  local TextBox = require("src.render.TextBox")
-  g.stack:push(TextBox.new(g, CONSENT_TEXT, nil, {
-    defaultNo = true,
-    choice = function(yes)
-      if yes then
-        Overlay.consentSetting:setValue(true, g)
-        Overlay.trace("log send consented")
-        Overlay.export(g)
-      else
-        Overlay.note("log send declined")
-      end
-    end,
-  }))
-  return true
+-- Whether the player has opted out. Read live through the options API
+-- (ModSetting), the same store every other setting lives in, so the
+-- row, the manager's page and this gate all see the same value.
+function Overlay.sendingAllowed()
+  return Overlay.sendSetting:get() ~= false
 end
 
 -- F8: export. Force the storage flush so the on-disk debug/log is
@@ -733,17 +706,20 @@ end
 -- can copy it straight out), and stamp the boundary. Works even while
 -- the debugger is toggled off -- exporting is the retrieval action.
 --
--- A first export that would send stops to ask first: until the player
--- opts in, the whole export waits on the answer -- F8 / SEND LOGS is the
--- send action, and a decline ships nothing at all.
+-- The send half respects LOGS TO DEV: ON ships, OFF notes and skips
+-- while the local dump still happens. A local-only engine (no endpoint)
+-- just dumps, exactly as before.
 function Overlay.export(g)
   g = g or game
-  if Overlay.canSend() and not Overlay.consent() then
-    return Overlay.askConsent(g)
-  end
   Overlay.runProbe()
   persist(true)
-  Overlay.sendLogs()
+  if Overlay.canSend() then
+    if Overlay.sendingAllowed() then
+      Overlay.sendLogs()
+    else
+      Overlay.note("log send disabled (LOGS TO DEV OFF)")
+    end
+  end
   pcall(print, "[pv-log] ---- boot evidence (" .. #bootLog .. " lines) ----")
   for _, line in ipairs(bootLog) do
     pcall(print, "[pv-log] " .. line)
@@ -788,6 +764,18 @@ function Overlay.summary()
 end
 
 -- Feed the voxel tick every frame.
+--
+-- The automatic send rides this tick: every autoSendEvery seconds of
+-- accumulated GAME time (frame dt, not wall clock -- a paused game never
+-- sends), the log ships on its own with no keypress. It is the same
+-- opt-out default as every manual send: the send_logs gate, a send
+-- already in flight, or an engine without an endpoint all skip it, and
+-- the schedule is expressed as a next-deadline so a skipped interval
+-- fires at the next opportunity rather than backing up.
+Overlay.autoSendEvery = 900
+local autoSendElapsed = 0
+local nextAutoAt = Overlay.autoSendEvery
+
 function Overlay.frame(dt, renderMs)
   if sendHandle and V.mod and V.mod.fetch
       and type(V.mod.fetch.poll) == "function" then
@@ -819,6 +807,15 @@ function Overlay.frame(dt, renderMs)
       sendHandle = nil
     end
   end
+  if Overlay.canSend() and Overlay.sendingAllowed()
+      and not sendHandle and autoSendElapsed >= nextAutoAt then
+    nextAutoAt = nextAutoAt + Overlay.autoSendEvery
+    persist(true)
+    Overlay.trace("auto-send: shipping log (%.0f s of game time)",
+                  autoSendElapsed)
+    Overlay.sendLogs()
+  end
+  autoSendElapsed = autoSendElapsed + (dt or 0)
   health.frame = health.frame + 1
   local frameMs = (dt or 0) * 1000
   if frameMs > worstFrame then worstFrame = frameMs end
@@ -1038,14 +1035,13 @@ local ModSetting = V.require("ModSetting")
 Overlay.setting = ModSetting.new("debugger", "DEBUGGER", { false, true },
                                  { "OFF", "ON" })
 
--- The log-send consent flag: false until the player answers YES to the
--- one-time prompt in askConsent. Stored through the same options store
--- as every other setting (the live save's options, the loader's copy
--- mod.options:get reads, then the options file), so the answer survives
--- restarts and New Game. It is not registered as a row anywhere -- it is
--- the prompt's memory, not a setting to fiddle with -- but it lives in
--- the shared store, so a future row could read it.
-Overlay.consentSetting = ModSetting.new("log_consent", "LOG CONSENT",
-                                        { false, true }, { "NO", "YES" })
+-- The LOGS TO DEV toggle: sending is ON by default (opt-out) and the
+-- row lives in VOXEL SETTINGS and on the mod manager's page, so the
+-- player can turn it off there or anywhere else the schema lands.
+-- Stored through the same options store as every other setting, so it
+-- survives restarts and New Game, and read live at send time so a
+-- manager-page write takes effect immediately.
+Overlay.sendSetting = ModSetting.new("send_logs", "LOGS TO DEV",
+                                     { true, false }, { "ON", "OFF" })
 
 return Overlay
