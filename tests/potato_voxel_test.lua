@@ -1091,7 +1091,7 @@ if MeshCache and MeshCache.encodeMesh then
                            idx = bigIdx },
                  flowers = nil, figures = {} }
   MeshCache.saveAux(fakeMap, "full", flat)
-  local auxBytes = fakeStore.peekBytes()["maps/VIRIDIAN_CITY/full/aux"] or ""
+  local auxBytes = fakeStore.peekBytes()["maps/VIRIDIAN_CITY/full/deco"] or ""
   -- header (8 + fpLen) + indexed grass (u32 n + n*6 floats + u32 m +
   -- m u32s), then the empty flowers payload (u32 0 + u32 0) and the
   -- figures count byte (0) -- a 6x-inflated grass write is ~5.7MB vs
