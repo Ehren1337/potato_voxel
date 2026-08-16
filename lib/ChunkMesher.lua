@@ -111,9 +111,10 @@ end
 -- A sink accepts quads (4 corners, 4 uv pairs, flat or per-corner shade)
 -- and finishes into a drawable mesh. The TABLE sink reproduces the
 -- historical pure-Lua output -- geometry() returns its arrays for the
--- headless suite, buffer() flattens them for the cache codecs, and
--- finish() uploads through Voxel3D.newMesh, the exact path the
--- pre-sandbox table build used.
+-- headless suite, buffer() flattens them for the cache codecs -- and
+-- finish() uploads the rows through uploadTableMesh below, so a fresh
+-- build's upload lands in budgeted pieces like every other slice of the
+-- job.
 -- Slice a table upload across frames: the mesh is created with the full
 -- vertex count, then vertices land in budgeted pieces. The vertex map must
 -- be uploaded in one call: setVertexMap replaces the complete map and has no
@@ -125,7 +126,18 @@ end
 -- uploads whole -- the fade covers that one by design. (Declared BEFORE
 -- its users: this LuaJIT resolves a later chunk-local as a global --
 -- the forward-local bug class.)
+--
+-- The FLAT-array form of setVertices is a trap on this engine's LOVE
+-- 11.5 and must not come back: on a vertex-count mesh it counts table
+-- ELEMENTS as VERTICES and rejects the call ("expected at most N, got
+-- M"), while a pcall'd rejection here used to leave a zeroed mesh --
+-- right count, all-zero vertices, terrain that renders as nothing.
+-- ROWS are the only working form for a vertex-count mesh (measured on
+-- the engine's own build). Every upload below CHECKS its pcall and
+-- drops the mesh on failure, so a regression fails the job loudly
+-- (logged, flat-2D fallback) instead of silently blacking the world.
 local UPLOAD_CHUNK = 8192
+
 local function uploadTableMesh(rows, indices)
   local n = #rows
   if n == 0 then return nil end
@@ -137,12 +149,20 @@ local function uploadTableMesh(rows, indices)
     local c = math.min(UPLOAD_CHUNK, n - i)
     local slice = {}
     for j = 1, c do slice[j] = rows[i + j] end
-    pcall(mesh.setVertices, mesh, slice, i + 1)
+    local okUp = pcall(mesh.setVertices, mesh, slice, i + 1)
+    if not okUp then
+      pcall(mesh.release, mesh)
+      return nil
+    end
     i = i + c
     Budget.check()
   end
   if indices and #indices > 0 then
-    pcall(mesh.setVertexMap, mesh, indices)
+    local okMap = pcall(mesh.setVertexMap, mesh, indices)
+    if not okMap then
+      pcall(mesh.release, mesh)
+      return nil
+    end
   end
   return mesh
 end
@@ -187,7 +207,7 @@ local function newTableSink()
       return flat, #verts, imap, #indices
     end,
     finish = function()
-      return Voxel3D.newMesh(verts, indices)
+      return uploadTableMesh(verts, indices)
     end,
   }
 end
@@ -1049,8 +1069,7 @@ local function meshFromData(d)
   -- Accept BOTH record shapes: cache-load records carry verts/indices
   -- (flat 1-based float tables) while fresh-build records from
   -- flattenAux carry buf/idx -- flat tables either way. Voxel3D.newMesh
-  -- wants ROWS, so the flat stream is folded into rows here; the index
-  -- map is already 1-based.
+  -- wants ROWS, so the flat stream is folded into rows here; the index  -- map is already 1-based.
   local flat, indices = d.verts or d.buf, d.indices or d.idx
   if not flat or d.n == 0 then return nil end
   local rows = {}
