@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.6.6] - 2026-08-16
+
+### Diagnostics
+
+- Sent logs and status records now identify the platform they came from
+  (Windows, OS X, Linux, Android, iOS, consoles), answered through the
+  engine's Platform module, with the device class appended where it is
+  not obvious (Android (mobile), NX (console)).
+
 ## [1.6.5] - 2026-08-16
 
 ### Diagnostics / privacy
