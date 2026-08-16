@@ -101,6 +101,23 @@ local function platformName()
   return kind and (osName .. " (" .. kind .. ")") or osName
 end
 
+-- The VOXEL SETTINGS summary, provided by main.lua (it owns the rows and
+-- the live options API): one space-separated `key=label` line so a
+-- received log shows exactly the rung and knobs the session ran with.
+-- Read live at send time through the same paths the rows read, so the
+-- excerpt can never disagree with what the menu showed.
+local settingsReader = nil
+function Overlay.setSettingsReader(fn)
+  settingsReader = type(fn) == "function" and fn or nil
+end
+
+local function settingsLine()
+  if not settingsReader then return nil end
+  local ok, got = pcall(settingsReader)
+  if not ok or type(got) ~= "string" or got == "" then return nil end
+  return got
+end
+
 local function clock()
   local timer = love and love.timer
   if timer and timer.getTime then
@@ -150,6 +167,7 @@ local function snapshot()
     storage = dataCopy(health.storage),
     probe = dataCopy(health.probe),
     platform = health.platform or platformName(),
+    settings = settingsLine(),
     lastEvent = dataCopy(health.lastEvent),
     lastError = dataCopy(health.lastError),
     lastPhase = health.lastPhase,
@@ -181,12 +199,18 @@ local function headerText()
   local lv = health.renderer and health.renderer.love
   local loveVer = lv and (tostring(lv.codename) .. " " .. tostring(lv.major)
     .. "." .. tostring(lv.minor)) or "?"
-  return ("-- potato_voxel diagnostic send --\nmod: %s %s\nengine: %s\nlove: %s\nplatform: %s\nsession: %s\nframe: %s")
+  -- The GPU identity, first thing a received log is sorted by. LÖVE 12's
+  -- getRendererInfo returns one table; LÖVE 11's four values (see
+  -- captureEnvironment, which normalises both).
+  local ri = health.renderer and health.renderer.renderer
+  local gpu = ri and ((tostring(ri.name or "") .. " " .. tostring(ri.device or ""))
+    :gsub("%s+$", "")) or "?"
+  return ("-- potato_voxel diagnostic send --\nmod: %s %s\nengine: %s\nlove: %s\nplatform: %s\ngpu: %s\nsession: %s\nframe: %s")
     :format(tostring(manifest and manifest.name or "potato_voxel"),
             tostring(manifest and manifest.version or "?"),
             tostring(ctx.engineVersion or "?"),
             loveVer, tostring(health.platform or platformName()),
-            tostring(sessionId), tostring(health.frame))
+            gpu, tostring(sessionId), tostring(health.frame))
 end
 
 -- Flat status excerpt.  The ring only covers what has happened since boot,
@@ -212,17 +236,54 @@ local function snapshotText()
         :format(tostring(p.lastPathDetail.renderMs), tostring(p.lastPathFrame)))
     end
   end
+  -- The GPU and screen behind every render and shadow issue: which
+  -- backend (Metal/GL), which vendor/device, and the DPI scale (a
+  -- fractional scale is where canvas and scissor bugs come from).
+  local env = health.renderer
+  local ri = env and env.renderer
+  if ri then
+    kv("renderer", ("%s %s %s %s"):format(tostring(ri.name or "?"),
+      tostring(ri.vendor or ""), tostring(ri.device or ""),
+      tostring(ri.version or "")))
+  end
+  if env and env.dimensions and env.pixelDimensions
+     and env.dimensions.w and env.dimensions.w > 0 then
+    kv("screen", ("%dx%d dpi=%s"):format(env.dimensions.w, env.dimensions.h,
+      ("%.2f"):format(env.pixelDimensions.w / env.dimensions.w)))
+  end
+  local line = settingsLine()
+  if line then kv("settings", line) end
   local v = health.capabilities and health.capabilities.voxel
   if v then
-    kv("voxel", ("available=%s reason=%s")
-      :format(tostring(v.available), tostring(v.reason)))
+    local depthFailed = v.depth and (#v.depth.failures or 0) > 0
+    kv("voxel", ("available=%s reason=%s shader=%s precision=%s depth=%s")
+      :format(tostring(v.available), tostring(v.reason),
+              tostring(v.shader and (v.shader.plain and "ok" or "missing") or "?"),
+              tostring(v.shaderPrecision and v.shaderPrecision.plain or "?"),
+              tostring(depthFailed and "failed" or "ok")))
   end
   local pr = health.probe and health.probe.result
   if pr then
     if pr.shadows then
-      kv("shadows", ("available=%s reason=%s resolution=%s")
-        :format(tostring(pr.shadows.available), tostring(pr.shadows.reason),
-                tostring(pr.shadows.resolution)))
+      local s = pr.shadows
+      kv("shadows", ("available=%s reason=%s res=%s precision=%s depth=%s sprites=%s aborts=%d")
+        :format(tostring(s.available), tostring(s.reason), tostring(s.resolution),
+                tostring(s.shaderPrecision or "?"),
+                tostring(s.depth and s.depth.binding or "?"),
+                tostring(s.spriteReady == true and "on"
+                         or (s.spriteReady == false and "off" or "?")),
+                (s.passCounts and s.passCounts.aborts) or 0))
+      -- An unavailable pass ships the retained failure text -- which shader
+      -- would not compile, which canvas could not be allocated, what the
+      -- driver said -- instead of a bare unavailable=no.
+      if not s.available then
+        local d = s.depth or {}
+        kv("shadowFail", ("shader=%s canvas=%s depth=%s last=%s")
+          :format(tostring(s.shaderError or s.shaderFallbackError or "?"),
+                  tostring(s.canvasError or "?"),
+                  tostring(d.error or d.fallbackError or "?"),
+                  tostring(s.lastFailure or "?")))
+      end
     end
     if pr.cache then
       kv("cache", ("identity=%s saveFailures=%d")
@@ -677,7 +738,9 @@ function Overlay.export(g)
     pcall(print, "[pv-log] " .. line)
   end
   local current = snapshot()
+  local curGpu = current.renderer and current.renderer.renderer
   pcall(print, "[pv-status] platform=" .. tostring(current.platform)
+             .. " gpu=" .. tostring(curGpu and curGpu.name or "?")
              .. " session=" .. tostring(current.session)
              .. " frame=" .. tostring(current.frame)
              .. " pipeline=" .. tostring(current.pipeline.availability)
@@ -877,8 +940,16 @@ function Overlay.captureEnvironment()
   end
   if g then
     if g.getRendererInfo then
-      local ok, info = pcall(g.getRendererInfo)
-      if ok and type(info) == "table" then out.renderer = dataCopy(info) end
+      -- LÖVE 12 returns one table (name/vendor/device/version); LÖVE 11
+      -- returns four values. Both are the same identity -- the GPU and
+      -- the backend behind every render and shadow issue.
+      local ok, a, b, c, d = pcall(g.getRendererInfo)
+      if ok and type(a) == "table" then
+        out.renderer = dataCopy(a)
+      elseif ok and a then
+        out.renderer = { name = tostring(a), vendor = tostring(b or ""),
+                         device = tostring(c or ""), version = tostring(d or "") }
+      end
     end
     if g.getDimensions then
       local ok, w, h = pcall(g.getDimensions)

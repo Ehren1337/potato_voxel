@@ -465,27 +465,68 @@ if brick then
     DebugOverlay.export(consentGame)
     T.check(stackPushed == nil, "a consented export never asks again")
     T.eq(sends, 2, "a consented export sends directly")
-    -- The send identity carries the platform the log came from.  The
-    -- engine's Platform module answers it; a stubbed OS shows through
-    -- into the send header, the status excerpt and the data snapshot.
+    -- The send identity carries the platform AND the GPU the log came
+    -- from.  The engine's Platform module answers the OS; captureEnvironment
+    -- answers the renderer (LÖVE 12's table shape) and the DPI scale --
+    -- the two facts every render/shadow report is sorted by.  All of it
+    -- shows through into the send header, the status excerpt and the data
+    -- snapshot.
     do
       local Platform = require("src.core.Platform")
       local oldLove = _G.love
       Platform._resetForTests()
-      _G.love = { system = { getOS = function() return "Android" end } }
+      _G.love = {
+        system = { getOS = function() return "Android" end },
+        graphics = {
+          getRendererInfo = function()
+            return { name = "Metal", vendor = "Apple",
+                     device = "Apple A13 GPU", version = "3.2" }
+          end,
+          getDimensions = function() return 200, 100 end,
+          getPixelDimensions = function() return 600, 300 end,
+        },
+      }
       DebugOverlay.captureEnvironment()
       Platform._resetForTests()
       _G.love = oldLove
       T.eq(DebugOverlay.status().platform, "Android (mobile)",
            "the status snapshot names the platform and its class")
+      T.eq(DebugOverlay.status().renderer.renderer.name, "Metal",
+           "the status snapshot names the GPU backend")
+      T.eq(DebugOverlay.status().renderer.renderer.device, "Apple A13 GPU",
+           "the status snapshot names the GPU device")
+      local statusSettings = DebugOverlay.status().settings
+      T.check(type(statusSettings) == "string"
+              and statusSettings:find("voxel=", 1, true) ~= nil
+              and statusSettings:find(" water=", 1, true) ~= nil
+              and statusSettings:find(" shadows=", 1, true) ~= nil,
+              "the status snapshot carries the VOXEL SETTINGS line")
       stackPushed = nil
       DebugOverlay.export(consentGame)
       T.eq(sends, 3, "a consented export sends after the platform capture")
       T.check(lastBody and lastBody:find("platform: Android (mobile)", 1, true),
               "the send header carries the platform")
+      T.check(lastBody and lastBody:find("gpu: Metal Apple A13 GPU", 1, true),
+              "the send header carries the GPU")
       T.check(lastBody and lastBody:find("-- status excerpt --", 1, true)
               and lastBody:find("platform: Android (mobile)", 1, true),
               "the send's status excerpt carries the platform")
+      T.check(lastBody and lastBody:find("renderer: Metal Apple Apple A13 GPU 3.2", 1, true),
+              "the status excerpt carries the full renderer identity")
+      T.check(lastBody and lastBody:find("screen: 200x100 dpi=3.00", 1, true),
+              "the status excerpt carries the DPI scale")
+      T.check(lastBody and lastBody:find("settings: voxel=", 1, true)
+              and lastBody:find(" water=", 1, true)
+              and lastBody:find(" shadows=", 1, true),
+              "the status excerpt carries the VOXEL SETTINGS line")
+      T.check(lastBody and lastBody:find("shadows: available=", 1, true)
+              and lastBody:find("precision=", 1, true)
+              and lastBody:find("depth=", 1, true),
+              "the status excerpt carries the shadow shader and depth state")
+      T.check(lastBody and lastBody:find("voxel: available=", 1, true)
+              and lastBody:find("shader=", 1, true)
+              and lastBody:find("precision=", 1, true),
+              "the status excerpt carries the voxel shader state")
     end
     -- NO sends nothing and leaves the flag unset, so the next export
     -- asks again.
