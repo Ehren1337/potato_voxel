@@ -1441,11 +1441,26 @@ end
 -- every vertex asks about the exact surface the sun recorded rather than
 -- one a few pixels behind it, and a figure cannot fringe itself. On the
 -- caster itself it is a no-op -- that quad is already flat.
+--
+-- Built in scratch matrices rather than allocating: this runs once per
+-- character per frame (twice when the water's reflection draws the cast).
+-- The result is a SHARED table, so callers must consume it before the
+-- next call -- every caller does (the snug pass copies it straight into
+-- its own scratch, and shadowMatrix folds it into a fresh matrix).
+local casterA = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 }
+local casterB = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 }
+
 function Voxel3D.casterMatrix(px, py, y, mirror)
-  local m = Mat4.translate(px + 8, y, py + 8)
-  if mirror then m = Mat4.mul(m, Mat4.scale(-1, 1, 1)) end
-  return Mat4.mul(Mat4.mul(m, Mat4.translate(-8, 0, 0)),
-                  Mat4.scale(1, 1, 0))
+  Mat4.translateInPlace(casterA, px + 8, y, py + 8)
+  if mirror then
+    Mat4.scaleInPlace(casterB, -1, 1, 1)
+    Mat4.mulInPlace(casterA, casterA, casterB)
+  end
+  Mat4.translateInPlace(casterB, -8, 0, 0)
+  Mat4.mulInPlace(casterA, casterA, casterB)
+  Mat4.scaleInPlace(casterB, 1, 1, 0)
+  Mat4.mulInPlace(casterA, casterA, casterB)
+  return casterA
 end
 
 -- Quantize fallback contact shadows to world pixels.  Actor positions are
