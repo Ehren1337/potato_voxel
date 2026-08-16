@@ -73,10 +73,13 @@ The debugger records diagnostics in the background from boot. F9 shows or
 hides its panel, F10 switches its detail level, and F8 exports its log plus a
 capability probe. The export preserves early boot evidence, recent runtime
 lines, and a data-only `debug/status` record containing pipeline eligibility,
-shader/canvas reasons, renderer information, cache/storage state, world
-render-path counters, and the platform the log came from (Windows, OS X,
-Linux, Android, iOS, consoles). It does not add a visible panel until you
-press F9.
+shader/canvas reasons, cache/storage state, world render-path counters, and
+the identity of the device it came from: the platform (Windows, OS X, Linux,
+Android, iOS, consoles), the GPU (backend, vendor, device, version) and the
+DPI scale, plus the full shadow-system state (shader precision, depth
+binding, sprite layer) and the retained failure text when the shadow or
+voxel pass is unavailable. It does not add a visible panel until you press
+F9.
 
 The first export that would send a log to the mod's log service (F8, the
 START hold chord, or SEND LOGS in VOXEL SETTINGS) asks first: a one-time

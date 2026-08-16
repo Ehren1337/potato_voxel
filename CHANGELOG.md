@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.6.7] - 2026-08-16
+
+### Diagnostics
+
+- Sent logs now identify the GPU behind every render and shadow report:
+  the header carries `gpu:` (backend + device), and the status excerpt
+  carries the full renderer identity (name/vendor/device/version), the
+  DPI scale (a fractional scale is where canvas and scissor bugs come
+  from), and the complete shadow-system state -- shader precision,
+  depth-attachment binding, sprite layer, pass aborts -- plus the
+  retained failure text when the shadow or voxel pass is unavailable
+  (which shader would not compile, which canvas could not be allocated,
+  what the driver said). Renderer capture now accepts both LÖVE 12's
+  table `getRendererInfo` and LÖVE 11's four-value form, so desktop
+  sends carry it too.
+
 ## [1.6.6] - 2026-08-16
 
 ### Diagnostics
