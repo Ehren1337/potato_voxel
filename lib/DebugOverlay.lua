@@ -101,6 +101,23 @@ local function platformName()
   return kind and (osName .. " (" .. kind .. ")") or osName
 end
 
+-- The VOXEL SETTINGS summary, provided by main.lua (it owns the rows and
+-- the live options API): one space-separated `key=label` line so a
+-- received log shows exactly the rung and knobs the session ran with.
+-- Read live at send time through the same paths the rows read, so the
+-- excerpt can never disagree with what the menu showed.
+local settingsReader = nil
+function Overlay.setSettingsReader(fn)
+  settingsReader = type(fn) == "function" and fn or nil
+end
+
+local function settingsLine()
+  if not settingsReader then return nil end
+  local ok, got = pcall(settingsReader)
+  if not ok or type(got) ~= "string" or got == "" then return nil end
+  return got
+end
+
 local function clock()
   local timer = love and love.timer
   if timer and timer.getTime then
@@ -150,6 +167,7 @@ local function snapshot()
     storage = dataCopy(health.storage),
     probe = dataCopy(health.probe),
     platform = health.platform or platformName(),
+    settings = settingsLine(),
     lastEvent = dataCopy(health.lastEvent),
     lastError = dataCopy(health.lastError),
     lastPhase = health.lastPhase,
@@ -233,6 +251,8 @@ local function snapshotText()
     kv("screen", ("%dx%d dpi=%s"):format(env.dimensions.w, env.dimensions.h,
       ("%.2f"):format(env.pixelDimensions.w / env.dimensions.w)))
   end
+  local line = settingsLine()
+  if line then kv("settings", line) end
   local v = health.capabilities and health.capabilities.voxel
   if v then
     local depthFailed = v.depth and (#v.depth.failures or 0) > 0

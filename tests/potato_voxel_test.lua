@@ -495,6 +495,12 @@ if brick then
            "the status snapshot names the GPU backend")
       T.eq(DebugOverlay.status().renderer.renderer.device, "Apple A13 GPU",
            "the status snapshot names the GPU device")
+      local statusSettings = DebugOverlay.status().settings
+      T.check(type(statusSettings) == "string"
+              and statusSettings:find("voxel=", 1, true) ~= nil
+              and statusSettings:find(" water=", 1, true) ~= nil
+              and statusSettings:find(" shadows=", 1, true) ~= nil,
+              "the status snapshot carries the VOXEL SETTINGS line")
       stackPushed = nil
       DebugOverlay.export(consentGame)
       T.eq(sends, 3, "a consented export sends after the platform capture")
@@ -509,6 +515,10 @@ if brick then
               "the status excerpt carries the full renderer identity")
       T.check(lastBody and lastBody:find("screen: 200x100 dpi=3.00", 1, true),
               "the status excerpt carries the DPI scale")
+      T.check(lastBody and lastBody:find("settings: voxel=", 1, true)
+              and lastBody:find(" water=", 1, true)
+              and lastBody:find(" shadows=", 1, true),
+              "the status excerpt carries the VOXEL SETTINGS line")
       T.check(lastBody and lastBody:find("shadows: available=", 1, true)
               and lastBody:find("precision=", 1, true)
               and lastBody:find("depth=", 1, true),

@@ -811,6 +811,25 @@ for _, entry in ipairs(SETTINGS) do
 end
 mod.options:define(schema)
 
+-- The VOXEL SETTINGS summary the debugger ships: the voxel rung plus every
+-- live setting row as `key=label`, so a received log shows exactly what the
+-- session ran with. Read live at send time through the same paths the rows
+-- use, and gated rows are omitted exactly as the menu omits them.
+DebugOverlay.setSettingsReader(function()
+  local Pipelines = require("src.render.Pipelines")
+  local out = { "voxel=" .. tostring(Pipelines.levelLabel("voxel")) }
+  for _, entry in ipairs(SETTINGS) do
+    if not entry.when or entry.when() then
+      local setting = entry[1]
+      local i = setting:read()
+      if not setting:allows(i) then i = 1 end
+      out[#out + 1] = tostring(setting.key) .. "="
+                      .. tostring(setting.labels[i] or "?")
+    end
+  end
+  return table.concat(out, " ")
+end)
+
 -- ------- this mod's hotkeys
 --
 --   3  VOXEL    cycle the camera ladder      (was 6; skips FULL)

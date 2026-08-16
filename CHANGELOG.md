@@ -15,6 +15,13 @@
   what the driver said). Renderer capture now accepts both LÖVE 12's
   table `getRendererInfo` and LÖVE 11's four-value form, so desktop
   sends carry it too.
+- The status excerpt now carries the session's VOXEL SETTINGS as one
+  `settings:` line -- the voxel rung plus every live setting row as
+  `key=label` (WATER, AA, V-CURVE, V-GRID, 3D-BTL, DAY/NIGHT, SHADOWS,
+  SHADOW QUALITY, RENDER SCALE, DEBUGGER) -- read live through the same
+  paths the menu rows use, so a received log shows exactly what the
+  session ran with. Gated rows are omitted exactly as the menu omits
+  them.
 
 ## [1.6.6] - 2026-08-16
 

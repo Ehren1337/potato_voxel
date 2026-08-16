@@ -76,7 +76,8 @@ lines, and a data-only `debug/status` record containing pipeline eligibility,
 shader/canvas reasons, cache/storage state, world render-path counters, and
 the identity of the device it came from: the platform (Windows, OS X, Linux,
 Android, iOS, consoles), the GPU (backend, vendor, device, version) and the
-DPI scale, plus the full shadow-system state (shader precision, depth
+DPI scale, the session's VOXEL SETTINGS (rung and every live knob as
+`key=label`), plus the full shadow-system state (shader precision, depth
 binding, sprite layer) and the retained failure text when the shadow or
 voxel pass is unavailable. It does not add a visible panel until you press
 F9.
