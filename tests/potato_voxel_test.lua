@@ -22,6 +22,7 @@ T.check(brick ~= nil and brick.isBrick(), "the one build is the Brick build")
 if brick then
   local Voxel = exports.lib.require("VoxelState")
   local ShadowMap = exports.lib.require("ShadowMap")
+  local Voxel3D = exports.lib.require("Voxel3D")
   local Water = exports.lib.require("Water")
   local AntiAlias = exports.lib.require("AntiAlias")
   local WorldCurve = exports.lib.require("WorldCurve")
@@ -104,6 +105,44 @@ if brick then
           "a sane frustum is not degenerate")
   T.check(ShadowMap._source():find("c.z == c.z", 1, true),
           "shadow shader stores far depth instead of NaN")
+  T.check(ShadowMap._source():find(
+            "varying LOVE_HIGHP_OR_MEDIUMP float vDepth", 1, true),
+          "shadow-map depth varying keeps mobile precision")
+  T.check(Voxel3D._source():find(
+            "varying LOVE_HIGHP_OR_MEDIUMP vec3 vSun", 1, true),
+          "scene shadow coordinates keep mobile precision")
+  T.check(Voxel3D._source():find(
+            "precision highp float", 1, true),
+          "scene shadow comparisons request fragment high precision")
+  local scenePinned = Voxel3D._source(false, false)
+  local sceneBare = Voxel3D._source(false, true)
+  T.check(scenePinned:find("#define EFFECT_PREC mediump\n", 1, true),
+          "scene shader pins effect parameters for mobile prototypes")
+  T.check(scenePinned:find(
+            "vec4 effect(EFFECT_PREC vec4 color", 1, true),
+          "scene shader routes effect parameters through the precision define")
+  T.check(sceneBare:find("#define EFFECT_PREC\n", 1, true),
+          "scene shader has a bare-precision retry variant")
+  local shadowPinned = ShadowMap._source(false)
+  local shadowBare = ShadowMap._source(true)
+  T.check(shadowPinned:find("#define EFFECT_PREC mediump\n", 1, true),
+          "shadow shader pins effect parameters for mobile prototypes")
+  T.check(shadowPinned:find(
+            "vec4 effect(EFFECT_PREC vec4 color", 1, true),
+          "shadow shader routes effect parameters through the precision define")
+  T.check(shadowBare:find("#define EFFECT_PREC\n", 1, true),
+          "shadow shader has a bare-precision retry variant")
+  do
+    local caps = Voxel3D.diagnostics()
+    T.check(type(caps) == "table" and type(caps.available) == "boolean",
+            "scene capability diagnostics return a boolean gate")
+    T.check(caps.reason ~= nil,
+            "scene capability diagnostics name the current gate")
+    T.check(type(caps.shaderErrors) == "table",
+            "scene capability diagnostics preserve shader errors")
+  end
+  T.check(type(ShadowMap.diagnostics) == "function",
+          "shadow diagnostics expose capability detail")
   T.check(ShadowMap.abort ~= nil, "abort() exists for pcall error handlers")
   -- Mali (Mediatek) devices: every active rung takes the proven HIGH actor
   -- shadow path -- the blob decal fallback is what freezes/black-frames them
@@ -272,6 +311,177 @@ if brick then
    local Prebuild = exports.lib.require("CachePrebuild")
   local jobs = Prebuild.enumerate({ B = { id="B", width=3, height=2, connections={} }, A = { id="A", width=4, height=5, connections={} } })
   T.eq(#jobs, 4, "prebuild enumerates body and full variants")
+  -- The hold chords: five seconds of SELECT toggles the debug overlay,
+  -- and five seconds of START while the debugger is on exports its log --
+  -- the touch/pad versions of F9 and F8. Each chord is a timer fed the
+  -- engine's Input:isDown answer; releasing early aborts the count.
+  local HoldChord = exports.lib.require("HoldChord")
+  T.eq(HoldChord.SECONDS, 5, "the hold chords are five seconds")
+  T.check(not HoldChord.update("select", 1, true),
+          "a fresh SELECT hold does not fire early")
+  T.check(not HoldChord.update("select", 1, true),
+          "two seconds still short")
+  T.check(not HoldChord.update("select", 0.5, false),
+          "a SELECT release aborts the count")
+  T.check(not HoldChord.update("select", 4, true),
+          "a new SELECT hold restarts from zero")
+  T.check(HoldChord.update("select", 1, true),
+          "the fifth SELECT second fires the chord")
+  T.check(not HoldChord.update("select", 1, true),
+          "a continued SELECT hold does not retrigger")
+  T.check(not HoldChord.update("select", 1, false),
+          "a SELECT release after firing keeps it silent")
+  T.check(not HoldChord.update("start", 4, true),
+          "START counts its own chord independently")
+  T.check(HoldChord.update("start", 1, true),
+          "START fires on its own fifth second")
+  T.check(not HoldChord.update("select", 1, true),
+          "START firing does not disturb SELECT's timer")
+  T.check(HoldChord.update("select", 5, true),
+          "one long frame can cross the SELECT threshold")
+  T.check(not HoldChord.update("select", 1, true),
+          "the crossing frame resets the timer")
+  local DebugOverlay = exports.lib.require("DebugOverlay")
+  T.check(type(DebugOverlay.enabled) == "function",
+          "the overlay exposes its visibility for the START chord")
+  T.check(type(DebugOverlay.running) == "function",
+          "the debugger exposes its background-running state")
+  T.check(DebugOverlay.running(), "the debugger runs in the background at boot")
+  T.check(not DebugOverlay.enabled(), "the debugger starts hidden")
+  T.check(type(DebugOverlay.status) == "function",
+          "the debugger exposes a data-only status snapshot")
+  T.check(type(DebugOverlay.pipelineUpdate) == "function",
+          "the debugger exposes pipeline heartbeat accounting")
+  T.check(type(DebugOverlay.pipelineAvailable) == "function",
+          "the debugger exposes pipeline capability reasons")
+  T.check(type(DebugOverlay.pipelinePath) == "function",
+          "the debugger exposes world-render path accounting")
+  T.check(type(DebugOverlay.runProbe) == "function",
+          "the debugger exposes a capability self-test")
+  do
+    DebugOverlay.pipelineUpdate(5)
+    DebugOverlay.pipelineAvailable(false, "scene_shader_compile",
+                                   { error = "test compiler error" })
+    DebugOverlay.pipelinePath("fallback", { reason = "scene_shader_compile" })
+    local status = DebugOverlay.status()
+    T.eq(status.pipeline.level, 5, "debug status records the live voxel level")
+    T.eq(status.pipeline.updateCalls, 1,
+         "debug status counts pipeline update calls")
+    T.eq(status.pipeline.availability, false,
+         "debug status records pipeline availability")
+    T.eq(status.pipeline.reason, "scene_shader_compile",
+         "debug status records the pipeline failure reason")
+    T.eq(status.pipeline.lastPath, "fallback",
+         "debug status records the world fallback path")
+    T.eq(status.pipeline.fallbacks, 1,
+         "debug status counts world fallbacks")
+    T.check(status.pipeline.detail.error == "test compiler error",
+            "debug status preserves capability details")
+    local probe = DebugOverlay.runProbe()
+    T.check(type(probe) == "table", "debug capability probe returns data")
+  end
+  do
+    local oldLove = _G.love
+    local printed = {}
+    _G.love = {
+      graphics = {
+        getFont = function() return nil end,
+        getColor = function() return 1, 1, 1, 1 end,
+        setFont = function() end,
+        setColor = function() end,
+        rectangle = function() end,
+        print = function(line) printed[#printed + 1] = line end,
+      },
+    }
+    DebugOverlay.note("hidden boot marker")
+    DebugOverlay.toggle()
+    DebugOverlay.draw()
+    local found = false
+    for _, line in ipairs(printed) do
+      if tostring(line):find("hidden boot marker", 1, true) then
+        found = true
+        break
+      end
+    end
+    T.check(found, "background diagnostics remain available when F9 shows the panel")
+    DebugOverlay.toggle()
+    _G.love = oldLove
+  end
+  -- The log-send consent gate: F8 / SEND LOGS / the START chord all land
+  -- on Overlay.export, and a first export that would send stops to ask.
+  -- The engine under test has neither postLog nor a manifest log_url, so
+  -- the gate is exercised with fakes installed -- and with them removed
+  -- the export must pass straight through, exactly as a local-only
+  -- engine does.
+  do
+    local mod = exports.lib.mod
+    local oldPostLog, oldManifest = mod.postLog, mod.manifest
+    local oldTextBox = package.loaded["src.render.TextBox"]
+    local sends, stackPushed = 0, nil
+    -- The prompt is engine UI (src.render.TextBox); stub it so the gate
+    -- can be driven headlessly. The stub records the text and options the
+    -- mod asked with, so the test can answer the choice itself.
+    package.loaded["src.render.TextBox"] = {
+      new = function(_, text, onDone, opts)
+        stackPushed = { text = text, opts = opts }
+        return stackPushed
+      end,
+    }
+    local fakeStack = { push = function(_, s) stackPushed = s end }
+    local consentGame = { save = { options = optionsState },
+                          writeOptions = function() stackPushed = "wrote" end,
+                          stack = fakeStack }
+    local function answeredYes()
+      local box = stackPushed
+      stackPushed = nil
+      T.check(type(box) == "table" and type(box.opts) == "table",
+              "the consent prompt carries a choice")
+      T.check(box.opts.defaultNo == true, "the consent prompt defaults to NO")
+      box.opts.choice(true)
+    end
+    -- Without a send capability the export must never ask: the local
+    -- dump is the whole action there.
+    T.check(not DebugOverlay.canSend(),
+            "no postLog or log_url means nothing can be sent")
+    DebugOverlay.export(consentGame)
+    T.check(stackPushed == nil, "a local-only export does not prompt")
+    mod.postLog = function() sends = sends + 1 return true end
+    mod.manifest = { log_url = "https://logs.example.invalid/logs" }
+    T.check(DebugOverlay.canSend(),
+            "postLog plus a log_url makes a send possible")
+    T.check(not DebugOverlay.consent(),
+            "log-send consent is off before the first export")
+    DebugOverlay.export(consentGame)
+    T.check(stackPushed ~= nil, "the first sendable export asks first")
+    T.eq(sends, 0, "nothing is sent before the prompt is answered")
+    -- YES persists the consent (the same options store every setting
+    -- lives in) and re-runs the export, which now sends.
+    answeredYes()
+    T.check(DebugOverlay.consent(), "a YES is recorded as consent")
+    T.check(optionsState.modOptions.potato_voxel.log_consent == true,
+            "consent is stored in the mod's options")
+    T.eq(sends, 1, "a consented export sends the log")
+    stackPushed = nil
+    DebugOverlay.export(consentGame)
+    T.check(stackPushed == nil, "a consented export never asks again")
+    T.eq(sends, 2, "a consented export sends directly")
+    -- NO sends nothing and leaves the flag unset, so the next export
+    -- asks again.
+    optionsState.modOptions.potato_voxel.log_consent = nil
+    T.check(not DebugOverlay.consent(), "a declined consent stays unset")
+    DebugOverlay.export(consentGame)
+    T.check(stackPushed ~= nil, "an unconsented export asks again")
+    stackPushed.opts.choice(false)
+    T.eq(sends, 2, "a declined prompt sends nothing")
+    T.check(not DebugOverlay.consent(), "declining leaves the flag unset")
+    -- No UI to ask on: refuse rather than ship logs silently.
+    stackPushed = nil
+    DebugOverlay.export({})
+    T.check(stackPushed == nil and sends == 2,
+            "an export with no prompt available sends nothing")
+    mod.postLog, mod.manifest = oldPostLog, oldManifest
+    package.loaded["src.render.TextBox"] = oldTextBox
+  end
 end
 
 -- The MeshCache storage format: encode/decode must round-trip
@@ -513,8 +723,14 @@ if MeshCache and MeshCache.encodeMesh then
       graphics = {
         newMesh = function()
           local m = {}
+          m.vertexMapCalls = {}
           function m.setVertices() end
-          function m.setVertexMap() end
+          function m.setVertexMap(_, map, start)
+            m.vertexMapCalls[#m.vertexMapCalls + 1] = {
+              count = type(map) == "table" and #map or 0,
+              start = start,
+            }
+          end
           function m.release() end
           return m
         end,
@@ -529,6 +745,33 @@ if MeshCache and MeshCache.encodeMesh then
             "the loaded pair answers from memory")
     T.check(ChunkMesher.grass(fastMap) ~= nil,
             "the aux grass rode the same fast path")
+    -- Mesh:setVertexMap replaces the complete map; it has no ranged-update
+    -- overload. The cache loader must therefore call it exactly once with
+    -- the complete index list, even when a large map needs sliced vertices.
+    do
+      local manyQuads, manyBuf, manyIdx = {}, {}, {}
+      for i = 1, 2731 do
+        manyQuads[#manyQuads + 1] = {
+          { 0, 0, 0 }, { 1, 0, 0 }, { 1, 1, 0 }, { 0, 1, 0 },
+          u = 0.25, v = 0.25, shade = 0.5,
+        }
+      end
+      local manyK, manyM = MeshCache.flattenQuads(manyQuads, manyBuf, manyIdx)
+      MeshCache.saveAux(fastMap, "full",
+                        { grass = { n = manyK / 6, buf = manyBuf,
+                                    m = manyM, idx = manyIdx },
+                          flowers = nil, figures = {} })
+      ChunkMesher.release(fastMap.id)
+      local reloaded = ChunkMesher.request(fastMap, false, nil, true)
+      T.check(reloaded ~= nil, "large cached mesh reloads")
+      local grass = ChunkMesher.grass(fastMap)
+      local calls = grass and grass.vertexMapCalls or {}
+      T.eq(#calls, 1, "large cached mesh uploads one complete vertex map")
+      T.eq(calls[1] and calls[1].count, manyM,
+           "large cached mesh uploads every vertex-map index")
+      T.eq(calls[1] and calls[1].start, nil,
+           "vertex-map upload does not pass a false range offset")
+    end
     -- a map with nothing in the box still queues the async cover path
     local coldMap = { id = "FASTPATH_MISS",
                       tileset = { image = "tilesets/sample.png", trueColor = false },

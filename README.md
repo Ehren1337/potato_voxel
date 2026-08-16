@@ -69,9 +69,18 @@ only one may run at a time.
 
 ## Diagnostics (hidden)
 
-F9 toggles a debug overlay (off by default), F10 switches its detail
-level, F8 exports its log. It exists for support reports and is silent
-unless turned on.
+The debugger records diagnostics in the background from boot. F9 shows or
+hides its panel, F10 switches its detail level, and F8 exports its log plus a
+capability probe. The export preserves early boot evidence, recent runtime
+lines, and a data-only `debug/status` record containing pipeline eligibility,
+shader/canvas reasons, renderer information, cache/storage state, and world
+render-path counters. It does not add a visible panel until you press F9.
+
+The first export that would send a log to the mod's log service (F8, the
+START hold chord, or SEND LOGS in VOXEL SETTINGS) asks first: a one-time
+prompt explains that the log goes to the mod developer over the internet
+and defaults to NO. Accepting stores the decision in the mod's options,
+so later exports never ask again; declining ships nothing.
 
 ## Develop & test
 

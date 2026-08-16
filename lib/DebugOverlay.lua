@@ -153,6 +153,76 @@ local function logText()
   return table.concat(out, "\n")
 end
 
+-- Identity header for the remote payload.  The server's filename only
+-- carries the client id, so without this a received log cannot be
+-- attributed to an engine build, a mod version, or a session.
+local function headerText()
+  local mod = V.mod
+  local manifest = mod and mod.manifest
+  local ctx = health.storage.context or {}
+  local lv = health.renderer and health.renderer.love
+  local loveVer = lv and (tostring(lv.codename) .. " " .. tostring(lv.major)
+    .. "." .. tostring(lv.minor)) or "?"
+  return ("-- potato_voxel diagnostic send --\nmod: %s %s\nengine: %s\nlove: %s\nsession: %s\nframe: %s")
+    :format(tostring(manifest and manifest.name or "potato_voxel"),
+            tostring(manifest and manifest.version or "?"),
+            tostring(ctx.engineVersion or "?"),
+            loveVer, tostring(sessionId), tostring(health.frame))
+end
+
+-- Flat status excerpt.  The ring only covers what has happened since boot,
+-- so a send made early in a session would otherwise carry no rendering,
+-- prebuild, or cache evidence; the snapshot aggregates all of it.  The
+-- playthroughId stays local: the upload adds no identifiers.
+local function snapshotText()
+  local out = {}
+  local function kv(label, value)
+    out[#out + 1] = label .. ": " .. tostring(value)
+  end
+  local c = counters
+  kv("counters", ("jobs=%d errors=%d jobFails=%d cacheHits=%d slowLoads=%d storageFails=%d")
+    :format(c.jobs, c.errors, c.jobFails, c.cacheHits, c.slowLoads, c.storageFails))
+  local p = health.pipeline
+  if p then
+    kv("pipeline", ("availability=%s reason=%s level=%s rendered=%d path=%s")
+      :format(tostring(p.availability), tostring(p.reason), tostring(p.level),
+              p.rendered or 0, tostring(p.lastPath)))
+    if p.lastPathDetail then
+      kv("lastRender", ("renderMs=%s frame=%s")
+        :format(tostring(p.lastPathDetail.renderMs), tostring(p.lastPathFrame)))
+    end
+  end
+  local v = health.capabilities and health.capabilities.voxel
+  if v then
+    kv("voxel", ("available=%s reason=%s")
+      :format(tostring(v.available), tostring(v.reason)))
+  end
+  local pr = health.probe and health.probe.result
+  if pr then
+    if pr.shadows then
+      kv("shadows", ("available=%s reason=%s resolution=%s")
+        :format(tostring(pr.shadows.available), tostring(pr.shadows.reason),
+                tostring(pr.shadows.resolution)))
+    end
+    if pr.cache then
+      kv("cache", ("identity=%s saveFailures=%d")
+        :format(tostring(pr.cache.identity or "?"), pr.cache.saveFailures or 0))
+    end
+    if pr.prebuild then
+      kv("prebuild", ("status=%s %s/%s")
+        :format(tostring(pr.prebuild.status), tostring(pr.prebuild.done),
+                tostring(pr.prebuild.total)))
+    end
+  end
+  kv("worstFrame", worstFrame)
+  local st = health.storage
+  if st then
+    kv("storage", ("state=%s writes=%d failures=%d")
+      :format(tostring(st.state), st.writes or 0, st.failures or 0))
+  end
+  return table.concat(out, "\n")
+end
+
 local function managerLog(kind, msg)
   local mod = V.mod
   local logger = mod and mod.log
@@ -411,12 +481,25 @@ end
 -- always land in the background log and the console; hiding does not clear
 -- the ring buffer, so reopening shows what happened while it was hidden.
 function Overlay.toggle()
-  visible = not visible
+  Overlay.setVisible(not visible)
+end
+
+-- The DEBUGGER option row and the mod manager's page land on the same
+-- flag as F9: an explicit show/hide that records the same boundary line.
+function Overlay.setVisible(show)
+  show = show and true or false
+  if visible == show then return end
+  visible = show
   if not visible then Overlay.summary() end
   local line = "debugger " .. (visible and "VISIBLE" or "HIDDEN")
   append(stamp(line))
   pcall(print, "[pv-debug] " .. stamp(line))
   persist(true)
+end
+
+-- Current panel state, for a caller that wants to stay in step with F9.
+function Overlay.visible()
+  return visible
 end
 
 -- F10: verbose <-> important-only.
@@ -431,24 +514,121 @@ end
 -- polled once on the next frame and released when it settles, so a hung
 -- endpoint never accumulates in the worker pool.
 local sendHandle = nil
+local sendAt = 0   -- wall clock when the current send was submitted
 
 function Overlay.sendLogs()
   local mod = V.mod
   if not (mod and type(mod.postLog) == "function") then return false end
   if not (mod.manifest and mod.manifest.log_url) then return false end
-  -- Keep the remote payload in the same format as the persisted debug/log
-  -- artifact, then append the explicit-send session summary.
-  local body = logText()
-  if body ~= "" then body = body .. "\n" end
-  body = body .. stamp("session: " .. tostring(counters.jobs)
-    .. " jobs, " .. tostring(counters.errors) .. " errors")
-  local ok, handle = pcall(mod.postLog, mod, body, { format = "text" })
+  -- Identity header + the persisted-evidence text + the aggregate status
+  -- excerpt, then the explicit-send session summary.  The engine's
+  -- postLog ceiling is 512 KiB since engine PR #1382 (64 KiB before), and
+  -- a long session's ring can exceed either, so the evidence text is
+  -- trimmed -- newest lines kept -- to a budget that always leaves room
+  -- for the header, excerpt and summary.
+  local function buildBody(budget)
+    local body = headerText()
+    local text = logText()
+    if text ~= "" then
+      budget = budget - #body - 3000
+      if #text > budget then
+        local kept = {}
+        local size = 0
+        for line in text:gmatch("[^\n]+") do
+          kept[#kept + 1] = line
+          size = size + #line + 1
+        end
+        local drop = 0
+        while size > budget and drop < #kept - 1 do
+          drop = drop + 1
+          size = size - #kept[drop] - 1
+        end
+        local out = {}
+        for i = drop + 1, #kept do out[#out + 1] = kept[i] end
+        text = table.concat(out, "\n")
+        Overlay.trace("log send: trimmed %d evidence lines to fit the engine ceiling", drop)
+      end
+      body = body .. "\n" .. text
+    end
+    body = body .. "\n-- status excerpt --\n" .. snapshotText()
+    body = body .. "\n" .. stamp("session: " .. tostring(counters.jobs)
+      .. " jobs, " .. tostring(counters.errors) .. " errors")
+    return body
+  end
+  -- The engine rejects a send by returning nil plus a REASON (too large,
+  -- too many in flight, bad URL...); pcall forwards both returns, so the
+  -- reason is captured and shown instead of reading as a bare nil.
+  local body = buildBody(400000)
+  local ok, handle, reason = pcall(mod.postLog, mod, body, { format = "text" })
+  if not ok or not handle and reason and reason:find("too large") then
+    -- An engine without PR #1382 caps at 64 KiB: retry once with the
+    -- conservative budget before reporting a failure.
+    Overlay.trace("log send: payload too large for this engine; retrying trimmed")
+    body = buildBody(48000)
+    ok, handle, reason = pcall(mod.postLog, mod, body, { format = "text" })
+  end
   if not ok or not handle then
-    Overlay.note("log send failed: " .. tostring(handle))
+    Overlay.note("log send failed: %s",
+      tostring(handle or reason or "engine rejected the send"))
     return false
   end
   sendHandle = handle
+  sendAt = clock()
   Overlay.note("log sent to loghook")
+  return true
+end
+
+-- ------- log-send consent
+--
+-- F8, the SEND LOGS row and the START chord all ship the stored evidence
+-- to the manifest's log_url -- the ONE action that leaves the device.
+-- It is gated behind a one-time prompt: the first export that would
+-- send asks first, and a YES is persisted as the log_consent option so
+-- later exports never ask again. A NO sends nothing and leaves the flag
+-- unset, so the next export asks again. Engines or manifests without a
+-- log_url never prompt -- there is no send to consent to.
+
+local CONSENT_TEXT =
+  "LOGS GO TO THE\nDEVELOPER.\fSENT OVER THE\nINTERNET.\fSEND?"
+
+-- Whether this engine can send at all: engine feature #1363 (mod.postLog)
+-- plus a manifest log_url. The gate only exists where a send would
+-- actually happen, so a local-only export never asks.
+function Overlay.canSend()
+  local mod = V.mod
+  return not not (mod and type(mod.postLog) == "function"
+                  and mod.manifest and mod.manifest.log_url)
+end
+
+-- The persisted answer. Read live through the options API (ModSetting),
+-- the same store every other setting lives in, so a consent written
+-- anywhere is seen on the next read.
+function Overlay.consent()
+  return Overlay.consentSetting:get() == true
+end
+
+-- The one-time prompt, pushed as a modal over whatever the key found.
+-- The YES/NO defaults to NO -- this is opt-in -- and a YES is written
+-- to the log_consent option before the export runs, so it is asked
+-- exactly once. A NO leaves the flag unset.
+function Overlay.askConsent(g)
+  if not (g and g.stack and g.stack.push) then
+    Overlay.note("log send refused: no consent and no prompt available")
+    return false
+  end
+  local TextBox = require("src.render.TextBox")
+  g.stack:push(TextBox.new(g, CONSENT_TEXT, nil, {
+    defaultNo = true,
+    choice = function(yes)
+      if yes then
+        Overlay.consentSetting:setValue(true, g)
+        Overlay.trace("log send consented")
+        Overlay.export(g)
+      else
+        Overlay.note("log send declined")
+      end
+    end,
+  }))
   return true
 end
 
@@ -456,7 +636,15 @@ end
 -- current, dump every line to the console in one block (terminal users
 -- can copy it straight out), and stamp the boundary. Works even while
 -- the debugger is toggled off -- exporting is the retrieval action.
-function Overlay.export()
+--
+-- A first export that would send stops to ask first: until the player
+-- opts in, the whole export waits on the answer -- F8 / SEND LOGS is the
+-- send action, and a decline ships nothing at all.
+function Overlay.export(g)
+  g = g or game
+  if Overlay.canSend() and not Overlay.consent() then
+    return Overlay.askConsent(g)
+  end
   Overlay.runProbe()
   persist(true)
   Overlay.sendLogs()
@@ -506,9 +694,28 @@ function Overlay.frame(dt, renderMs)
       and type(V.mod.fetch.poll) == "function" then
     local ok, st = pcall(V.mod.fetch.poll, V.mod.fetch, sendHandle)
     if ok and st and st.status ~= "pending" then
+      -- The job settled.  The engine worker does not report through the
+      -- send notice, so surface its result here: a failure is important
+      -- (stored in the support log and shown), a success is a trace.
+      if st.status == "ok" then
+        Overlay.trace("log send confirmed")
+      else
+        Overlay.note("log send failed: %s", tostring(st.err or st.status))
+      end
+      pcall(V.mod.fetch.release, V.mod.fetch, sendHandle)
+      sendHandle = nil
+    elseif ok and clock() - sendAt > 40 then
+      -- A worker that hangs (e.g. a stuck process spawn) leaves the job
+      -- pending forever; every further F8 then trips the engine's
+      -- 4-in-flight ceiling ("log send failed: nil").  Cancel and drop the
+      -- handle so the next send starts clean.
+      Overlay.note("log send timed out after %ds; cancelling",
+                   math.floor(clock() - sendAt))
+      pcall(V.mod.fetch.cancel, V.mod.fetch, sendHandle)
       pcall(V.mod.fetch.release, V.mod.fetch, sendHandle)
       sendHandle = nil
     elseif not ok then
+      Overlay.note("log send poll failed: %s", tostring(st))
       pcall(V.mod.fetch.release, V.mod.fetch, sendHandle)
       sendHandle = nil
     end
@@ -685,5 +892,25 @@ function Overlay.install()
   end)
   Overlay.note("debugger running in background -- F9 shows/hides, F10 verbosity")
 end
+
+-- The DEBUGGER option: the same visibility flag as F9, reachable from the
+-- VOXEL SETTINGS screen and the mod manager's page (Android has no F9 key,
+-- and its SELECT hold chord is gated off mobile).  Values { false, true }
+-- make the manager's schema a toggle.  main.lua's always-running tick
+-- applies it, re-asserting only when the stored value changes so it never
+-- fights a manual F9 toggle.
+local ModSetting = V.require("ModSetting")
+Overlay.setting = ModSetting.new("debugger", "DEBUGGER", { false, true },
+                                 { "OFF", "ON" })
+
+-- The log-send consent flag: false until the player answers YES to the
+-- one-time prompt in askConsent. Stored through the same options store
+-- as every other setting (the live save's options, the loader's copy
+-- mod.options:get reads, then the options file), so the answer survives
+-- restarts and New Game. It is not registered as a row anywhere -- it is
+-- the prompt's memory, not a setting to fiddle with -- but it lives in
+-- the shared store, so a future row could read it.
+Overlay.consentSetting = ModSetting.new("log_consent", "LOG CONSENT",
+                                        { false, true }, { "NO", "YES" })
 
 return Overlay
