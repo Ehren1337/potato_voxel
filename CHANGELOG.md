@@ -1,5 +1,34 @@
 # Changelog
 
+## [1.7.2] - 2026-08-16
+
+### Changed: logs send every 90 seconds
+
+- The automatic log send drops from every 15 minutes to every 90
+  seconds of game time. The LOGS TO DEV row still gates every send.
+
+### Fixed: GPU identity field order
+
+- LÖVE 11's getRendererInfo returns (name, version, vendor, device) but
+  the capture stored them scrambled, so a Deck log's gpu line degraded
+  to "OpenGL AMD" -- and the L4T slug rule could miss a real Tegra
+  chip string landing in the version slot. The mapping is corrected and
+  the Tegra matcher now reads all four fields.
+
+### Fixed: debug panel state leaks
+
+- The F9 panel and F6 class map drew in the hud pass without saving or
+  restoring scissor and blend state -- a text-box scissor clipped the
+  panel (read as broken) and leaked into whatever drew next. Both views
+  now capture, clear and restore it.
+
+### Changed: the Steam Deck rides the low-end compression class
+
+- Platform.isSteamDeck() detects the vangogh / neptune renderer
+  signature and joins the lz4-first compression class -- the Deck's
+  zlib compress stalls measured 500-680 ms in the field, the same class
+  the Raspberry Pi had in 1.6.11.
+
 ## [1.7.1] - 2026-08-16
 
 ### Fixed: Switch-under-L4T sessions tag as switch
