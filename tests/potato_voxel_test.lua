@@ -440,11 +440,17 @@ if brick then
       box.opts.choice(true)
     end
     -- Without a send capability the export must never ask: the local
-    -- dump is the whole action there.
+    -- dump is the whole action there. The engine loader now provides
+    -- mod.postLog unconditionally, so this sub-case clears both the
+    -- transport and the manifest's log_url explicitly.
+    local noSendPostLog, noSendManifest = mod.postLog, mod.manifest
+    mod.postLog = nil
+    mod.manifest = nil
     T.check(not DebugOverlay.canSend(),
             "no postLog or log_url means nothing can be sent")
     DebugOverlay.export(consentGame)
     T.check(stackPushed == nil, "a local-only export does not prompt")
+    mod.postLog, mod.manifest = noSendPostLog, noSendManifest
     mod.postLog = function(_, body) sends = sends + 1 lastBody = body return true end
     mod.manifest = { log_url = "https://logs.example.invalid/logs" }
     T.check(DebugOverlay.canSend(),

@@ -39,6 +39,11 @@ local function withOS(osName, fn)
   EnginePlatform._resetForTests()
   local ok, err = pcall(fn)
   EnginePlatform._resetForTests()
+  -- Restore the shim's real getOS: _G.love is the SDK's SHARED love
+  -- table, so mutating it in place and only restoring the reference
+  -- leaks the stub to every later test (a leaked "NX" flipped the
+  -- off-Switch codec assertions on CI).
+  _G.love.system.getOS = oldOS
   _G.love = oldLove
   if not ok then error(err, 0) end
 end
@@ -597,10 +602,10 @@ end
 
 withOS("OS X", function()
   freshManifestCache()
-  Assets.invalidate()   -- callback 1: the boot handoff, skipped by design
-  T.check(not manifestGone(), "desktop: first handoff keeps the manifest")
-  Assets.invalidate()   -- callback 2: a real invalidation off-Switch
-  T.check(manifestGone(), "desktop: second handoff drops the manifest")
+  Assets.invalidate()   -- the boot handoff (or a later one: loadMod may
+  Assets.invalidate()   -- have fired the engine's handoff already)
+  T.check(manifestGone(),
+          "desktop: invalidations land once the boot handoff is past")
 end)
 
 withOS("NX", function()
@@ -608,7 +613,7 @@ withOS("NX", function()
   Assets.invalidate()
   Assets.invalidate()   -- the observed double boot handoff
   T.check(not manifestGone(),
-          "Switch: double boot handoff must keep the manifest")
+          "Switch: boot-time invalidations must keep the manifest")
   ChunkMesher.request(fakeMap, true, {}, false, true)
   Assets.invalidate()
   T.check(manifestGone(),
