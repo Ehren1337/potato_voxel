@@ -213,9 +213,14 @@ end
 local function tegraRenderer()
   local ri = health.renderer and health.renderer.renderer
   if not ri then return false end
-  local s = ("%s %s %s"):format(tostring(ri.name or ""),
-                                 tostring(ri.vendor or ""),
-                                 tostring(ri.device or "")):lower()
+  -- all four fields: the chip string lands where the driver puts it --
+  -- LÖVE 11 names it in `device`, some Mesa builds only in `version` --
+  -- and a matcher that missed the real field is what a Steam Deck log
+  -- once proved possible (its vangogh signature lived in version).
+  local s = ("%s %s %s %s"):format(tostring(ri.name or ""),
+                                    tostring(ri.vendor or ""),
+                                    tostring(ri.device or ""),
+                                    tostring(ri.version or "")):lower()
   return s:find("tegra", 1, true) ~= nil
       or s:find("nv13", 1, true) ~= nil
       or s:find("gm20", 1, true) ~= nil
@@ -1014,14 +1019,18 @@ function Overlay.captureEnvironment()
   if g then
     if g.getRendererInfo then
       -- LÖVE 12 returns one table (name/vendor/device/version); LÖVE 11
-      -- returns four values. Both are the same identity -- the GPU and
-      -- the backend behind every render and shadow issue.
+      -- returns four values, in the order (name, version, vendor, device)
+      -- -- the field order matters: a Deck log once stored "AMD" as the
+      -- device and left the vangogh signature in the version slot, which
+      -- is how the GPU line degraded to "OpenGL AMD". Both shapes are the
+      -- same identity -- the GPU and the backend behind every render and
+      -- shadow issue.
       local ok, a, b, c, d = pcall(g.getRendererInfo)
       if ok and type(a) == "table" then
         out.renderer = dataCopy(a)
       elseif ok and a then
-        out.renderer = { name = tostring(a), vendor = tostring(b or ""),
-                         device = tostring(c or ""), version = tostring(d or "") }
+        out.renderer = { name = tostring(a), version = tostring(b or ""),
+                         vendor = tostring(c or ""), device = tostring(d or "") }
       end
     end
     if g.getDimensions then

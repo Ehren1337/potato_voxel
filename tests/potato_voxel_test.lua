@@ -243,6 +243,35 @@ if brick then
           "non-Mali battles stay blob-decals below HIGH")
   T.check(brick.battleActorShadowMap(1),
           "HIGH battles keep the actor map")
+  -- The Steam Deck: its vangogh renderer rides the low-end compression
+  -- class (the Deck's zlib compress stalls measured 500-680ms -- the
+  -- same class the Pi had in 1.6.11). The LÖVE 11 shape (four values:
+  -- name, version, vendor, device) is what the engine's LOVE answers.
+  do
+    local ModPlatform = exports.lib.require("Platform")
+    local oldDeckRI = loveG and loveG.getRendererInfo
+    if loveG then
+      loveG.getRendererInfo = function()
+        return "OpenGL", "4.6 (Core Profile) Mesa 25.3.0",
+               "AMD Custom GPU 0932 (radeonsi, vangogh, LLVM 20.1.8)",
+               "AMD"
+      end
+    end
+    ModPlatform._resetForTests()
+    T.check(ModPlatform.isSteamDeck() == (loveG ~= nil),
+            "a vangogh renderer string is detected as the Deck")
+    if loveG then
+      T.eq(ModPlatform.lowEnd(), true,
+           "the Deck rides the low-end compression class")
+    end
+    if loveG then loveG.getRendererInfo = oldDeckRI end
+    ModPlatform._resetForTests()
+    if loveG then
+      T.check(not ModPlatform.isSteamDeck(),
+              "a non-vangogh GPU is not the Deck")
+    end
+    ModPlatform._resetForTests()
+  end
   -- The sun-grazing slack: the slope term scales with the shear's magnitude
   -- (the cotangent of the sun's elevation), so a dawn/dusk or moonlit frame
   -- keeps its acne margin instead of streaking. Noon is the calibration
@@ -570,6 +599,25 @@ if brick then
         _G.love = oldLove
         T.eq(DebugOverlay._platformSlug(), "switch",
              "a Tegra renderer under Linux slugs as switch (L4T)")
+        -- the LÖVE 11 four-value shape, with the Tegra string in the
+        -- DEVICE slot where real Mesa builds put it -- pins the field
+        -- order so the Deck's scrambled-fields bug cannot come back
+        Platform._resetForTests()
+        _G.love = {
+          system = { getOS = function() return "Linux" end },
+          graphics = {
+            getRendererInfo = function()
+              return "OpenGL", "4.5", "NVIDIA", "Tegra X1 (NV13B)"
+            end,
+          },
+        }
+        DebugOverlay.captureEnvironment()
+        Platform._resetForTests()
+        _G.love = oldLove
+        T.eq(DebugOverlay._platformSlug(), "switch",
+             "the LÖVE 11 field order keeps the Tegra device in the match")
+        T.eq(DebugOverlay.status().renderer.renderer.device, "Tegra X1 (NV13B)",
+             "the LÖVE 11 field order lands device in the device slot")
         Platform._resetForTests()
         _G.love = {
           system = { getOS = function() return "Linux" end },
