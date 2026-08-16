@@ -967,7 +967,16 @@ function Overlay.draw()
   if not g then return end
   local prevFont, okF = pcall(g.getFont)
   local prevColor = { g.getColor() }
+  -- the hud pass can be running under a text-box SCISSOR or a UI BLEND
+  -- (glow), and neither was restored -- a scissored panel reads as
+  -- broken and a poisoned state breaks whatever draws next. Capture,
+  -- clear, restore, the same discipline the font and colour keep.
+  local okSc, sx, sy, sw, sh = pcall(g.getScissor)
+  local prevScissor = okSc and sx and { sx, sy, sw, sh } or nil
+  local okBl, prevBlend, prevBlendAlpha = pcall(g.getBlendMode)
   pcall(g.setFont, nil)
+  pcall(g.setScissor)
+  pcall(g.setBlendMode, "alpha", "alphamultiply")
   local lineH = 11
   local shown = {}
   for _, line in ipairs(lines) do
@@ -987,6 +996,8 @@ function Overlay.draw()
   end
   if okF then pcall(g.setFont, prevFont) end
   g.setColor(prevColor[1], prevColor[2], prevColor[3], prevColor[4])
+  pcall(g.setScissor, prevScissor)
+  pcall(g.setBlendMode, prevBlend, prevBlendAlpha)
 end
 
 function Overlay.captureEnvironment()

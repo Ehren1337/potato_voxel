@@ -155,6 +155,11 @@ function ShapeDebug.draw(game)
   local y = 4
 
   local prevColor = { lg.getColor() }
+  local okSc, sx, sy, sw, sh = pcall(lg.getScissor)
+  local prevScissor = okSc and sx and { sx, sy, sw, sh } or nil
+  local okBl, prevBlend, prevBlendAlpha = pcall(lg.getBlendMode)
+  pcall(lg.setScissor)
+  pcall(lg.setBlendMode, "alpha", "alphamultiply")
   lg.setColor(0, 0, 0, 0.62)
   lg.rectangle("fill", x - 2, y - 2, entry.w * scale + 4, entry.h * scale + 4)
   lg.setColor(1, 1, 1, 1)
@@ -169,6 +174,8 @@ function ShapeDebug.draw(game)
                  2 * scale, 2 * scale)
   end
   lg.setColor(prevColor[1], prevColor[2], prevColor[3], prevColor[4])
+  pcall(lg.setScissor, prevScissor)
+  pcall(lg.setBlendMode, prevBlend, prevBlendAlpha)
 end
 
 function ShapeDebug.toggle()
