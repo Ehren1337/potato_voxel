@@ -1,5 +1,41 @@
 # Changelog
 
+## [1.7.5] - 2026-08-16
+
+### Added: player support ID (8-digit token)
+
+- Each install mints a random 8-digit token (stored in the per-install
+  OPTIONS store, shown on the debugger panel's top line and as a
+  read-only PLAYER ID row in VOXEL SETTINGS) and ships it inside
+  consented log payloads (`playerId`). Privacy contract: the token has
+  no link to any personal data and only identifies a player once they
+  volunteer it in a support chat -- the playthroughId is deliberately
+  never uploaded, so no log can be matched to a save without the
+  player's involvement. The loghook server stores it per session, and
+  the tracker workbook gains a PlayerId column for filtering.
+
+## [1.7.6] - TBD (threaded geometry workers, needs engine PR #1454)
+
+### Added: threaded geometry workers for the prebuilder (multi-core fills)
+
+- The pure CPU phase of a cache job (Structures analysis, geometry
+  streams, aux flattening) now runs on up to two love.thread workers,
+  so a cold-cache fill on a multi-core desktop/linux/windows machine
+  builds several maps at once instead of one serial coroutine. The main
+  thread keeps map loads, storage writes and mesh uploads; the workers
+  exchange only data tables plus the shared tileset image, and the
+  saved payloads are byte-identical to a serial build (the manifest,
+  resume and verify machinery is untouched). Design:
+  docs/threaded-geometry-design.md.
+- The engine must grant the new `compute` permission (src/mods/Sandbox.lua
+  in the engine) for threads to spawn; engines without it -- Switch,
+  Android, the brick profile, and any engine that has not shipped the
+  grant -- run the serial pump exactly as before, with zero behaviour
+  change (a 60s worker stall also falls back to serial mid-build).
+- Dev tooling: `tools/thread_smoke` runs the real threaded round trip
+  under the desktop love binary (`love tools/thread_smoke`).
+
+
 ## [1.7.4] - 2026-08-16
 
 ### Fixed: Windows could never cache aux meshes (reserved filename)

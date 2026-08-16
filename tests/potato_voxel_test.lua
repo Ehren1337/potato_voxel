@@ -12,11 +12,32 @@ T.check(exports ~= nil, "mod exports a table")
 -- manager page makes). The SDK stub has neither, so the suite installs a
 -- functional store and a fake game whose save carries it.
 local optionsState = { modOptions = {} }
+optionsState.modOptions.potato_voxel = {}
 exports.lib.mod.options = {
   get = function(_, key) return optionsState.modOptions.potato_voxel[key] end,
+  set = function(_, key, value)
+    optionsState.modOptions.potato_voxel[key] = value
+  end,
 }
 local fakeGame = { save = { options = optionsState },
                    writeOptions = function() end }
+
+-- --- the player support token (PlayerId) ----------------------------------
+-- 8 digits, minted once per install, persisted in OPTIONS (per-install,
+-- not per-save), stable within the session, and carried in consented log
+-- payloads. It is the only way a support thread can match a player to
+-- their logs, because the player must volunteer it first.
+local PlayerId = exports.lib.require("PlayerId")
+PlayerId._resetForTests()
+local token = PlayerId.ensure()
+T.check(token ~= nil and token:match("^%d%d%d%d%d%d%d%d$") ~= nil,
+        "the player id is an 8-digit token")
+T.eq(PlayerId.get(), token, "the token is stable within the session")
+T.eq(optionsState.modOptions.potato_voxel.player_id, token,
+     "the token persists in the per-install OPTIONS store")
+local secondSession = PlayerId.ensure()
+T.eq(secondSession, token,
+     "a re-ensure reuses the persisted token (one id per install)")
 local brick = exports and exports.brick
 T.check(brick ~= nil and brick.isBrick(), "the one build is the Brick build")
 if brick then
@@ -725,6 +746,8 @@ if brick then
                 "the send carries the engine and mod versions")
         T.check(sent.date and sent.date:match("^%d%d_%d%d_%d%d%d%d$") ~= nil,
                 "the send carries the DD_MM_YYYY log date")
+        T.eq(sent.playerId, token,
+             "the send carries the player support token")
         local status = sent.status
         T.check(status ~= nil, "the send carries the status snapshot")
         if status then

@@ -33,6 +33,8 @@ local V = ...
 
 local Overlay = {}
 
+local PlayerId = V.require("PlayerId")
+
 local MAX_LINES = 20
 local lines = {}         -- the on-screen ring buffer
 local log = {}           -- the recent deduped line ring
@@ -291,6 +293,11 @@ local function jsonPayload()
     gpu = id.gpu,
     date = os.date("%d_%m_%Y"),
   }
+  -- the per-install support token: random, persisted in OPTIONS, visible
+  -- in the debugger; it only identifies a player once they share it
+  -- (PlayerId). Omitted entirely when the store could not be read.
+  local pid = PlayerId.get()
+  if pid then out.playerId = pid end
   if not bootSent and #bootLog > 0 then
     out.boot = {}
     for _, line in ipairs(bootLog) do out.boot[#out.boot + 1] = line end
@@ -324,8 +331,10 @@ end
 -- server stores the organized document as-is).  The ring only covers
 -- what has happened since boot, so a send made early in a session would
 -- otherwise carry no rendering, prebuild, or cache evidence; the
--- snapshot aggregates all of it.  The playthroughId stays local: the
--- upload adds no identifiers.
+-- snapshot aggregates all of it.  The playthroughId stays local.  The
+-- one identifier the upload carries is playerId, the player-facing
+-- 8-digit support token (PlayerId): random per install, visible in the
+-- debugger, and unlinkable to any player who has not shared it.
 
 local function managerLog(kind, msg)
   local mod = V.mod
@@ -1043,6 +1052,12 @@ function Overlay.draw()
   pcall(g.setBlendMode, "alpha", "alphamultiply")
   local lineH = 11
   local shown = {}
+  -- the player-facing support id, always on top when the panel is open:
+  -- this is the token a player reads out in a support chat so their logs
+  -- can be found (PlayerId). Session id rides beside it for a quick
+  -- match against the received file's name.
+  local pid = PlayerId.get() or "--------"
+  shown[#shown + 1] = ("id %s   session %s"):format(pid, tostring(sessionId))
   for _, line in ipairs(lines) do
     if verbose or line:find(" ERROR ") or line:find("FWD%-LOCAL")
        or line:find("mesh job failed") or line:find("SLOW load")

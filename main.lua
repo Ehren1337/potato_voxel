@@ -113,6 +113,7 @@ local MapAtmos = V.require("MapAtmos")
 local Weather = V.require("Weather")
 local VoxelLoading = V.require("VoxelLoading")
 local DebugOverlay = V.require("DebugOverlay")
+local PlayerId = V.require("PlayerId")
 DebugOverlay.install()
 local ShapeDebug = V.require("ShapeDebug")
 ShapeDebug.install()
@@ -882,6 +883,11 @@ for _, entry in ipairs(SETTINGS) do
 end
 mod.options:define(schema)
 
+-- Mint the per-install support token early so the PLAYER ID row and the
+-- debugger show the real id from the title screen (options are live from
+-- load; a missing store leaves the session without an id, never errors).
+PlayerId.ensure()
+
 -- The VOXEL SETTINGS summary the debugger ships: the voxel rung plus every
 -- live setting row as `key=label`, so a received log shows exactly what the
 -- session ran with. Read live at send time through the same paths the rows
@@ -1271,6 +1277,14 @@ local function voxelSettingsRows(game)
     end,
   }
   end
+  rows[#rows + 1] = {
+    id = "potato_voxel:player_id",
+    label = "PLAYER ID",
+    -- the 8-digit support token (PlayerId): read-only, shown so a player
+    -- can share it in a support chat; A does nothing
+    value = function() return PlayerId.get() or "--------" end,
+    activate = function() end,
+  }
   rows[#rows + 1] = {
     id = "potato_voxel:cache_status",
     label = "CACHE STATUS",
