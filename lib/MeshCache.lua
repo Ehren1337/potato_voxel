@@ -1344,6 +1344,11 @@ function MeshCache.loadTerrain(map, slot)
                      tostring(slot), ms, where)
       end
     end
+  else
+    local okD, Overlay = pcall(V.require, "DebugOverlay")
+    if okD and Overlay then
+      Overlay.count("cacheMisses")
+    end
   end
   return mesh, water
 end
@@ -1396,7 +1401,13 @@ function MeshCache.loadAux(map, slot)
   local mkey = metaKey(map, slot, "aux")
   local fp = fingerprint(map, slot .. "Aux")
   local body, meta = readPayload(key, fp)
-  if not body then return nil end
+  if not body then
+    local okD, Overlay = pcall(V.require, "DebugOverlay")
+    if okD and Overlay then
+      Overlay.count("cacheMisses")
+    end
+    return nil
+  end
   repackRaw(key, mkey, fp, body, meta)
   local g = decodeIndexed(body)
   if not g then return nil end

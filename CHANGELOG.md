@@ -1,20 +1,26 @@
 # Changelog
 
-## [1.7.5] - 2026-08-16
+## [1.7.6] - 2026-08-17
 
-### Added: player support ID (8-digit token)
+### Changed: support logs carry the fix-evidence for the field issues
 
-- Each install mints a random 8-digit token (stored in the per-install
-  OPTIONS store, shown on the debugger panel's top line and as a
-  read-only PLAYER ID row in VOXEL SETTINGS) and ships it inside
-  consented log payloads (`playerId`). Privacy contract: the token has
-  no link to any personal data and only identifies a player once they
-  volunteer it in a support chat -- the playthroughId is deliberately
-  never uploaded, so no log can be matched to a save without the
-  player's involvement. The loghook server stores it per session, and
-  the tracker workbook gains a PlayerId column for filtering.
+- Startup capability snapshot: the voxel pipeline's readiness
+  (`available` / `reason`, plus the shader or depth error text when a
+  driver refuses it) is now recorded at game.ready, not only when the
+  engine first asks the pipeline. A device where voxel silently falls
+  back to flat 2D (field log: macOS M5 Pro ran the whole session with
+  the pipeline never asked) now names the gate in the very first send.
+- The `save.writing` trace line carries `texMB` (GPU texture memory at
+  save time). Field logs show autosave freezes of 18-36s that track the
+  atlas growing past ~170MB, so every save line now states the memory
+  pressure it froze under.
+- New `cacheMisses` counter in the session summary and JSON payload:
+  a cold cache fill shows `0 hits (N misses)` per job, and a platform
+  that silently fails to read its cache (Android sessions logged 0-26
+  hits out of ~470 jobs while Windows resumed warm) can no longer hide
+  the miss ratio.
 
-## [1.7.6] - TBD (threaded geometry workers, needs engine PR #1454)
+## [1.7.7] - TBD (threaded geometry workers, needs engine PR #1454)
 
 ### Added: threaded geometry workers for the prebuilder (multi-core fills)
 
@@ -35,6 +41,20 @@
 - Dev tooling: `tools/thread_smoke` runs the real threaded round trip
   under the desktop love binary (`love tools/thread_smoke`).
 
+
+## [1.7.5] - 2026-08-16
+
+### Added: player support ID (8-digit token)
+
+- Each install mints a random 8-digit token (stored in the per-install
+  OPTIONS store, shown on the debugger panel's top line and as a
+  read-only PLAYER ID row in VOXEL SETTINGS) and ships it inside
+  consented log payloads (`playerId`). Privacy contract: the token has
+  no link to any personal data and only identifies a player once they
+  volunteer it in a support chat -- the playthroughId is deliberately
+  never uploaded, so no log can be matched to a save without the
+  player's involvement. The loghook server stores it per session, and
+  the tracker workbook gains a PlayerId column for filtering.
 
 ## [1.7.4] - 2026-08-16
 

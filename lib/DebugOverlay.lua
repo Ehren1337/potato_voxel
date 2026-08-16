@@ -65,8 +65,8 @@ local statsRender = 0
 local statsLast = 0
 
 -- session counters, folded into the summary
-local counters = { jobs = 0, jobFails = 0, cacheHits = 0, slowLoads = 0,
-                   errors = 0, storageFails = 0 }
+local counters = { jobs = 0, jobFails = 0, cacheHits = 0, cacheMisses = 0,
+                   slowLoads = 0, errors = 0, storageFails = 0 }
 local worstFrame = 0
 
 -- This is deliberately data-only: it can be written through mod.storage's
@@ -845,9 +845,9 @@ end
 -- The session verdict, written into the stored log.
 function Overlay.summary()
   local ok, msg = pcall(string.format,
-    "session: %d jobs (%d failed), %d cache hits, %d slow loads, "
+    "session: %d jobs (%d failed), %d cache hits (%d misses), %d slow loads, "
     .. "%d errors, %d storage fails, worst frame %.1fms",
-    counters.jobs, counters.jobFails, counters.cacheHits,
+    counters.jobs, counters.jobFails, counters.cacheHits, counters.cacheMisses,
     counters.slowLoads, counters.errors, counters.storageFails,
     worstFrame)
   if not ok then msg = "session summary unavailable" end

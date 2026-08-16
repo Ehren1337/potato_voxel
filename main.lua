@@ -1707,6 +1707,8 @@ mod.events:on("game.ready", function(payload)
   if payload and payload.game then
     DebugOverlay.bindGame(payload.game)
     DebugOverlay.event("game.ready")
+    local caps = Voxel3D.diagnostics()
+    DebugOverlay.pipelineAvailable(caps.available, caps.reason, caps)
     CachePrebuild.bootstrap(payload.game)
   end
 end)
@@ -1714,7 +1716,14 @@ end)
 mod.events:on("save.writing", function(payload)
   DebugOverlay.event("save.writing")
   if payload and payload.game then DebugOverlay.bindGame(payload.game) end
-  DebugOverlay.trace("event save.writing")
+  local tex = ""
+  if love and love.graphics and love.graphics.getStats then
+    local okS, st = pcall(love.graphics.getStats)
+    if okS and st then
+      tex = (" texMB=%.1f"):format((st.texturememory or 0) / 1048576)
+    end
+  end
+  DebugOverlay.trace("event save.writing%s", tex)
   DayNight.store()
 end)
 
