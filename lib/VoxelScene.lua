@@ -32,6 +32,7 @@ local VoxelGrid = V.require("VoxelGrid")
 local DayNight = V.require("DayNight")
 local FirstPerson = V.require("FirstPerson")
 local ShadowSettings = V.require("ShadowSettings")
+local MapAtmos = V.require("MapAtmos")
 local BattleBillboard = V.require("BattleBillboard")
 local Pokedex = V.require("Pokedex")
 local PaletteFX = require("src.render.PaletteFX")
@@ -731,10 +732,9 @@ end
 -- GPUs they don't reliably (that fight is what put the Android port back on
 -- flat water). Confined to the curve there is no regression to reach: the
 -- flat world never had the far-shore bug in the first place.
-function VoxelScene.drawWater(draws, cast)
+function VoxelScene.drawWater(draws, cast, waterProfile)
   -- prepass only under the bend; see the header
-  local curved = (Voxel3D.curveK or 0) > 0
-  if curved then
+  local curved = (Voxel3D.curveK or 0) > 0  if curved then
     for _, d in ipairs(draws) do
       Voxel3D.draw(d[1], d[2], d[3])
     end
@@ -751,7 +751,7 @@ function VoxelScene.drawWater(draws, cast)
       screen = { w, h }, cell = Voxel3D.cell, fov = Voxel3D.fovY,
       skyEdge = Voxel3D.skyEdge, grid = VoxelGrid.enabled(),
       lookFlat = Voxel3D.lookFlat, descent = Voxel3D.descent,
-    })
+    }, waterProfile)
     if ok then
       for _, d in ipairs(draws) do
         Water.draw(d[1], d[2], d[3])
@@ -1000,9 +1000,10 @@ function VoxelScene.render(state, w, h, vw, vh, paletteFor, eyes)
   Voxel3D.glassNight = outdoor and DayNight.windowLight() or 0
   local g = VoxelScene.glintStep(glint, cx, cy)
   Voxel3D.glassPhase, Voxel3D.glassGlint = g.phase, g.amp
-  -- The FOREST FX atmosphere is gone (see the removals ADR): every map
-  -- draws under clear air, so the scene shader gets no fog.
-  Voxel3D.fog = nil
+  -- the map's haze, when the player has the ATMOS row on and the map has
+  -- an entry (see MapAtmos / data/voxel_atmos.lua); nil draws under clear
+  -- air, which is every map without one and every map with the row off.
+  Voxel3D.fog = MapAtmos.fogFor(state.map)
 
   local function atlasFor(map)
     return TerrainAtlas.forMap(map, modeColors(paletteFor, map))
@@ -1133,7 +1134,7 @@ function VoxelScene.render(state, w, h, vw, vh, paletteFor, eyes)
   if #waterDraws > 0 then
     VoxelScene.drawWater(waterDraws, function()
       drawCast(state, posed, atlasFor)
-    end)
+    end, Water.profileFor(state.map.tileset and state.map.tileset.id))
   end
 
 

@@ -109,9 +109,13 @@ local HordeHud = V.require("HordeHud")
 local CachePrebuild = V.require("CachePrebuild")
 local MeshCache = V.require("MeshCache")
 local HordeSfx = V.require("HordeSfx")
+local MapAtmos = V.require("MapAtmos")
+local Weather = V.require("Weather")
 local VoxelLoading = V.require("VoxelLoading")
 local DebugOverlay = V.require("DebugOverlay")
 DebugOverlay.install()
+local ShapeDebug = V.require("ShapeDebug")
+ShapeDebug.install()
 DebugOverlay.setProbe(function()
   local done, total, running, eta = CachePrebuild.progress()
   return {
@@ -510,6 +514,13 @@ mod.content.render_pipelines:register("voxel", {
       DebugOverlay.note("drawWorld: first scene render (%.0fms)", renderMs)
     end
     if not canvas then return nil end   -- fall back to the 2D path
+    -- the weather field advances on the same clock as the scene: the
+    -- drops fall through menus and dialogs like the hour's light does
+    local wcam = ctx.state and ctx.state.camera
+    if wcam then
+      Weather.update(ctx.state.map, wcam.x + ctx.vw / 2,
+                     wcam.y + ctx.vh / 2, ctx.vw, ctx.vh)
+    end
     if Voxel3D.beginOverlay() then
       -- the FX closures are ordinary 2D draws sized in DISPLAY pixels, and
       -- they are drawing into the supersampled canvas alongside everything
@@ -524,6 +535,9 @@ mod.content.render_pipelines:register("voxel", {
       -- headset never reaches this line (drawWorld returns the mirror
       -- above) -- lib/VR draws the same HUD onto each eye instead.
       HordeHud.drawFlat(crw, crh, ctx.scale * AntiAlias.factor() * rs)
+      -- falling weather, drawn through the same project() seam the FX
+      -- closures use -- world-anchored, in front of everything
+      Weather.draw(ctx.scale * AntiAlias.factor() * rs, Voxel3D.project)
       Voxel3D.endOverlay()
     end
     -- and back to the window's own size, which is what the engine composites
@@ -553,6 +567,7 @@ mod.content.render_pipelines:register("voxel", {
     AntiAlias.invalidate()
     Upscale.invalidate()
     VoxelLoading.invalidate()
+    Weather.invalidate()
     DebugOverlay.trace("pipeline invalidate (context change)")
     ChunkMesher.invalidate()   -- no map id = every cached mesh
     VR.invalidate()            -- the mirror, and FBO ids of dead canvases
@@ -728,6 +743,18 @@ local SETTINGS = {
       "or DAWN, run it",
       "on CYCLE, or SYNC",
       "to the wall clock." } },
+  { MapAtmos.setting,
+    { "Map haze on the",
+      "weather maps (the",
+      "forest, the caves).",
+      "OFF keeps clear",
+      "air everywhere." } },
+  { Weather.setting,
+    { "Falling rain and",
+      "snow on the maps",
+      "that have them.",
+      "OFF keeps clear",
+      "skies everywhere." } },
   -- Marked `full` for the opposite reason the battle rows are: this is not a
   -- knob on the look at all, it is what the look COSTS. FULL is a preset for
   -- the diorama, not a licence to spend four times the fill rate on the
@@ -790,6 +817,14 @@ local SETTINGS = {
       "panel. OFF hides",
       "it; the background",
       "log still records." } },
+  -- The opt-out send toggle: ON by default, ships the log automatically
+  -- every 15 minutes of game time and on every manual export. OFF stops
+  -- all sends until it is turned back on.
+  { DebugOverlay.sendSetting,
+    { "Send logs to the",
+      "developer over the",
+      "internet. OFF stops",
+      "all sends." } },
 }
 
 -- The mod manager's page lists this mod's settings from the same schema:
@@ -954,6 +989,12 @@ do
     end
     if key == "f8" and not (top and top.onKeyPressed) then
       DebugOverlay.export(self)
+      return
+    end
+    -- F6: the class-map view -- every tile tinted by its resolved shape
+    -- class (see lib/ShapeDebug.lua). Debug-only, like F9/F10/F8.
+    if key == "f6" and not (top and top.onKeyPressed) then
+      ShapeDebug.toggle()
       return
     end
     -- A screen with its own key handler gets the key first, exactly as the
