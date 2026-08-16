@@ -31,6 +31,70 @@ if brick then
   local OverworldBattle = exports.lib.require("OverworldBattle")
   local QualityMode = exports.lib.require("QualityMode")
   local DayNight = exports.lib.require("DayNight")
+  local MapAtmos = exports.lib.require("MapAtmos")
+  T.eq(MapAtmos.setting:get(), false, "ATMOS defaults OFF")
+  local fakeMap = { id = "VIRIDIAN_FOREST" }
+  T.eq(MapAtmos.fogFor(fakeMap), nil, "ATMOS OFF: clear air even on a weather map")
+  MapAtmos.setting:setValue(true, fakeGame)
+  local fog = MapAtmos.fogFor(fakeMap)
+  T.check(fog ~= nil, "ATMOS ON: the forest map has a haze record")
+  T.check(fog ~= nil and fog.density > 0 and fog.start >= 0
+          and fog.color[1] > 0, "the haze record carries color/density/start")
+  T.eq(MapAtmos.fogFor({ id = "FIX_TOWN" }), nil,
+       "a map with no entry draws clear air")
+  local bogus = { id = "VIRIDIAN_FOREST" }
+  MapAtmos.setting:setValue(false, fakeGame)
+  T.eq(MapAtmos.fogFor(bogus), nil, "ATMOS OFF again: clear air")
+  local ShapeDebug = exports.lib.require("ShapeDebug")
+  T.eq(ShapeDebug.colorFor(nil), nil, "no shape resolves to no class colour")
+  local waterC = ShapeDebug.colorFor({ class = "water" })
+  T.check(waterC ~= nil and waterC[3] > waterC[1],
+          "water resolves to a blue class colour")
+  local groundC = ShapeDebug.colorFor({ class = "ground" })
+  T.check(groundC ~= nil and groundC[2] > 0.3,
+          "ground resolves to a green class colour")
+  do
+    local S = { shapeAt = { [50] = { class = "wall" } },
+                runs = {}, skip = {} }
+    local plain = ShapeDebug.pixelFor(S, 50)
+    T.check(plain[1] > 0.5 and plain[2] < 0.5, "a wall tile tints red")
+    S.runs[50] = true
+    local run = ShapeDebug.pixelFor(S, 50)
+    T.check(run[2] > plain[2], "a volume run pulls the tint toward white")
+    S.runs[50] = nil
+    S.skip[50] = true
+    local claimed = ShapeDebug.pixelFor(S, 50)
+    T.check(claimed[1] > plain[1] and claimed[3] > plain[3],
+            "a claimed cell pulls the tint toward magenta")
+  end
+  T.check(Water.profileFor(nil) == nil, "no tileset resolves to no wave profile")
+  local gymWater = Water.profileFor("GYM")
+  T.check(gymWater ~= nil and #gymWater.trains == 3
+          and gymWater.swell ~= nil and gymWater.bend ~= nil,
+          "the GYM tileset has a calm wave profile")
+  T.check(Water.waveRate(gymWater.trains) > 0,
+          "a custom profile's rate derives from its own dominant train")
+  T.check(Water.waveRate() > 0, "the default trains still derive a rate")
+  local WeatherD = exports.lib.require("Weather")
+  T.eq(WeatherD.setting:get(), false, "WEATHER defaults OFF")
+  T.eq(WeatherD.entryFor({ id = "VIRIDIAN_FOREST" }), nil,
+       "WEATHER OFF: clear skies even on a weather map")
+  WeatherD.setting:setValue(true, fakeGame)
+  local wEntry = WeatherD.entryFor({ id = "VIRIDIAN_FOREST" })
+  T.check(wEntry ~= nil and wEntry.kind == "rain",
+          "the forest has a rain entry")
+  T.eq(WeatherD.entryFor({ id = "FIX_TOWN" }), nil,
+       "a map with no entry keeps clear skies")
+  local nDrops = WeatherD.dropCount(320, 288, wEntry)
+  T.check(nDrops >= 40 and nDrops <= 220, "the drop pool is bounded")
+  local drop = { x = 10, y = 100, z = 10, phase = 0 }
+  T.eq(WeatherD.stepDrop(drop, 1 / 60, "rain", 0), false,
+       "a rain drop falls without landing")
+  T.check(drop.y < 100, "falling lowers the drop")
+  drop.y = 1
+  T.eq(WeatherD.stepDrop(drop, 1 / 60, "rain", 0), true,
+       "a drop at the ground asks for a respawn")
+  WeatherD.setting:setValue(false, fakeGame)
   T.eq(#Voxel.ANGLES_DEG, 6, "VOXEL keeps OFF/HIGH/MEDIUM/LOW/POTATO/CUSTOM")
   T.eq(Voxel.ANGLE_LABELS[1], "OFF", "VOXEL OFF rung is retained")
   T.eq(Voxel.ANGLE_LABELS[2], "HIGH", "VOXEL HIGH rung is retained")
@@ -228,7 +292,14 @@ if brick then
             "DAWN shadows obey the stretch clamp")
   end
   T.eq(Water.setting.values[1], "off", "WATER defaults off")
-  T.eq(#Water.setting.values, 3, "WATER ladder stays available")
+  T.eq(#Water.setting.values, 4, "WATER ladder stays available")
+  Water.setting:setValue("half", fakeGame)
+  T.eq(Water.level(), 2, "HALF is the reflective reduced-budget rung")
+  T.eq(Water.enabled(), true, "HALF keeps the reflective pass on")
+  Water.setting:setValue("full", fakeGame)
+  T.eq(Water.level(), 3, "FULL is the full-budget reflective rung")
+  Water.setting:setValue("off", fakeGame)
+  T.eq(Water.level(), 0, "WATER back OFF")
   -- FOREST FX was removed with the sandbox release (see the removals ADR):
   -- no setting exists to assert.
   T.eq(AntiAlias.setting.values[1], 0, "AA defaults off")
@@ -407,39 +478,19 @@ if brick then
     DebugOverlay.toggle()
     _G.love = oldLove
   end
-  -- The log-send consent gate: F8 / SEND LOGS / the START chord all land
-  -- on Overlay.export, and a first export that would send stops to ask.
-  -- The engine under test has neither postLog nor a manifest log_url, so
-  -- the gate is exercised with fakes installed -- and with them removed
-  -- the export must pass straight through, exactly as a local-only
-  -- engine does.
+  -- The log-send gate: F8 / SEND LOGS / the START chord all land on
+  -- Overlay.export, and sending is ON by default (opt-out) with no
+  -- prompt -- LOGS TO DEV gates every send. The engine under test has
+  -- neither postLog nor a manifest log_url, so the gate is exercised
+  -- with fakes installed -- and with them removed the export must pass
+  -- straight through, exactly as a local-only engine does.
   do
     local mod = exports.lib.mod
     local oldPostLog, oldManifest = mod.postLog, mod.manifest
-    local oldTextBox = package.loaded["src.render.TextBox"]
-    local sends, lastBody, stackPushed = 0, nil, nil
-    -- The prompt is engine UI (src.render.TextBox); stub it so the gate
-    -- can be driven headlessly. The stub records the text and options the
-    -- mod asked with, so the test can answer the choice itself.
-    package.loaded["src.render.TextBox"] = {
-      new = function(_, text, onDone, opts)
-        stackPushed = { text = text, opts = opts }
-        return stackPushed
-      end,
-    }
-    local fakeStack = { push = function(_, s) stackPushed = s end }
-    local consentGame = { save = { options = optionsState },
-                          writeOptions = function() stackPushed = "wrote" end,
-                          stack = fakeStack }
-    local function answeredYes()
-      local box = stackPushed
-      stackPushed = nil
-      T.check(type(box) == "table" and type(box.opts) == "table",
-              "the consent prompt carries a choice")
-      T.check(box.opts.defaultNo == true, "the consent prompt defaults to NO")
-      box.opts.choice(true)
-    end
-    -- Without a send capability the export must never ask: the local
+    local oldFetch = mod.fetch
+    local sends, lastBody = 0, nil
+    local sendGame = { save = { options = optionsState } }
+    -- Without a send capability the export must never send: the local
     -- dump is the whole action there. The engine loader now provides
     -- mod.postLog unconditionally, so this sub-case clears both the
     -- transport and the manifest's log_url explicitly.
@@ -448,29 +499,19 @@ if brick then
     mod.manifest = nil
     T.check(not DebugOverlay.canSend(),
             "no postLog or log_url means nothing can be sent")
-    DebugOverlay.export(consentGame)
-    T.check(stackPushed == nil, "a local-only export does not prompt")
+    DebugOverlay.export(sendGame)
+    T.eq(sends, 0, "a local-only export sends nothing")
     mod.postLog, mod.manifest = noSendPostLog, noSendManifest
     mod.postLog = function(_, body) sends = sends + 1 lastBody = body return true end
     mod.manifest = { log_url = "https://logs.example.invalid/logs" }
     T.check(DebugOverlay.canSend(),
             "postLog plus a log_url makes a send possible")
-    T.check(not DebugOverlay.consent(),
-            "log-send consent is off before the first export")
-    DebugOverlay.export(consentGame)
-    T.check(stackPushed ~= nil, "the first sendable export asks first")
-    T.eq(sends, 0, "nothing is sent before the prompt is answered")
-    -- YES persists the consent (the same options store every setting
-    -- lives in) and re-runs the export, which now sends.
-    answeredYes()
-    T.check(DebugOverlay.consent(), "a YES is recorded as consent")
-    T.check(optionsState.modOptions.potato_voxel.log_consent == true,
-            "consent is stored in the mod's options")
-    T.eq(sends, 1, "a consented export sends the log")
-    stackPushed = nil
-    DebugOverlay.export(consentGame)
-    T.check(stackPushed == nil, "a consented export never asks again")
-    T.eq(sends, 2, "a consented export sends directly")
+    T.check(DebugOverlay.sendingAllowed(),
+            "log sending defaults to ON (opt-out)")
+    DebugOverlay.export(sendGame)
+    T.eq(sends, 1, "an export sends immediately with no prompt")
+    DebugOverlay.export(sendGame)
+    T.eq(sends, 2, "a second export sends directly too")
     -- The send identity carries the platform AND the GPU the log came
     -- from.  The engine's Platform module answers the OS; captureEnvironment
     -- answers the renderer (LÖVE 12's table shape) and the DPI scale --
@@ -507,8 +548,7 @@ if brick then
               and statusSettings:find(" water=", 1, true) ~= nil
               and statusSettings:find(" shadows=", 1, true) ~= nil,
               "the status snapshot carries the VOXEL SETTINGS line")
-      stackPushed = nil
-      DebugOverlay.export(consentGame)
+      DebugOverlay.export(sendGame)
       T.eq(sends, 3, "a consented export sends after the platform capture")
       -- The send is ONE organized JSON document (schema 3): identity
       -- fields at the top (the server names and sorts the file from
@@ -570,8 +610,7 @@ if brick then
           spriteReady = false, passCounts = { aborts = 0 } } }
       end)
       DebugOverlay.runProbe()
-      stackPushed = nil
-      DebugOverlay.export(consentGame)
+      DebugOverlay.export(sendGame)
       T.eq(sends, 4, "a consented export sends with the stubbed probe")
       local okJ2, Json2 = pcall(require, "src.link.Json")
       local sent2 = okJ2 and Json2.decode(lastBody)
@@ -600,20 +639,40 @@ if brick then
         }
       end)
     end
-    -- NO sends nothing and leaves the flag unset, so the next export
-    -- asks again.
-    optionsState.modOptions.potato_voxel.log_consent = nil
-    T.check(not DebugOverlay.consent(), "a declined consent stays unset")
-    DebugOverlay.export(consentGame)
-    T.check(stackPushed ~= nil, "an unconsented export asks again")
-    stackPushed.opts.choice(false)
-    T.eq(sends, 4, "a declined prompt sends nothing")
-    T.check(not DebugOverlay.consent(), "declining leaves the flag unset")
-    -- No UI to ask on: refuse rather than ship logs silently.
-    stackPushed = nil
-    DebugOverlay.export({})
-    T.check(stackPushed == nil and sends == 4,
-            "an export with no prompt available sends nothing")
+    -- OFF stops the send while the local dump still happens, and the
+    -- stored value is read live, so a manager-page write takes effect
+    -- on the very next export.
+    optionsState.modOptions.potato_voxel.send_logs = false
+    T.check(not DebugOverlay.sendingAllowed(), "the toggle reads the stored OFF")
+    DebugOverlay.export(sendGame)
+    T.eq(sends, 4, "an export sends nothing while LOGS TO DEV is OFF")
+    optionsState.modOptions.potato_voxel.send_logs = true
+    T.check(DebugOverlay.sendingAllowed(), "the toggle reads the stored ON")
+    DebugOverlay.export(sendGame)
+    T.eq(sends, 5, "turning LOGS TO DEV back ON restores sending")
+    -- The automatic send: every 15 minutes (900 s) of accumulated game
+    -- time the frame tick ships the log with no keypress. The schedule
+    -- is a next-deadline, so a skipped interval fires at the first tick
+    -- past it -- and OFF silences it like every other send. The fake
+    -- fetch settles each handle so the next interval can send.
+    do
+      mod.fetch = {
+        poll = function() return { status = "ok" } end,
+        release = function() end,
+        cancel = function() end,
+      }
+      optionsState.modOptions.potato_voxel.send_logs = false
+      DebugOverlay.frame(900)
+      T.eq(sends, 5, "the auto-send respects LOGS TO DEV OFF")
+      optionsState.modOptions.potato_voxel.send_logs = true
+      DebugOverlay.frame(0.01)
+      T.eq(sends, 6, "the frame tick auto-sends once 15 minutes of game time pass")
+      DebugOverlay.frame(899.99)
+      T.eq(sends, 6, "the next interval needs its own 15 minutes of game time")
+      DebugOverlay.frame(0.01)
+      T.eq(sends, 7, "the auto-send repeats every 15 minutes of game time")
+      mod.fetch = oldFetch
+    end
     -- Delta sends: after a successful send the next payload carries only
     -- the ring lines added since (the watermark advances on success, and
     -- a failed send keeps it so the next send retries the same delta).
@@ -631,14 +690,14 @@ if brick then
         return true
       end
       mod2.manifest = { log_url = "https://logs.example.invalid/logs" }
-      optionsState.modOptions.potato_voxel.log_consent = true
+      optionsState.modOptions.potato_voxel.send_logs = true
       local Json2 = require("src.link.Json")
       -- Emit a couple of distinct lines through the overlay so the ring
       -- has content, then send twice and inspect the deltas.
       DebugOverlay.note("delta marker one")
       DebugOverlay.note("delta marker two")
-      DebugOverlay.export(consentGame)
-      DebugOverlay.export(consentGame)
+      DebugOverlay.export(sendGame)
+      DebugOverlay.export(sendGame)
       T.eq(#bodies, 2, "two consented exports send")
       local first = bodies[1] and Json2.decode(bodies[1])
       local second = bodies[2] and Json2.decode(bodies[2])
@@ -658,9 +717,9 @@ if brick then
         -- Failed send: watermark stays, next send retries the same delta.
         local before = #bodies
         failNext = true
-        DebugOverlay.export(consentGame)
+        DebugOverlay.export(sendGame)
         T.eq(#bodies, before, "a rejected send does not count as sent")
-        DebugOverlay.export(consentGame)
+        DebugOverlay.export(sendGame)
         T.eq(#bodies, before + 1, "the next send goes out")
         local retried = bodies[#bodies] and Json2.decode(bodies[#bodies])
         T.check(retried ~= nil and type(retried.ring) == "table",
@@ -669,7 +728,6 @@ if brick then
       mod2.postLog, mod2.manifest = oldPostLog2, oldManifest2
     end
     mod.postLog, mod.manifest = oldPostLog, oldManifest
-    package.loaded["src.render.TextBox"] = oldTextBox
   end
 end
 

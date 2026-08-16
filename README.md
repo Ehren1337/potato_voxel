@@ -67,26 +67,34 @@ conflicts with `DRAMATIC_SHAPE`, `ds_fp_ceiling`, the pre-rename
 `dramatic_shape_brick`, `BATTLE_ART_VOXEL_FORK` and `DRAMALESS_SHAPE`;
 only one may run at a time.
 
-## Diagnostics (hidden)
+## Diagnostics (sent automatically -- opt out)
 
 The debugger records diagnostics in the background from boot. F9 shows or
-hides its panel, F10 switches its detail level, and F8 exports its log plus a
-capability probe. The export preserves early boot evidence, recent runtime
-lines, and a data-only `debug/status` record containing pipeline eligibility,
-shader/canvas reasons, cache/storage state, world render-path counters, and
-the identity of the device it came from: the platform (Windows, OS X, Linux,
-Android, iOS, consoles), the GPU (backend, vendor, device, version) and the
-DPI scale, the session's VOXEL SETTINGS (rung and every live knob as
-`key=label`), plus the full shadow-system state (shader precision, depth
-binding, sprite layer) and the retained failure text when the shadow or
-voxel pass is unavailable. It does not add a visible panel until you press
-F9.
+hides its panel, F10 switches its detail level, F6 shows or hides the
+class-map view (every tile tinted by its resolved shape class -- the
+profile-authoring aid), and F8 exports its log plus a capability probe.
+The export preserves early boot evidence, recent runtime lines, and a
+data-only `debug/status` record containing pipeline eligibility,
+shader/canvas reasons, cache/storage state, world render-path counters,
+and the identity of the device it came from: the platform (Windows, OS X,
+Linux, Android, iOS, consoles), the GPU (backend, vendor, device, version)
+and the DPI scale, the session's VOXEL SETTINGS (rung and every live knob
+as `key=label`), plus the full shadow-system state (shader precision,
+depth binding, sprite layer) and the retained failure text when the
+shadow or voxel pass is unavailable. It does not add a visible panel
+until you press F9.
 
-The first export that would send a log to the mod's log service (F8, the
-START hold chord, or SEND LOGS in VOXEL SETTINGS) asks first: a one-time
-prompt explains that the log goes to the mod developer over the internet
-and defaults to NO. Accepting stores the decision in the mod's options,
-so later exports never ask again; declining ships nothing.
+The log is sent to the mod developer over the internet through the
+engine's log service: automatically every 15 minutes of game time, and
+on demand with F8, the START hold chord or SEND LOGS in VOXEL SETTINGS.
+It contains no name, account, save data, IP address or other identifier;
+each session's log is identified only by a random session number.
+
+Sending is ON by default and can be turned off in VOXEL SETTINGS (LOGS
+TO DEV) or on the mod manager's page; OFF stops all sends until it is
+turned back on. Logs are kept by the developer for up to 90 days, then
+deleted, and are used only to fix crashes and tune performance on
+devices the developer does not own.
 
 ## Develop & test
 

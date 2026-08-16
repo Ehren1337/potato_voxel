@@ -1,5 +1,67 @@
 # Changelog
 
+## [1.7.0] - 2026-08-16
+
+### Changed: log sending is opt-out
+
+- Diagnostics now go to the developer automatically every 15 minutes of
+  game time (and on demand via F8 / SEND LOGS / the START chord), with
+  no prompt. The one-time consent prompt is gone; the new LOGS TO DEV
+  row (ON by default) in VOXEL SETTINGS and on the mod manager's page
+  turns all sending off permanently.
+
+### Changed: mesh uploads are budget-sliced, and upload failures are loud
+
+- Fresh builds slice their upload through the same 8k-vertex budget
+  path as the rest of the job instead of one-shotting the whole mesh
+  inside a pumped frame. Every upload call now checks its result and
+  drops the mesh on failure -- a failed upload fails the job loudly
+  (logged, flat-2D fallback) instead of leaving a silently zeroed
+  mesh. (A flat-array upload variant was tried and reverted: this
+  engine's LOVE 11.5 rejects flat vertex arrays on a vertex-count
+  mesh, counting elements as vertices -- and the old unchecked pcall
+  turned that rejection into zeroed terrain meshes on every cache
+  load.)
+
+### Changed: character shadow-caster matrices built in place
+
+- `Voxel3D.casterMatrix` no longer allocates -- it builds into shared
+  scratch matrices, removing the cast pass's biggest per-frame GC
+  source (runs once per character per frame, twice under water).
+
+### Added: ATMOS row -- per-map haze
+
+- `data/voxel_atmos.lua` names per-map fog records (forest haze, cave
+  gloom); the ATMOS row (OFF by default) turns them on. The scene
+  shader's fog path -- unused since the 1.6.1 removals -- is fed
+  again, and the water surface reads the same air its banks do.
+
+### Added: WEATHER row -- rain and snow
+
+- `data/voxel_weather.lua` names per-map entries; drops fall in world
+  space through the FX overlay (parallax, no depth writes), drawn as
+  one stream mesh. Rain ships for Viridian Forest; snow is implemented
+  for total conversions.
+
+### Added: WATER HALF rung
+
+- The WATER row is OFF / SKY / HALF / FULL: HALF is the reflective
+  pass at a reduced ray budget (RAY_STEPS 16 / RAY_REFINE 4), a second
+  shader compilation -- FULL is unchanged.
+
+### Changed: per-tileset water wave profiles
+
+- Wave trains, swell and bend are per-pass uniforms now;
+  `Water.WAVE_PROFILES` keys them by tileset id, with a calm GYM pool
+  shipped. The phase rate derives from the active profile's dominant
+  train.
+
+### Added: F6 class-map debug view
+
+- F6 tints every tile of the current overworld by its resolved shape
+  class (volume runs toward white, claimed cells toward magenta) --
+  the authoring aid for the shape profile.
+
 ## [1.6.11] - 2026-08-16
 
 ### Added: structured JSON log payloads + delta sends
