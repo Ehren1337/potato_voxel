@@ -417,7 +417,7 @@ if brick then
     local mod = exports.lib.mod
     local oldPostLog, oldManifest = mod.postLog, mod.manifest
     local oldTextBox = package.loaded["src.render.TextBox"]
-    local sends, stackPushed = 0, nil
+    local sends, lastBody, stackPushed = 0, nil, nil
     -- The prompt is engine UI (src.render.TextBox); stub it so the gate
     -- can be driven headlessly. The stub records the text and options the
     -- mod asked with, so the test can answer the choice itself.
@@ -445,7 +445,7 @@ if brick then
             "no postLog or log_url means nothing can be sent")
     DebugOverlay.export(consentGame)
     T.check(stackPushed == nil, "a local-only export does not prompt")
-    mod.postLog = function() sends = sends + 1 return true end
+    mod.postLog = function(_, body) sends = sends + 1 lastBody = body return true end
     mod.manifest = { log_url = "https://logs.example.invalid/logs" }
     T.check(DebugOverlay.canSend(),
             "postLog plus a log_url makes a send possible")
@@ -465,6 +465,28 @@ if brick then
     DebugOverlay.export(consentGame)
     T.check(stackPushed == nil, "a consented export never asks again")
     T.eq(sends, 2, "a consented export sends directly")
+    -- The send identity carries the platform the log came from.  The
+    -- engine's Platform module answers it; a stubbed OS shows through
+    -- into the send header, the status excerpt and the data snapshot.
+    do
+      local Platform = require("src.core.Platform")
+      local oldLove = _G.love
+      Platform._resetForTests()
+      _G.love = { system = { getOS = function() return "Android" end } }
+      DebugOverlay.captureEnvironment()
+      Platform._resetForTests()
+      _G.love = oldLove
+      T.eq(DebugOverlay.status().platform, "Android (mobile)",
+           "the status snapshot names the platform and its class")
+      stackPushed = nil
+      DebugOverlay.export(consentGame)
+      T.eq(sends, 3, "a consented export sends after the platform capture")
+      T.check(lastBody and lastBody:find("platform: Android (mobile)", 1, true),
+              "the send header carries the platform")
+      T.check(lastBody and lastBody:find("-- status excerpt --", 1, true)
+              and lastBody:find("platform: Android (mobile)", 1, true),
+              "the send's status excerpt carries the platform")
+    end
     -- NO sends nothing and leaves the flag unset, so the next export
     -- asks again.
     optionsState.modOptions.potato_voxel.log_consent = nil
@@ -472,12 +494,12 @@ if brick then
     DebugOverlay.export(consentGame)
     T.check(stackPushed ~= nil, "an unconsented export asks again")
     stackPushed.opts.choice(false)
-    T.eq(sends, 2, "a declined prompt sends nothing")
+    T.eq(sends, 3, "a declined prompt sends nothing")
     T.check(not DebugOverlay.consent(), "declining leaves the flag unset")
     -- No UI to ask on: refuse rather than ship logs silently.
     stackPushed = nil
     DebugOverlay.export({})
-    T.check(stackPushed == nil and sends == 2,
+    T.check(stackPushed == nil and sends == 3,
             "an export with no prompt available sends nothing")
     mod.postLog, mod.manifest = oldPostLog, oldManifest
     package.loaded["src.render.TextBox"] = oldTextBox

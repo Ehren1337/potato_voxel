@@ -82,7 +82,24 @@ local health = {
   probe = { ok = nil },
   lastEvent = nil,
   lastError = nil,
+  platform = nil,
 }
+
+-- The device class these logs come from.  The mod sandbox forbids raw OS
+-- queries, so the answer comes from the engine's own Platform module --
+-- the same one main.lua reads for its mobile gates -- which resolves the
+-- OS name inside engine code.  Captured once at boot: a device does not
+-- change platform mid-session.
+local function platformName()
+  local ok, Platform = pcall(require, "src.core.Platform")
+  if not ok or type(Platform) ~= "table" then return "?" end
+  local okP, info = pcall(Platform.detect)
+  if not okP or type(info) ~= "table" then return "?" end
+  local osName = tostring(info.os or "?")
+  if osName == "?" or osName == "" then return "?" end
+  local kind = info.console and "console" or info.mobile and "mobile" or nil
+  return kind and (osName .. " (" .. kind .. ")") or osName
+end
 
 local function clock()
   local timer = love and love.timer
@@ -132,6 +149,7 @@ local function snapshot()
     renderer = dataCopy(health.renderer),
     storage = dataCopy(health.storage),
     probe = dataCopy(health.probe),
+    platform = health.platform or platformName(),
     lastEvent = dataCopy(health.lastEvent),
     lastError = dataCopy(health.lastError),
     lastPhase = health.lastPhase,
@@ -163,11 +181,12 @@ local function headerText()
   local lv = health.renderer and health.renderer.love
   local loveVer = lv and (tostring(lv.codename) .. " " .. tostring(lv.major)
     .. "." .. tostring(lv.minor)) or "?"
-  return ("-- potato_voxel diagnostic send --\nmod: %s %s\nengine: %s\nlove: %s\nsession: %s\nframe: %s")
+  return ("-- potato_voxel diagnostic send --\nmod: %s %s\nengine: %s\nlove: %s\nplatform: %s\nsession: %s\nframe: %s")
     :format(tostring(manifest and manifest.name or "potato_voxel"),
             tostring(manifest and manifest.version or "?"),
             tostring(ctx.engineVersion or "?"),
-            loveVer, tostring(sessionId), tostring(health.frame))
+            loveVer, tostring(health.platform or platformName()),
+            tostring(sessionId), tostring(health.frame))
 end
 
 -- Flat status excerpt.  The ring only covers what has happened since boot,
@@ -179,6 +198,7 @@ local function snapshotText()
   local function kv(label, value)
     out[#out + 1] = label .. ": " .. tostring(value)
   end
+  kv("platform", health.platform or platformName())
   local c = counters
   kv("counters", ("jobs=%d errors=%d jobFails=%d cacheHits=%d slowLoads=%d storageFails=%d")
     :format(c.jobs, c.errors, c.jobFails, c.cacheHits, c.slowLoads, c.storageFails))
@@ -657,7 +677,8 @@ function Overlay.export(g)
     pcall(print, "[pv-log] " .. line)
   end
   local current = snapshot()
-  pcall(print, "[pv-status] session=" .. tostring(current.session)
+  pcall(print, "[pv-status] platform=" .. tostring(current.platform)
+             .. " session=" .. tostring(current.session)
              .. " frame=" .. tostring(current.frame)
              .. " pipeline=" .. tostring(current.pipeline.availability)
              .. " reason=" .. tostring(current.pipeline.reason)
@@ -846,6 +867,7 @@ end
 function Overlay.captureEnvironment()
   local g = love and love.graphics
   local out = {}
+  health.platform = platformName()
   if love and love.getVersion then
     local ok, major, minor, revision, codename = pcall(love.getVersion)
     if ok then
