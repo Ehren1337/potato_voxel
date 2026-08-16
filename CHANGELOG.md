@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.7.1] - 2026-08-16
+
+### Fixed: Switch-under-L4T sessions tag as switch
+
+- A Linux session whose GPU renderer names a Tegra (`tegra` / `nv13` /
+  `gm20`) now slugs as `switch` -- under L4T the OS reports Linux, so
+  the renderer is the only sandbox-safe hardware witness. Non-Tegra
+  Linux handhelds (the Brick's GE8300) keep their honest `linux` slug.
+
 ## [1.7.0] - 2026-08-16
 
 ### Changed: log sending is opt-out
