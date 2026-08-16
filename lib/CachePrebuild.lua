@@ -428,8 +428,17 @@ function Prebuild.update(covered)
     MeshCache.jobRecord(slotMap, job.slot)
   -- Update the manifest per completed job (F3): an interrupted build now
   -- leaves a manifest naming exactly the jobs whose files survived, so
-  -- the next boot resumes instead of prompting forever.
-  MeshCache.writeProgress(state.completed, state.total)
+  -- the next boot resumes instead of prompting forever. Writing it on
+  -- EVERY job costs a full manifest encode + storage write per job --
+  -- O(n^2) bytes on slow flash, measured as the prebuild's biggest fixed
+  -- overhead -- so it is throttled: every 8 jobs or every 5 seconds,
+  -- plus always on finish/cancel (writeManifest).
+  local since = state.lastProgress or 0
+  if state.done % 8 == 0 or (now() or 0) - since >= 5 then
+    if MeshCache.writeProgress(state.completed, state.total) then
+      state.lastProgress = now()
+    end
+  end
   releaseMap(job.id, state.game)
   state.done = state.done + 1
   state.index = state.index + 1

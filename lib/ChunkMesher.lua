@@ -1454,7 +1454,11 @@ end
 -- for desktop GPUs.
 ChunkMesher.URGENT_SLICE = 0.012
 ChunkMesher.IDLE_SLICE = 0.005
-ChunkMesher.COVERED_SLICE = 0.030
+-- Nothing visible can hitch during covered phases (menus, warps, the
+-- title screen, the loading canvas), so the prebuild takes as much as
+-- the frame can give: 50ms per frame is still under a 60fps budget and
+-- cuts cold-fill wall time roughly 1.6x versus the 30ms slice.
+ChunkMesher.COVERED_SLICE = 0.050
 
 function ChunkMesher.pump(covered)
   if #jobs == 0 then return end

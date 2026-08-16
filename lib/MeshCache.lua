@@ -128,19 +128,31 @@ local function facadeFailed()
 end
 
 -- Storage failure codes worth surfacing: every write/read returns
--- (ok, code, message); a code other than nil is the WHY.
-local function callFail(op, code, message)
+-- (ok, code, message); a code other than nil is the WHY. The failing key
+-- is named so a support log points at the record, not just the code.
+local function callFail(op, key, code, message)
   if code == "not_in_playthrough" or code == "not_at_title" then
     facadeFailed()
   end
   -- not_found (and a nil code from a stub) is the normal empty-cache
-  -- case, not a failure worth logging; every other code is.
+  -- case, not a failure worth logging; invalid_key reads are legacy
+  -- records an older build wrote under an unsanitised key -- the cache
+  -- treats them as absent and logs them once at warning so the triage
+  -- stream names the key without alarming the session.
   if code ~= nil and code ~= "not_found" then
+    local level = (op:find("^read") and code == "invalid_key")
+                  and "warn" or "error"
     local okD, Overlay = pcall(V.require, "DebugOverlay")
     if okD and Overlay then
-      Overlay.count("storageFails")
-      Overlay.error("storage %s: %s (%s)", tostring(op), tostring(code),
-                    tostring(message))
+      if level == "warn" then
+        Overlay.count("storageWarns")
+        Overlay.warn("storage %s %q: %s (%s)", tostring(op),
+                     tostring(key), tostring(code), tostring(message))
+      else
+        Overlay.count("storageFails")
+        Overlay.error("storage %s %q: %s (%s)", tostring(op),
+                      tostring(key), tostring(code), tostring(message))
+      end
     end
   end
   return false
@@ -161,11 +173,11 @@ local function readBytes(key)
     if ok and data then return data end
     -- not_found and type conflicts both fall through: the table shape
     -- may hold what the byte read could not see.
-    callFail("readBytes", code, message)
+    callFail("readBytes", key, code, message)
   end
   local ok, data, code, message = pcall(store_.read, store_,
                                         liveGame(), key)
-  if not ok or not data then callFail("read", code, message) end
+  if not ok or not data then callFail("read", key, code, message) end
   if type(data) == "table" and data.bytes ~= nil then return data.bytes end
   if type(data) == "string" then return data end
   return nil
@@ -178,7 +190,7 @@ local function writeBytes(key, bytes)
     local ok, result, code, message = pcall(store_.writeBytes, store_,
                                             liveGame(), key, bytes)
     if ok and result then return true end
-    callFail("writeBytes", code, message)
+    callFail("writeBytes", key, code, message)
     -- Fall through to the table shape: a playthrough whose keys were
     -- written by an engine without byte storage still has table-typed
     -- values, and a byte write over one is a type conflict -- the table
@@ -196,7 +208,7 @@ local function writeBytes(key, bytes)
                                               liveGame(), key,
                                               { bytes = bytes })
   if not ok2 or not result2 then
-    callFail("write", code2, message2)
+    callFail("write", key, code2, message2)
   end
   return ok2 and result2 and true or false
 end
@@ -206,7 +218,7 @@ local function writeTable(key, value)
   if not store_ or not store_.write then return false end
   local ok, result, code, message = pcall(store_.write, store_,
                                           liveGame(), key, value)
-  if not ok or not result then callFail("write", code, message) end
+  if not ok or not result then callFail("write", key, code, message) end
   return ok and result and true or false
 end
 
@@ -214,7 +226,7 @@ local function readTable(key)
   local store_ = facade()
   if not store_ or not store_.read then return nil end
   local ok, data, code, message = pcall(store_.read, store_, liveGame(), key)
-  if not ok or not data then callFail("read", code, message) end
+  if not ok or not data then callFail("read", key, code, message) end
   return ok and data or nil
 end
 
@@ -223,7 +235,7 @@ local function listKeys(prefix)
   if not store_ or not store_.list then return {} end
   local ok, keys, code, message = pcall(store_.list, store_, liveGame(),
                                         prefix)
-  if not ok then callFail("list", code, message) end
+  if not ok then callFail("list", prefix, code, message) end
   return (ok and keys) or {}
 end
 
@@ -429,12 +441,25 @@ local function safeId(mapId)
   return tostring(mapId):gsub("[^%w_-]", "_")
 end
 
+-- The final KEY SEGMENT becomes the file base name in the engine's storage
+-- ("<key>.bin" / "<key>.lua" + .bak/.tmp). Windows treats AUX, CON, PRN,
+-- NUL, COM1-9 and LPT1-9 as reserved device names and refuses to create
+-- files whose base name matches, case-insensitively -- every aux payload
+-- write failed write_failed/verify_failed on Windows while terrain/water
+-- in the same directory succeeded. The internal kind stays "aux"
+-- (traces, status, manifest); only the on-disk segment changes.
+local function kindSegment(kind)
+  return kind == "aux" and "deco" or kind
+end
+
 local function payloadKey(map, slot, kind)
-  return "maps/" .. safeId(map.id) .. "/" .. tostring(slot) .. "/" .. kind
+  return "maps/" .. safeId(map.id) .. "/" .. tostring(slot) .. "/"
+         .. kindSegment(kind)
 end
 
 local function metaKey(map, slot, kind)
-  return "meta/" .. safeId(map.id) .. "/" .. tostring(slot) .. "/" .. kind
+  return "meta/" .. safeId(map.id) .. "/" .. tostring(slot) .. "/"
+         .. kindSegment(kind)
 end
 
 -- ------------------------------------------------------------- encoding

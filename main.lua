@@ -481,17 +481,28 @@ mod.content.render_pipelines:register("voxel", {
       -- naming the pending count.
       local now = love and love.timer and love.timer.getTime
                  and love.timer.getTime() or 0
+      local pendingNow = ChunkMesher.pending()
       if worldDiag.loadingEntered == 0 then
         worldDiag.loadingEntered = now
         worldDiag.loadingReported = false
+        worldDiag.loadingPending = pendingNow
         DebugOverlay.note("drawWorld: loading canvas (%d pending)",
-                          ChunkMesher.pending())
+                          pendingNow)
       elseif not worldDiag.loadingReported and now > 0
              and now - worldDiag.loadingEntered > 10 then
-        worldDiag.loadingReported = true
-        DebugOverlay.error("drawWorld: stuck loading %.0fs (%d pending)",
-                           now - worldDiag.loadingEntered,
-                           ChunkMesher.pending())
+        -- A slow device legitimately keeps the loading canvas up for
+        -- more than 10s (android 1.7.2 logs: 5 pending builds with a
+        -- 600MB+ texture load at save.loaded). Only a HANG reports:
+        -- pending must make no progress across the window (a finished
+        -- job is progress even if builds remain).
+        if pendingNow >= worldDiag.loadingPending then
+          worldDiag.loadingReported = true
+          DebugOverlay.error("drawWorld: stuck loading %.0fs (%d pending)",
+                             now - worldDiag.loadingEntered, pendingNow)
+        else
+          worldDiag.loadingEntered = now
+          worldDiag.loadingPending = pendingNow
+        end
       end
       DebugOverlay.pipelinePath("loading", {
         pending = ChunkMesher.pending(),

@@ -219,6 +219,16 @@ if MeshCache.available() then
           "saveTerrain stores a terrain payload in the box")
   T.check(fakeStore.peekTables()["meta/A/body/terrain"] ~= nil,
           "each payload leaves a meta summary behind")
+  -- Windows reserved-device names (AUX/CON/PRN/NUL/COM1-9/LPT1-9) cannot
+  -- be file base names: a key ending "/aux" made every aux write fail
+  -- write_failed on Windows while terrain/water in the same directory
+  -- succeeded. The on-disk segment is remapped to "deco"; the internal
+  -- kind and every trace stay "aux".
+  T.check(fakeStore.peekBytes()["maps/A/body/deco"] ~= nil,
+          "aux payloads land under the non-reserved 'deco' segment")
+  T.check(fakeStore.peekBytes()["maps/A/body/aux"] == nil
+          and fakeStore.peekBytes()["maps/A/body/aux.bin"] == nil,
+          "no Windows-reserved aux base name is ever used")
   fakeStore.delete(nil, nil, "manifest")
   local ready = MeshCache.ready({ { id = "A", slot = "body" } })
   T.check(ready, "complete cache without a manifest reports READY")
@@ -231,7 +241,7 @@ if MeshCache.available() then
           "wipe cache removes precache payloads")
   T.check(fakeStore.peekBytes()["maps/A/body/terrain"] == nil
           and fakeStore.peekBytes()["maps/A/body/water"] == nil
-          and fakeStore.peekBytes()["maps/A/body/aux"] == nil,
+          and fakeStore.peekBytes()["maps/A/body/deco"] == nil,
           "wipe cache removes all payload variants")
 
   -- --- Switch: a wipe that does not land is reported, not swallowed -----

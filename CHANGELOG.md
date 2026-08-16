@@ -1,5 +1,43 @@
 # Changelog
 
+## [1.7.4] - 2026-08-16
+
+### Fixed: Windows could never cache aux meshes (reserved filename)
+
+- On Windows, `aux` is a reserved device name (like `CON`, `PRN`, `NUL`):
+  the engine's storage writes `<key>.bin` / `<key>.lua`, and a key ending
+  in `/aux` made every aux payload write fail `write_failed` while
+  terrain and water in the SAME directory succeeded (field logs: 180+
+  failures per session, all aux; the doc in docs/engine-storage-windows-enoent.md
+  chased this as a path/ENOENT problem). The on-disk segment is now
+  `deco`; the internal kind, traces and status stay `aux`. Old payloads
+  are fingerprint-protected and simply stop matching -- one aux rebuild,
+  no migration.
+
+### Fixed: storage failure lines name the offending key
+
+- `storage read/write: <code> (<message>)` now includes the key, so a
+  support log points at the record. Legacy keys an older build wrote
+  unsanitised (the boot `invalid_key` reads on Android) are treated as
+  absent and logged once at warning instead of erroring the session.
+
+### Fixed: the stuck-loading alarm false-positives on slow devices
+
+- `drawWorld: stuck loading` fired whenever the loading canvas stayed up
+  over 10s, but a 10s+ canvas is legitimate on a low-end phone with a
+  multi-hundred-MB texture load at save.loaded. The alarm now reports
+  only when pending builds make NO progress for 10 seconds.
+
+### Changed: cold-cache fills run ~1.6x faster
+
+- The covered-phase prebuild slice widens from 30ms to 50ms per frame
+  (nothing visible can hitch during menus, warps, the title screen or
+  the loading canvas), and the per-job manifest write is throttled to
+  every 8 jobs or every 5s instead of once per job -- the manifest grew
+  O(n^2) on slow flash and was the prebuild's biggest fixed overhead.
+  F3 resume granularity is still 8 jobs; finish always writes the full
+  manifest.
+
 ## [1.7.3] - 2026-08-16
 
 ### Fixed: mesh builds froze frames for seconds at a time
