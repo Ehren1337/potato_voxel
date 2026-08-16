@@ -36,6 +36,7 @@ local V = ...
 
 local Brick = V.require("BrickProfile")
 local Budget = V.require("BuildBudget")
+local Platform = V.require("Platform")
 
 -- The engine's save-root resolver used to pick the portable SD-card dir.
 -- With storage the engine owns placement entirely; SaveData is no longer
@@ -229,8 +230,13 @@ end
 local function deleteKey(key)
   local store_ = facade()
   if not store_ or not store_.delete then return false end
-  pcall(store_.delete, store_, liveGame(), key)
-  return true
+  -- Return the storage call's real outcome instead of swallowing it: the
+  -- Switch scoped-storage delete has been observed to no-op while this
+  -- function still reported true, which hid the wipe bug (callers that
+  -- relied on the old unconditional true are unchanged -- they just do
+  -- not trust the result yet; MeshCache.wipe verifies by read-back).
+  local ok = pcall(store_.delete, store_, liveGame(), key)
+  return ok
 end
 
 function MeshCache.dir()
@@ -573,6 +579,19 @@ local function packPayload(fp, body)
     if ok and type(packed) == "string" and #packed < #body then
       return header(fp, COMPRESSED_FORMAT, #body, #packed, 0, ZSTD_CODEC)
              .. packed
+    end
+    -- On Switch zstd is absent and zlib's compress is a multi-hundred-ms
+    -- main-thread stall per big payload; the same prebuild tail ran ~2x
+    -- faster with lz4 than with zlib in the Switch-port logs (zlib vs
+    -- lz4 manifests). The payloads are quantized (already entropy-coded),
+    -- so lz4's weaker ratio costs little -- prefer it before zlib there.
+    -- Everywhere else the chain stays zstd -> zlib -> lz4.
+    if Platform.isSwitch() then
+      ok, packed = pcall(data.compress, "string", "lz4", body)
+      if ok and type(packed) == "string" and #packed < #body then
+        return header(fp, COMPRESSED_FORMAT, #body, #packed, 0, LZ4_CODEC)
+               .. packed
+      end
     end
     ok, packed = pcall(data.compress, "string", "zlib", body)
     if ok and type(packed) == "string" and #packed < #body then
@@ -1401,11 +1420,43 @@ function MeshCache.wipe(jobs)
   -- both namespaces. (The prefix pass catches stale payloads from maps
   -- no longer present in the current data, which the jobs pass alone
   -- would leave behind.)
-  for _, key in ipairs(listKeys("maps")) do
+  local mapsKeys = listKeys("maps")
+  local metaKeys = listKeys("meta")
+  for _, key in ipairs(mapsKeys) do
     deleteKey(key)
   end
-  for _, key in ipairs(listKeys("meta")) do
+  for _, key in ipairs(metaKeys) do
     deleteKey(key)
+  end
+  -- On Switch the scoped-storage delete has been observed to no-op while
+  -- reporting success: after a wipe the prebuild restarted from zero
+  -- (manifest/metas gone) yet the old payloads kept serving cache hits.
+  -- Verify by read-back and re-list, count survivors as storage
+  -- failures, and answer false so Prebuild.wipe does not reset its state
+  -- over a wipe that did not land. Other platforms keep the historical
+  -- fire-and-forget behavior.
+  if Platform.isSwitch() then
+    local survivors = {}
+    if readTable(MANIFEST_KEY) ~= nil then
+      survivors[#survivors + 1] = MANIFEST_KEY
+    end
+    if readTable(BUILD_INFO_KEY) ~= nil then
+      survivors[#survivors + 1] = BUILD_INFO_KEY
+    end
+    for _, key in ipairs(listKeys("maps")) do
+      survivors[#survivors + 1] = key
+    end
+    for _, key in ipairs(listKeys("meta")) do
+      survivors[#survivors + 1] = key
+    end
+    if #survivors > 0 then
+      local okD2, Overlay2 = pcall(V.require, "DebugOverlay")
+      if okD2 and Overlay2 then
+        Overlay2.count("storageFails")
+        Overlay2.error("cache wipe: %d key(s) survived delete", #survivors)
+      end
+      return false
+    end
   end
   return true
 end

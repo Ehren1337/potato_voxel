@@ -1,6 +1,37 @@
 # Changelog
 
-## [1.6.7] - 2026-08-16
+## [1.6.8] - 2026-08-16
+
+### Cache (Switch)
+
+- Platform detection: the mod now answers "is this the Switch port?"
+  through a small wrapper (`lib/Platform.lua`) over the engine's own
+  Platform module (the NX flag -- the sandbox forbids the mod touching
+  love.system itself). Every Switch-only cache change below gates on it;
+  desktop and other platforms run exactly as before.
+- Compression codec: on Switch, `packPayload` now prefers lz4 over zlib
+  when zstd is absent. zlib's compress is a multi-hundred-ms main-thread
+  stall per big payload, and the Switch-port logs showed the same
+  prebuild tail running ~2x faster with lz4 than with zlib (zlib vs lz4
+  manifests). The quantized payloads lose little ratio, so the faster
+  codec wins on the console; elsewhere the chain stays zstd -> zlib ->
+  lz4.
+- WIPE CACHE now verifies on Switch: after deleting, the wipe read-backs
+  the manifest/buildinfo and re-lists both payload namespaces, counts
+  every survivor as a storage failure, and reports false instead of
+  claiming success. The Switch storage has been observed to no-op
+  deletes while reporting success -- after a wipe the prebuild restarted
+  from zero (manifest/metas gone) while the old payloads kept serving
+  cache hits.
+- Boot invalidation: on Switch, the engine's Assets.installLoader ->
+  Assets.invalidate handoff has been observed to fire twice at boot; the
+  second call dropped the manifest and forced a cold 444-job prebuild on
+  every launch. Handoff invalidations are now ignored until the first
+  mesh entry exists (which a boot-time handoff can never be), so Switch
+  restarts stay warm; real invalidations still land the moment any mesh
+  work starts.
+- `deleteKey` now returns the storage call's real result instead of
+  swallowing it; no caller's behavior changes off-Switch.## [1.6.7] - 2026-08-16
 
 ### Diagnostics
 
