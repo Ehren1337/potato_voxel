@@ -230,6 +230,38 @@ local renderMs = 0
 local worldDiag = { loadingEntered = 0, loadingReported = false,
                     inactiveNoted = false, firstRender = false }
 
+-- Entry-frame work deferred off the frame that queued it (BUG-2c): a
+-- non-urgent options write must not ride the restoreSave frame -- the
+-- field logs' map-enter freezes -- so it lands here, one batch per
+-- frame, from the always-running tick below. Deferral is one frame at
+-- most, and the drain is unconditional (title, menus and warps all
+-- tick).
+local deferredWork = {}
+local function deferToNextTick(fn)
+  if type(fn) == "function" then deferredWork[#deferredWork + 1] = fn end
+end
+local function drainDeferredWork()
+  if #deferredWork == 0 then return end
+  local batch = deferredWork
+  deferredWork = {}
+  for i = 1, #batch do
+    local ok, err = pcall(batch[i])
+    if not ok then
+      DebugOverlay.error("deferred entry-frame work failed: %s", tostring(err))
+    end
+  end
+end
+
+-- BUG-1 render-skip tuning: a frame is "stalled" past STALL_FRAME
+-- seconds (a single slow frame is legit -- a mesh landing); two
+-- consecutive stalled frames arm the skip, and drawWorld drops the
+-- voxel pass for up to STALL_MAX_FRAMES so the driver's queue drains
+-- and input stays live (the Deck log's GPU-side crawl).
+local STALL_FRAME = 0.25
+local STALL_TRIGGER = 2
+local STALL_MAX_FRAMES = 4
+local stallSkip = { count = 0, frames = 0 }
+
 -- The boot gate's "MAP CACHE NOT READY. BUILD NOW?" prompt is a real
 -- question: while it is up -- and after a NO answer -- the hands-off
 -- auto-start must not override it (field log: the fill started 8s after
@@ -288,6 +320,10 @@ mod.content.render_pipelines:register("voxel", {
   -- already there instead of a flat flash.
   update = function(dt, level)
     return DebugOverlay.try("voxel-update", function()
+    -- Entry-frame work deferred by the events below lands here, one
+    -- batch per frame (BUG-2c): non-urgent option/save writes must not
+    -- ride the restoreSave frame that queued them.
+    drainDeferredWork()
     DebugOverlay.frame(dt, renderMs)
     DebugOverlay.pipelineUpdate(level)
     -- FULL is a preset, so it is applied ON THE PRESS rather than held every
@@ -418,16 +454,31 @@ mod.content.render_pipelines:register("voxel", {
         DebugOverlay.note("voxel inactive: drawWorld not running")
       end
       publishLoading()
+      stallSkip.count, stallSkip.frames = 0, 0
       return
     end
     worldDiag.inactiveNoted = false
     local Game = require("src.core.Game")
     local ow = Game and Game.overworld
+    -- BUG-1: the first map's body mesh primes from the cache BEFORE the
+    -- first prefetch: the entry frame's synchronous full-slot load (and
+    -- its GPU upload burst) falls to the sliced pump, and the first
+    -- scene renders a small mesh that is already in memory. One-shot,
+    -- and a no-op while the prebuild owns the cache or no payloads
+    -- exist.
     if ow and ow.map and ow.camera then
+      CachePrebuild.primeFirst(ow.map)
       pcall(VoxelScene.prefetch, ow)
     end
+    -- BUG-1: consecutive stalled frames (a GPU/compositor crawl -- the
+    -- Deck log's 4s frames) arm the render-skip in drawWorld below.
+    stallSkip.count = dt > STALL_FRAME and (stallSkip.count + 1) or 0
+    if stallSkip.count == 0 then stallSkip.frames = 0 end
     local covered = Game and Game.stack and Game.stack:top() ~= ow
-    ChunkMesher.pump(covered or Voxel.loading)
+    -- The shared queue pumps with CachePrebuild's own slice budget while
+    -- a prebuild runs (BUG-2a): the queue is shared, so the live pump
+    -- would otherwise slurp prebuild jobs at the full covered slice.
+    CachePrebuild.pump(covered or Voxel.loading)
     -- The covered slice may have completed the current terrain. Re-read now
     -- so the loading canvas does not survive for one empty extra frame.
     if Voxel.loading and ow and ow.map and ow.camera then
@@ -512,6 +563,21 @@ mod.content.render_pipelines:register("voxel", {
     end
     worldDiag.loadingEntered = 0
     worldDiag.loadingReported = false
+    -- BUG-1 render-skip: while a stall is in progress (see the update
+    -- hook), drop the voxel draw for up to STALL_MAX_FRAMES consecutive
+    -- frames -- the engine's flat 2D path draws instead -- so the
+    -- driver's queue drains and input stays live. The tracker re-arms
+    -- if the stall outlives the window.
+    if worldDiag.firstRender and stallSkip.count >= STALL_TRIGGER then
+      if stallSkip.frames < STALL_MAX_FRAMES then
+        stallSkip.frames = stallSkip.frames + 1
+        DebugOverlay.pipelinePath("stall_skip", {
+          frames = stallSkip.frames,
+        })
+        return nil
+      end
+      stallSkip.frames, stallSkip.count = 0, 0
+    end
     -- With AA on, the whole pass runs into a canvas BIGGER than the window
     -- and is folded back down at the end (see AntiAlias).  Nothing between
     -- these two lines knows: every pass in the frame measures itself in the
@@ -1169,7 +1235,12 @@ local function pinEngineFx(game)
   end
   pcall(Tilt.setLevel, 0)
   pcall(GBCFX.setLevel, 0)
-  if changed and game.writeOptions then pcall(game.writeOptions, game) end
+  if changed and game.writeOptions then
+    -- Off the entry frame (BUG-2c): save.loaded/save.created already
+    -- carry restoreSave and the cache gate -- the field logs' map-enter
+    -- freezes -- and the pin holds in memory either way.
+    deferToNextTick(function() pcall(game.writeOptions, game) end)
+  end
 end
 
 -- Build the complete PotatoVoxel-owned row set for the dedicated submenu.

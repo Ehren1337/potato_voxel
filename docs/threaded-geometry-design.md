@@ -1,6 +1,11 @@
-# Threaded geometry workers for the prebuilder (1.7.5 plan)
+# Threaded geometry workers for the prebuilder
 
-**Status:** design, not started. Tracks the parallel-precache follow-up.
+**Status:** implemented in 1.7.5 (`lib/WorkerPool.lua` +
+`workers/geometry_worker.lua` + `ChunkMesher.buildGeometryData` +
+`CachePrebuild` threaded dispatch). Requires the engine's `compute`
+permission (src/mods/Sandbox.lua) for threads to spawn; every engine
+without the grant runs the serial pump unchanged. Verify with
+`love tools/thread_smoke`.
 
 ## Goal
 

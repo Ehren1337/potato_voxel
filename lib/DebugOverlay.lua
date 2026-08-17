@@ -760,11 +760,15 @@ function Overlay.sendLogs()
   -- Acknowledged: advance the delta watermark so the next send carries
   -- only newer lines.  On a failed send the watermark stays put, so the
   -- next send retries the same delta (at-least-once, same as today).
-  lastSentSeq = seq
+  -- The watermark is captured AFTER the confirmation note below appends
+  -- its own ring line, so the send's self-lines are never re-sent and
+  -- the idle gate (seq == lastSentSeq) can actually trip once the send
+  -- settles; the poll half advances it again past its confirmation trace.
   bootSent = true
   sendHandle = handle
   sendAt = clock()
   Overlay.note("log sent to loghook")
+  lastSentSeq = seq
   return true
 end
 
@@ -866,9 +870,21 @@ end
 -- already in flight, or an engine without an endpoint all skip it, and
 -- the schedule is expressed as a next-deadline so a skipped interval
 -- fires at the next opportunity rather than backing up.
+--
+-- Idle backoff: an auto-send only ships when the ring grew since the
+-- last send (seq > lastSentSeq) or the boot evidence is still unsent.
+-- A quiet session would otherwise POST an identical near-empty delta
+-- every 90s forever (a field session logged 32 sends / 2.2MB of them).
+-- The deadline still moves so the cadence cannot wedge, but only out to
+-- IDLE_HEARTBEAT_EVERY seconds of game time past the last auto-send:
+-- a fully idle session still ships a liveness heartbeat at most once
+-- per five minutes.  Manual sends (F8, SEND LOGS, the START chord) are
+-- deliberate and never throttled.
 Overlay.autoSendEvery = 90
 local autoSendElapsed = 0
 local nextAutoAt = Overlay.autoSendEvery
+local IDLE_HEARTBEAT_EVERY = 300
+local lastAutoSendElapsed = 0   -- game time of the last auto-send (heartbeat cap anchor)
 
 function Overlay.frame(dt, renderMs)
   if sendHandle and V.mod and V.mod.fetch
@@ -880,6 +896,7 @@ function Overlay.frame(dt, renderMs)
       -- (stored in the support log and shown), a success is a trace.
       if st.status == "ok" then
         Overlay.trace("log send confirmed")
+        lastSentSeq = seq
       else
         Overlay.note("log send failed: %s", tostring(st.err or st.status))
       end
@@ -903,11 +920,24 @@ function Overlay.frame(dt, renderMs)
   end
   if Overlay.canSend() and Overlay.sendingAllowed()
       and not sendHandle and autoSendElapsed >= nextAutoAt then
-    nextAutoAt = nextAutoAt + Overlay.autoSendEvery
-    persist(true)
-    Overlay.trace("auto-send: shipping log (%.0f s of game time)",
-                  autoSendElapsed)
-    Overlay.sendLogs()
+    if bootSent and seq == lastSentSeq
+        and nextAutoAt < lastAutoSendElapsed + IDLE_HEARTBEAT_EVERY then
+      -- Nothing new since the last send and the heartbeat window is
+      -- still open: skip the identical-delta ship and push the deadline
+      -- out, capped at IDLE_HEARTBEAT_EVERY seconds of game time past
+      -- the last auto-send so an idle session still heartbeats.
+      nextAutoAt = math.min(nextAutoAt + Overlay.autoSendEvery,
+                            lastAutoSendElapsed + IDLE_HEARTBEAT_EVERY)
+    else
+      -- New ring lines, the first send of a session (the boot evidence
+      -- only ships there), or the idle heartbeat window elapsed: ship.
+      nextAutoAt = nextAutoAt + Overlay.autoSendEvery
+      lastAutoSendElapsed = autoSendElapsed
+      persist(true)
+      Overlay.trace("auto-send: shipping log (%.0f s of game time)",
+                    autoSendElapsed)
+      Overlay.sendLogs()
+    end
   end
   autoSendElapsed = autoSendElapsed + (dt or 0)
   health.frame = health.frame + 1
@@ -939,15 +969,41 @@ function Overlay.frame(dt, renderMs)
     -- evidence that distinguishes a GPU driver freeze (texture memory
     -- collapsed or re-uploading -- the Raspberry Pi's ~55s 1fps crawl
     -- started exactly after texMB dropped 85.8 -> 25.4) from a mesh or
-    -- storage hitch, so the next support log states its cause.
+    -- storage hitch, so the next support log states its cause.  The
+    -- driver identity and the shader-switch counter ride along: a
+    -- compositor-side upload burst (the Deck's 34s crawl with texMB
+    -- pinned flat) shows up in both.
     local stall = ""
     if statsMax > 500 then
       local tex = ""
+      local shaderSw = ""
       if love and love.graphics and love.graphics.getStats then
         local okS, st = pcall(love.graphics.getStats)
         if okS and st then
           tex = (" texMB=%.1f"):format((st.texturememory or 0) / 1048576)
+          -- Shader-compile witness: getStats().shaderswitches counts
+          -- every switch since boot, and switching is when the driver
+          -- compiles/uploads.  A stall window whose counter jumped since
+          -- the previous one dates the burst; builds that leave the
+          -- field unpopulated omit it, like drawcalls above.
+          if type(st.shaderswitches) == "number" and st.shaderswitches > 0 then
+            shaderSw = (" shaderSw=%d"):format(st.shaderswitches)
+          end
         end
+      end
+      -- Driver identity, restated on the stall line: the boot evidence
+      -- names the GPU once, but the received log is triaged by its STALL
+      -- lines first, and the same crawl reads differently per driver (a
+      -- Deck vangogh vs a Switch Tegra).  health.renderer carries the
+      -- captureEnvironment normalise; absent (a love-less stub) omit.
+      local ri = health.renderer and health.renderer.renderer
+      local gpuId = ""
+      if ri then
+        local gpuName = (("%s %s %s %s"):format(
+            tostring(ri.name or ""), tostring(ri.vendor or ""),
+            tostring(ri.device or ""), tostring(ri.version or "")))
+          :gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+        if gpuName ~= "" then gpuId = " gpu=" .. gpuName end
       end
       local lastEvent = health.lastEvent
       local lastEventText = "none"
@@ -959,7 +1015,7 @@ function Overlay.frame(dt, renderMs)
       stall = (" [STALL>500ms %s %s path=%s level=%s lastEvent=%s]")
         :format(tostring(p.availability), tostring(p.reason),
                 tostring(p.lastPath), tostring(p.level),
-                lastEventText) .. tex
+                lastEventText) .. tex .. shaderSw .. gpuId
     end
     Overlay.trace("frame avg %.1fms max %.1fms render avg %.1fms%s%s%s "
                   .. "pipeline avail=%s reason=%s updates=%d draws=%d path=%s",

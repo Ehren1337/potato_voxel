@@ -19,7 +19,6 @@ listing:close()
 local forbidden = {
   { "love.filesystem", "love%.filesystem" },
   { "love.system", "love%.system" },
-  { "love.thread", "love%.thread" },
   { "love.event", "love%.event" },
   { "love.mousemoved assignment", "love%.mousemoved%s*=" },
   { "love.mousepressed assignment", "love%.mousepressed%s*=" },
@@ -67,6 +66,34 @@ local manifestSource = manifest:read("*a") or ""
 manifest:close()
 if manifestSource:find('"filesystem"') then
   failures[#failures + 1] = root .. "/manifest.json: requests raw filesystem permission"
+end
+-- love.thread is only reachable under the `compute` permission the
+-- engine grants (src/mods/Sandbox.lua), so the mod cannot declare it
+-- until that lands -- but its uses must still be safe on engines
+-- WITHOUT the grant: every love.thread reference has to sit inside a
+-- pcall (the pool then disables itself silently). The worker script
+-- itself lives in workers/, which the scan does not ship.
+if not manifestSource:find('"compute"') then
+  for _, path in ipairs(files) do
+    local file = assert(io.open(path, "rb"))
+    local source = file:read("*a") or ""
+    file:close()
+    -- love.thread is only ever legal inside a pcall(function() ... end)
+    -- block: track the enclosing body so a multi-line pcall counts as
+    -- guarded without parsing Lua.
+    local inPcall = false
+    for line in source:gmatch("[^\n]+") do
+      if line:find("pcall%s*%(") then inPcall = true end
+      local code = line:gsub("%-%-.*$", "")
+      if code:find("love%.thread")
+         and not (code:find("pcall") or inPcall) then
+        failures[#failures + 1] = path .. ": unguarded love.thread "
+          .. "(must be inside pcall so engines without the "
+          .. '"compute" permission disable the pool silently)'
+      end
+      if line:find("^%s*end%)") then inPcall = false end
+    end
+  end
 end
 
 for _, failure in ipairs(failures) do print("FAIL: " .. failure) end

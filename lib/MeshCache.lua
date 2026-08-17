@@ -931,6 +931,12 @@ end
 -- A meta record's fingerprint, validated against the live identity
 -- prefix for the job. nil when missing or stale.
 local function metaFingerprint(mkey, prefix)
+  -- A record whose optional save failed carries no meta key (aux is
+  -- OPTIONAL): skip it before any storage call -- the engine answers
+  -- invalid_key for a nil key, which would flood storageWarns on every
+  -- prebuild. Genuinely-bad NON-nil keys still fall through to the read
+  -- and its one-time invalid_key warn for legacy records.
+  if not mkey then return nil end
   local ok, meta = pcall(readTable, mkey)
   if not (ok and type(meta) == "table" and type(meta.fp) == "string") then
     return nil

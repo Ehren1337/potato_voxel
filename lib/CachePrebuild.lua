@@ -6,6 +6,7 @@ local Prebuild = {}
 
 local ChunkMesher = V.require("ChunkMesher")
 local MeshCache = V.require("MeshCache")
+local WorkerPool = V.require("WorkerPool")
 
 -- Use the engine's own placement routine so prebuilt FULL masks cover the same
 -- connected strips (including two-hop neighbours) as the live renderer.
@@ -14,7 +15,35 @@ local OverworldState = require("src.world.OverworldController")
 local state = { running = false, cancelled = false, maps = {}, index = 0,
                 slot = nil, done = 0, total = 0, game = nil,
                 startedAt = nil, eta = nil, ready = false,
-                failed = false, error = nil, completed = {} }
+                failed = false, error = nil, completed = {},
+                threaded = {} }
+
+-- BUG-2a pump budget: the slices the prebuild pumps the shared queue
+-- with. The queue's idle/covered slices are tuned for live neighbour
+-- builds; a prebuild monopolizes the queue for minutes, and the full
+-- covered slice turned one hiccup into a wall-clock freeze (field logs:
+-- the 30ms slice routinely overshot). Tightened from here -- the
+-- prebuild owns the pump while it runs -- and restored around every
+-- pump call, so the live path's numbers are untouched.
+local PREBUILD_IDLE_SLICE = 0.003
+local PREBUILD_COVERED_SLICE = 0.025
+-- One tick of rest after a pump overshoots its slice: the frame after a
+-- freeze must not compound it with another full slice (the job resumes
+-- on the following pump).
+local pumpPause = 0
+
+-- BUG-2b resume-scan budgets: the survivor scan is ~2 storage reads per
+-- job (seconds of cold-flash reads for a whole set), so it runs in
+-- update() ticks, time-capped, instead of one synchronous pass. Job sets
+-- at or below RESUME_SCAN_INLINE still scan inline (they cost nothing).
+local RESUME_SCAN_INLINE = 16
+local SCAN_IDLE_MS = 0.008
+local SCAN_COVERED_MS = 0.020
+local SCAN_MAX_JOBS = 32
+
+-- BUG-1 pre-warm latch: the first map's body mesh primes from the cache
+-- exactly once per session (see Prebuild.primeFirst).
+local primed = false
 
 local function sortedIds(maps)
   local ids = {}
@@ -68,6 +97,8 @@ function Prebuild.available()
 end
 
 function Prebuild.bootstrap(game)
+  primed = false
+  pumpPause = 0
   local data = game and game.data
   MeshCache.configure(data)
   local jobs = Prebuild.enumerate(data and data.maps)
@@ -79,8 +110,9 @@ function Prebuild.bootstrap(game)
   -- remainder gets rebuilt. The rescan itself is ~2 storage reads per
   -- job -- seconds of cold-flash reads on the game.ready frame (the NX
   -- boot log: a 3.0s first frame with a cold cache) -- so it is
-  -- DEFERRED: start() runs it once, when a build actually begins,
-  -- never on the boot frame. completed == nil is the deferred marker;
+  -- DEFERRED: start() runs it once, when a build actually begins --
+  -- chunked across update() ticks for a full job set -- never on the
+  -- boot frame. completed == nil is the deferred marker;
   -- a ready cache and a wipe both leave a real (empty) table.
   local completed = ready and {} or nil
   if not ready then done = 0 end
@@ -210,6 +242,12 @@ local function now()
   return nil
 end
 
+local function countKeys(table_)
+  local count = 0
+  for _ in pairs(table_ or {}) do count = count + 1 end
+  return count
+end
+
 -- The old android() OS probe is gone with the sandbox: the one use was
 -- a shortened progress label, which now reads the same everywhere.
 
@@ -220,6 +258,7 @@ function Prebuild.start(game)
     state.cancelled = true
     return false
   end
+  pumpPause = 0
   -- An explicit start overrides nothing: the session's decline and gate
   -- history survive the row build (so a cancel then a wipe cannot
   -- silently re-arm the auto-start). Only bootstrap -- a fresh boot --
@@ -234,24 +273,39 @@ function Prebuild.start(game)
   -- rebuilding everything from zero. A fresh build (empty completed)
   -- starts at the first job as before. The boot scan was deferred off
   -- the first frame (cold-flash reads measured seconds there); it runs
-  -- here, once, only when a build actually starts.
+  -- here, once, only when a build actually starts -- and, for a full
+  -- job set, in update() ticks rather than one synchronous pass (a
+  -- 444-job rescan is the field logs' 1.5s freeze). Small sets scan
+  -- inline: they cost nothing.
   local completed = state.completed
   if completed == nil then
     completed = {}
-    local okS, records = pcall(MeshCache.scanComplete, jobs)
-    if okS and records then completed = records end
+    if #jobs <= RESUME_SCAN_INLINE then
+      local okS, records = pcall(MeshCache.scanComplete, jobs)
+      if okS and records then completed = records end
+      state.scan = nil   -- a leftover chunked scan (data shrank) is stale
+    elseif not (state.scan and #state.scan.jobs == #jobs) then
+      -- deferred: the survivor scan advances in update() ticks, and
+      -- dispatch waits for it (the resume set decides which jobs skip)
+      state.scan = { jobs = jobs, index = 1, records = {} }
+    end
   end
+  -- The pending chunked scan must survive the state rebuild below.
+  local pendingScan = state.scan
   local index = 1
   for i, job in ipairs(jobs) do
     local key = tostring(job.id) .. "/" .. tostring(job.slot)
     if not completed[key] then index = i; break end
     index = i + 1
   end
+  WorkerPool.start()
   state = { running = true, cancelled = false, maps = jobs, index = index,
-            slot = nil, done = index - 1, total = #jobs, game = game,
+            slot = nil, done = countKeys(completed), total = #jobs,
+            game = game, scan = pendingScan,
             startedAt = now(), eta = nil, ready = false,
             failed = false, error = nil, completed = completed,
-            declined = sessionDeclined, gateRan = sessionGateRan }
+            declined = sessionDeclined, gateRan = sessionGateRan,
+            threaded = {} }
   local okD, Overlay = pcall(V.require, "DebugOverlay")
   if okD and Overlay then
     Overlay.trace("prebuild start: %d/%d done, %d jobs",
@@ -312,14 +366,9 @@ function Prebuild.wipe(game)
     -- and a fresh boot are the re-arm paths.
     state.done, state.total, state.error = 0, #jobs, nil
     state.completed = {}
+    state.scan = nil   -- a stale survivor scan describes the old cache
   end
   return ok
-end
-
-local function countKeys(table_)
-  local count = 0
-  for _ in pairs(table_ or {}) do count = count + 1 end
-  return count
 end
 
 -- Re-evaluate readiness against the live identity and files, and update
@@ -346,9 +395,21 @@ function Prebuild.refresh(game)
     state.failed, state.error = false, nil
     state.completed = {}
   else
-    local completed = MeshCache.scanComplete(jobs)
-    state.completed = completed
-    state.done = countKeys(completed)
+    if #jobs <= RESUME_SCAN_INLINE then
+      local completed = MeshCache.scanComplete(jobs)
+      state.completed = completed
+      state.done = countKeys(completed)
+    else
+      -- The survivor scan is deferred to update() ticks (cold-flash
+      -- reads): the gate's prompt can go up now, and a build that
+      -- starts mid-scan waits for the resume set. completed == nil is
+      -- the same deferred marker start() consumes.
+      state.completed = nil
+      state.done = 0
+      if not (state.scan and #state.scan.jobs == #jobs) then
+        state.scan = { jobs = jobs, index = 1, records = {} }
+      end
+    end
   end
   state.total = #jobs
   return ready
@@ -363,9 +424,292 @@ function Prebuild.activationDecision(status, running)
   return "start"
 end
 
+-- Throttled manifest progress: F3 resume needs a manifest naming the
+-- jobs whose files survived, but writing it on EVERY job costs a full
+-- manifest encode + storage write per job -- O(n^2) bytes on slow flash,
+-- the prebuild's biggest fixed overhead. Every 8 jobs or every 5 seconds,
+-- plus always on finish (writeManifest).
+local function progressTick()
+  local since = state.lastProgress or 0
+  if state.done % 8 == 0 or (now() or 0) - since >= 5 then
+    if MeshCache.writeProgress(state.completed, state.total) then
+      state.lastProgress = now()
+    end
+  end
+end
+
+-- One threaded job completed: write the payloads, verify, record, advance.
+-- The worker returned the raw sink streams + flattened aux -- exactly what
+-- the serial path's save phase consumes -- so the cache files are
+-- byte-identical to a main-thread build.
+local function finishThreaded(result)
+  local entry = state.threaded[result.gen]
+  state.threaded[result.gen] = nil
+  if not entry then return end
+  local job, map = entry.job, entry.map
+  local fail = function(reason)
+    state.failedJobs = (state.failedJobs or 0) + 1
+    local okD, Overlay = pcall(V.require, "DebugOverlay")
+    if okD and Overlay then
+      Overlay.error("prebuild job failed (%d/%d): %s -- %s/%s",
+                    state.failedJobs, state.total, tostring(reason),
+                    tostring(job.id), tostring(job.slot))
+    end
+    releaseMap(job.id, state.game)
+    state.done = state.done + 1
+    if state.done >= state.total then finish(false) end
+  end
+  if result.error then
+    fail("worker: " .. tostring(result.error))
+    return
+  end
+  local okSave = true
+  local okT, terrain = pcall(MeshCache.saveTerrain, MeshCache, map,
+                             job.slot, result.data.terrain.buf,
+                             result.data.terrain.n, result.data.terrain.idx,
+                             result.data.terrain.m)
+  local okW = true
+  if okT and terrain then
+    okW = MeshCache.saveWater(map, job.slot, result.data.water.buf,
+                              result.data.water.n, result.data.water.idx,
+                              result.data.water.m)
+  else
+    okSave = false
+  end
+  if okSave and result.data.aux then
+    okSave = MeshCache.saveAux(map, job.slot, result.data.aux)
+  end
+  if not okSave or not MeshCache.verifyJob(map, job.slot) then
+    fail(MeshCache.saveError() or "worker payload verification failed")
+    return
+  end
+  state.completed[tostring(job.id) .. "/" .. tostring(job.slot)] =
+    MeshCache.jobRecord(map, job.slot)
+  progressTick()
+  releaseMap(job.id, state.game)
+  state.done = state.done + 1
+  local okD, Overlay = pcall(V.require, "DebugOverlay")
+  if okD and Overlay then
+    Overlay.trace("prebuild %d/%d done %s/%s (worker)", state.done,
+                  state.total, tostring(job.id), tostring(job.slot))
+  end
+  local elapsed = state.startedAt and now()
+  if elapsed and state.startedAt and state.done > 0 then
+    state.eta = (elapsed - state.startedAt) * (state.total - state.done)
+             / state.done
+  end
+  if state.done >= state.total then finish(false) end
+end
+
+-- Dispatch the next frontier job to the pool. The map loads here, on the
+-- update tick -- the same single blocking load the serial path's pumped
+-- job performs -- then the data tables are dumped once per map and the
+-- geometry phase runs off-main. Returns true when a job was dispatched.
+local function dispatchThreaded(covered)
+  local job = state.maps[state.index]
+  if not job then return false end
+  local MapLoader = require("src.world.MapLoader")
+  local data = state.game and state.game.data
+  local t0 = love and love.timer and love.timer.getTime
+            and love.timer.getTime() or 0
+  local map = MapLoader.load(data, job.id)
+  local loadMs = (love and love.timer and love.timer.getTime
+                 and (love.timer.getTime() - t0) * 1000) or 0
+  if not map then
+    state.failedJobs = (state.failedJobs or 0) + 1
+    local okD, Overlay = pcall(V.require, "DebugOverlay")
+    if okD and Overlay then
+      Overlay.error("prebuild job failed (%d/%d): map load failed -- %s/%s",
+                    state.failedJobs, state.total, tostring(job.id),
+                    tostring(job.slot))
+    end
+    state.done = state.done + 1
+    state.index = state.index + 1
+    return true
+  end
+  if loadMs > 250 then
+    local okD, Overlay = pcall(V.require, "DebugOverlay")
+    if okD and Overlay then
+      Overlay.warn("prebuild map load overshot: %s %.0fms",
+                   tostring(job.id), loadMs)
+    end
+  end
+  local tileImage = nil
+  local okA, Assets = pcall(require, "src.render.Assets")
+  if okA and Assets and Assets.imageData then
+    local okI, img = pcall(Assets.imageData, map.tileset.image)
+    if okI then tileImage = img or false end
+  end
+  local okTR, TileRenderer = pcall(require, "src.render.TileRenderer")
+  local voidFill = (okTR and TileRenderer and TileRenderer.voidFill)
+                   or "trees"
+  local gen = WorkerPool.submit({
+    version = MeshCache.GEOMETRY_VERSION,
+    mapSrc = WorkerPool.serializeMap(map),
+    bodyOnly = job.slot == "body",
+    masks = job.masks,
+    voidFill = tostring(voidFill),
+    tileImage = tileImage,
+  })
+  if not gen then return false end
+  state.threaded[gen] = { job = job, map = map, at = now() }
+  state.index = state.index + 1
+  return true
+end
+
+-- The shared mesh queue, pumped with the prebuild's OWN slice budget
+-- while a build runs (BUG-2a). main.lua's live pump calls this too: the
+-- queue is shared, and the live pump would otherwise slurp prebuild jobs
+-- at the full covered slice right after this tick's tighter pump. A
+-- plain pass-through when no build is running. Returns the pump wall
+-- time in ms (nil when no clock is available).
+function Prebuild.pump(covered)
+  local idle, coveredSlice = ChunkMesher.IDLE_SLICE, ChunkMesher.COVERED_SLICE
+  if state.running then
+    if idle and idle > PREBUILD_IDLE_SLICE then
+      ChunkMesher.IDLE_SLICE = PREBUILD_IDLE_SLICE
+    end
+    if coveredSlice and coveredSlice > PREBUILD_COVERED_SLICE then
+      ChunkMesher.COVERED_SLICE = PREBUILD_COVERED_SLICE
+    end
+  end
+  local t0 = now()
+  local ok, err = pcall(ChunkMesher.pump, covered)
+  local t1 = now()
+  ChunkMesher.IDLE_SLICE, ChunkMesher.COVERED_SLICE = idle, coveredSlice
+  if not ok then error(err, 0) end
+  if t0 and t1 then return (t1 - t0) * 1000 end
+  return nil
+end
+
+-- Advance the deferred resume scan a little (BUG-2b): the survivor
+-- records are read a few jobs per tick, time-capped -- cold-flash meta
+-- reads run ~1-2ms each, so a whole-set pass is the 1.5s freeze -- until
+-- the whole set is covered. Returns true when the scan finished on this
+-- call.
+local function scanStep(covered)
+  local scan = state.scan
+  if not scan then return true end
+  local jobs = scan.jobs
+  local budget = covered and SCAN_COVERED_MS or SCAN_IDLE_MS
+  local t0 = now()
+  local scanned = 0
+  while scan.index <= #jobs and scanned < SCAN_MAX_JOBS do
+    local t = now()
+    if t and scanned > 0 and t - t0 >= budget then break end
+    local okS, records = pcall(MeshCache.scanComplete, { jobs[scan.index] })
+    if okS and records then
+      for key, record in pairs(records) do scan.records[key] = record end
+    end
+    scan.index = scan.index + 1
+    scanned = scanned + 1
+  end
+  if state.running then state.done = countKeys(scan.records) end
+  if scan.index > #jobs then
+    state.completed = scan.records
+    state.scan = nil
+    return true
+  end
+  return false
+end
+
+-- The resume scan just finished: adopt the resume set. A running build
+-- skips straight to the first job the scan found missing -- only the
+-- missing jobs rebuild, exactly like the synchronous scan did -- and a
+-- build that starts later reads state.completed as before.
+local function adoptScan()
+  local records = state.completed or {}
+  state.done = countKeys(records)
+  if not state.running then return end
+  local index = 1
+  for i = state.index, #state.maps do
+    local job = state.maps[i]
+    local key = tostring(job.id) .. "/" .. tostring(job.slot)
+    if not records[key] then index = i; break end
+    index = i + 1
+  end
+  state.index = index
+end
+
 function Prebuild.update(covered)
+  -- The deferred resume scan advances every frame, running or not: the
+  -- gate's prompt and a build that starts mid-scan never block on the
+  -- cold-flash survivor scan.
+  if state.scan then
+    if scanStep(covered) then adoptScan() end
+    if state.scan then return end   -- dispatch waits for the resume set
+  end
   if not state.running then return end
   if state.cancelled then finish(true); return end
+  -- BUG-2a: after a pump overshot its slice, yield this tick to gameplay
+  -- (the paused job resumes on the next pump) instead of compounding the
+  -- freeze with another full slice.
+  if pumpPause > 0 then
+    pumpPause = pumpPause - 1
+    return
+  end
+
+  if WorkerPool.working() then
+    -- Threaded mode: dispatch up to the pool's depth and drain results;
+    -- the serial pump is not used while workers are alive. A worker that
+    -- died mid-job strands its generation -- after 60s of silence the
+    -- pool is declared failed and the remainder falls back to the serial
+    -- path below (the stranded job was never written, so the resume set
+    -- picks it up next boot).
+    for _, res in ipairs(WorkerPool.poll()) do
+      finishThreaded(res)
+    end
+    local poolSize = WorkerPool.workerCount()
+    -- One dispatch per tick (BUG-2a): every dispatch blocks on a
+    -- MapLoader.load (hundreds of ms on cold flash), and a tick that
+    -- filled the whole pool was poolSize loads in ONE frame -- the field
+    -- logs' STALL lines. The workers keep the geometry fed; the main
+    -- thread feeds them one map a frame.
+    local dispatched = 0
+    local t0d = now()
+    while state.running
+      and not state.cancelled
+      and state.index <= #state.maps
+      and dispatched < 1
+      and WorkerPool.inFlight() < poolSize do
+      if not dispatchThreaded(covered) then
+        -- nothing dispatched (version mismatch, dead pool): drop the
+        -- pool so the serial pump below takes over the remainder
+        WorkerPool.shutdown()
+        break
+      end
+      dispatched = dispatched + 1
+    end
+    local t1d = now()
+    local dispatchMs = t0d and t1d and ((t1d - t0d) * 1000) or 0
+    if dispatchMs > 250 then
+      -- a map load froze this tick (cold flash): the next tick belongs
+      -- to the game, not another load
+      pumpPause = 1
+    end
+    if state.index > #state.maps and WorkerPool.inFlight() == 0 then
+      finish(false)
+      return
+    end
+    local stuck = nil
+    for gen, entry in pairs(state.threaded) do
+      if entry.at and (now() or 0) - entry.at > 60 then stuck = gen end
+    end
+    if stuck then
+      local okD, Overlay = pcall(V.require, "DebugOverlay")
+      if okD and Overlay then
+        Overlay.error("geometry worker stalled: falling back to serial")
+      end
+      WorkerPool.shutdown()
+    end
+    if not WorkerPool.working() and state.index <= #state.maps
+       and not state.cancelled then
+      -- fall through to the serial pump below for the remainder
+    else
+      return
+    end
+  end
+
   local job = state.maps[state.index]
   if not job then finish(false); return end
   if not state.slot then
@@ -383,10 +727,22 @@ function Prebuild.update(covered)
     end)
   end
   -- Prebuild runs alongside normal gameplay; the covered flag (menus,
-  -- warps, the title screen, the loading canvas) opens the wider 30ms
-  -- slice -- nothing visible can hitch there, and fills run several
-  -- times faster.
-  ChunkMesher.pump(covered)
+  -- warps, the title screen, the loading canvas) opens the wider pump
+  -- slice -- nothing visible can hitch there, and fills run faster.
+  -- BUG-2a: the pump runs under the prebuild's OWN (tighter) budget --
+  -- see Prebuild.pump -- and a resume that blows it pauses the NEXT
+  -- tick so the freeze does not compound.
+  local pumpMs = Prebuild.pump(covered) or 0
+  local sliceMs = covered and PREBUILD_COVERED_SLICE or PREBUILD_IDLE_SLICE
+  if pumpMs > sliceMs * 1000 * 4 then
+    pumpPause = 1
+    local okD, Overlay = pcall(V.require, "DebugOverlay")
+    if okD and Overlay then
+      Overlay.warn("prebuild pump overshot: %.0fms vs %.0fms slice; "
+                   .. "pausing next tick", pumpMs, sliceMs * 1000)
+    end
+    return
+  end
   local bodyOnly = job.slot == "body"
   local jobStatus = ChunkMesher.jobStatus(job.id, bodyOnly)
   if jobStatus == "pending" then return end
@@ -433,12 +789,7 @@ function Prebuild.update(covered)
   -- O(n^2) bytes on slow flash, measured as the prebuild's biggest fixed
   -- overhead -- so it is throttled: every 8 jobs or every 5 seconds,
   -- plus always on finish/cancel (writeManifest).
-  local since = state.lastProgress or 0
-  if state.done % 8 == 0 or (now() or 0) - since >= 5 then
-    if MeshCache.writeProgress(state.completed, state.total) then
-      state.lastProgress = now()
-    end
-  end
+  progressTick()
   releaseMap(job.id, state.game)
   state.done = state.done + 1
   state.index = state.index + 1
@@ -474,6 +825,32 @@ end
 
 function Prebuild.isReady()
   return state.ready and not MeshCache.isDirty()
+end
+
+-- BUG-1 pre-warm: the FIRST map's body mesh primes from the cache before
+-- the pipeline's first full scene render (main.lua calls this ahead of
+-- the first prefetch). The entry frame's synchronous full-slot load --
+-- ChunkMesher's cold-entry fast path -- bursts a whole map's GPU upload
+-- on the first visible frame; priming the BODY slot ahead of it leaves
+-- the first scene drawing a small mesh that is already in memory, and
+-- the full ring cooks in the sliced pump. One-shot, and conservative by
+-- contract: a running prebuild owns the cache, and a map with no
+-- payloads has nothing to prime -- it never builds fresh (that would
+-- just move the freeze).
+function Prebuild.primeFirst(map)
+  if primed or state.running then return false end
+  if not (map and map.id and map.tileset) then return false end
+  primed = true
+  if not MeshCache.available() then return false end
+  local okP, terrain = pcall(MeshCache.loadTerrain, map, "body")
+  if not okP or not terrain then return false end
+  local okG, mesh = pcall(ChunkMesher.get, map, true, nil)
+  local okD, Overlay = pcall(V.require, "DebugOverlay")
+  if okD and Overlay then
+    Overlay.note("pre-warm: primed %s/body%s", tostring(map.id),
+                 okG and mesh and "" or " (payloads present, no mesh)")
+  end
+  return okG
 end
 
 return Prebuild

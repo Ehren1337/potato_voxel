@@ -1,5 +1,39 @@
 # Changelog
 
+## [1.7.8] - 2026-08-17
+
+### Fixed: the ~34s GPU crawl after the first voxel render (field logs)
+
+- The first full scene triggered a driver upload burst that pinned every
+  frame at 3-4s for ~34s (Steam Deck/vangogh 1.7.7 session 20260816-202329;
+  the same signature as the Raspberry Pi in the previous review). The
+  current map's body mesh now primes into the runtime cache before the
+  first render (`CachePrebuild.primeFirst`), so the upload spike lands on
+  a small scene instead of the full one; if a stall still starts, the
+  voxel pass drops for up to 4 frames so input stays responsive. STALL
+  lines now carry the driver identity and shader-switch count so the next
+  review can confirm the root cause.
+- Main-thread freezes at save/map-enter: the cooperative prebuild budget
+  is tightened (3ms idle / 25ms covered) with a one-tick yield after an
+  overshoot and one threaded dispatch per tick; the cold-flash survivor
+  scan runs chunked off the entry frame; options/save writes defer off
+  the entry frame.
+- `writeManifest` no longer warns `storage read "nil": invalid_key` when
+  a job's optional aux record is absent -- nil keys never reach storage,
+  so full prebuilds stop flooding the triage stream with ~70 warns each.
+
+### Changed: threaded geometry workers, idle-send backoff
+
+- Mesh builds dispatch to the worker pool when the engine provides one
+  (engine PR #1454), falling back to the serial sliced pump.
+- Auto-send backs off: an idle ring (no new lines since the last acked
+  send) skips the 90s deadline and ships at most a 300s liveness
+  heartbeat, cutting idle POSTs ~3x on mobile. The watermark now advances
+  when a send settles, so the send's own log lines never re-ship.
+- loghook server: idle sessions are evicted from memory after the
+  retention window (files are kept), and a resumed session re-attaches
+  to its merged file from disk.
+
 ## [1.7.7] - 2026-08-17
 
 ### Fixed: the player support ID was minted anew on every boot

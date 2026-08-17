@@ -837,10 +837,13 @@ if brick then
     DebugOverlay.export(sendGame)
     T.eq(sends, 5, "turning LOGS TO DEV back ON restores sending")
     -- The automatic send: every 90 seconds of accumulated game time the
-    -- frame tick ships the log with no keypress. The schedule is a
-    -- next-deadline, so a skipped interval fires at the first tick past
-    -- it -- and OFF silences it like every other send. The fake fetch
-    -- settles each handle so the next interval can send.
+    -- frame tick ships the log with no keypress -- but only when the ring
+    -- grew since the last send (idle backoff, OPT-1: an unchanged delta
+    -- is not worth a POST; a fully idle session still heartbeats at the
+    -- five-minute cap). The schedule is a next-deadline, so a skipped
+    -- interval fires at the first tick past it -- and OFF silences it
+    -- like every other send. The fake fetch settles each handle so the
+    -- next interval can send.
     do
       mod.fetch = {
         poll = function() return { status = "ok" } end,
@@ -852,10 +855,16 @@ if brick then
       T.eq(sends, 5, "the auto-send respects LOGS TO DEV OFF")
       optionsState.modOptions.potato_voxel.send_logs = true
       DebugOverlay.frame(0.01)
+      T.eq(sends, 5, "an idle ring skips the 90s deadline (backoff)")
+      DebugOverlay.note("tick marker one")
+      DebugOverlay.frame(89.99)
+      T.eq(sends, 5, "the skip pushed the next deadline out a full interval")
+      DebugOverlay.frame(89.99)
       T.eq(sends, 6, "the frame tick auto-sends once 90 seconds of game time pass")
       DebugOverlay.frame(89.99)
-      T.eq(sends, 6, "the next interval needs its own 90 seconds of game time")
-      DebugOverlay.frame(0.01)
+      T.eq(sends, 6, "an idle ring skips the next deadline too (backoff)")
+      DebugOverlay.note("tick marker two")
+      DebugOverlay.frame(89.99)
       T.eq(sends, 7, "the auto-send repeats every 90 seconds of game time")
       mod.fetch = oldFetch
     end
@@ -914,6 +923,151 @@ if brick then
       mod2.postLog, mod2.manifest = oldPostLog2, oldManifest2
     end
     mod.postLog, mod.manifest = oldPostLog, oldManifest
+  end
+
+  -- The auto-send cadence backs off on an idle ring: an interval only
+  -- ships when new lines arrived since the last send (or the boot
+  -- evidence is still unsent), and a fully idle session still sends a
+  -- liveness heartbeat at most once per five minutes of game time.  The
+  -- schedule is driven by synthetic 90s ticks through the same fake
+  -- transport as the gate block above -- no real timers.
+  do
+    local mod3 = exports.lib.mod
+    local oldPostLog3, oldManifest3 = mod3.postLog, mod3.manifest
+    local oldFetch3 = mod3.fetch
+    local oldSendSetting3 = optionsState.modOptions.potato_voxel.send_logs
+    local sends = 0
+    local bodies = {}
+    mod3.postLog = function(_, body)
+      sends = sends + 1
+      bodies[#bodies + 1] = body
+      return true
+    end
+    mod3.manifest = { log_url = "https://logs.example.invalid/logs" }
+    mod3.fetch = {
+      poll = function() return { status = "ok" } end,
+      release = function() end,
+      cancel = function() end,
+    }
+    optionsState.modOptions.potato_voxel.send_logs = true
+    local sendGame = { save = { options = optionsState } }
+    -- Settle the send handle a prior send left in flight so the deadline
+    -- branch is the only gate in play, then give the ring one new line
+    -- so the first deadline crossing ships -- that send anchors the idle
+    -- window (the last-auto-send cap) at a known point.
+    DebugOverlay.frame(0.01)
+    DebugOverlay.note("cadence baseline marker")
+    DebugOverlay.frame(90)
+    DebugOverlay.frame(0.01)
+    local baseline = sends
+    T.check(baseline >= 1, "the auto-send ships when the ring grew")
+    -- (a) Nothing new since that send: the next 90s deadline must NOT
+    -- ship the identical delta, and the same holds for the next two
+    -- deadlines while the ring stays idle.
+    DebugOverlay.frame(90)
+    DebugOverlay.frame(0.01)
+    T.eq(sends, baseline, "an idle deadline ships nothing")
+    DebugOverlay.frame(90)
+    DebugOverlay.frame(0.01)
+    T.eq(sends, baseline, "the idle backoff extends the deadline again")
+    DebugOverlay.frame(90)
+    DebugOverlay.frame(0.01)
+    T.eq(sends, baseline, "the idle backoff holds until the heartbeat cap")
+    -- (b) The five-minute cap: with the ring still idle, the deadline
+    -- the cap lands on must send the liveness heartbeat -- at most once
+    -- per 300s of game time, never a flood.
+    DebugOverlay.frame(90)
+    DebugOverlay.frame(0.01)
+    T.eq(sends, baseline + 1, "an idle session heartbeats at the five-minute cap")
+    local okH, JsonH = pcall(require, "src.link.Json")
+    local heartbeat = okH and JsonH.decode(bodies[#bodies])
+    T.check(heartbeat ~= nil and heartbeat.boot == nil,
+            "the heartbeat repeats no boot evidence")
+    -- Manual sends stay untouched by the backoff: an export ships even
+    -- with a completely idle ring.
+    DebugOverlay.export(sendGame)
+    T.eq(sends, baseline + 2, "a manual export is never throttled by the backoff")
+    mod3.postLog, mod3.manifest = oldPostLog3, oldManifest3
+    mod3.fetch = oldFetch3
+    optionsState.modOptions.potato_voxel.send_logs = oldSendSetting3
+  end
+
+  -- The stall tag names the driver and the shader-switch counter: when a
+  -- stats window's worst frame crosses 500ms, the tagged line must carry
+  -- the GPU identity (health.renderer) and getStats().shaderswitches --
+  -- the two witnesses for a driver/compositor upload burst (the Deck's
+  -- 34s crawl pinned texMB flat, so texture memory alone could not prove
+  -- it).  A fake love supplies a controllable clock and the getStats
+  -- table; the renderer identity is captured fresh so the fields are
+  -- exact.
+  do
+    local oldLove4 = _G.love
+    local fakeT = 0
+    _G.love = {
+      timer = { getTime = function() return fakeT end },
+      graphics = {
+        getRendererInfo = function()
+          return { name = "OpenGL", vendor = "Mesa",
+                   device = "Steam Deck (Van Gogh)", version = "4.6" }
+        end,
+        getStats = function()
+          return { texturememory = 19327352, shaderswitches = 7 }
+        end,
+      },
+    }
+    local Platform = require("src.core.Platform")
+    Platform._resetForTests()
+    DebugOverlay.captureEnvironment()
+    local mod4 = exports.lib.mod
+    local oldPostLog4, oldManifest4 = mod4.postLog, mod4.manifest
+    local oldFetch4 = mod4.fetch
+    local oldSendSetting4 = optionsState.modOptions.potato_voxel.send_logs
+    local bodies = {}
+    mod4.postLog = function(_, body)
+      bodies[#bodies + 1] = body
+      return true
+    end
+    mod4.manifest = { log_url = "https://logs.example.invalid/logs" }
+    mod4.fetch = {
+      poll = function() return { status = "ok" } end,
+      release = function() end,
+      cancel = function() end,
+    }
+    optionsState.modOptions.potato_voxel.send_logs = true
+    local sendGame = { save = { options = optionsState } }
+    DebugOverlay.frame(0.01)  -- settle any in-flight send handle
+    -- One >500ms frame into the open stats window, then jump the clock
+    -- past STATS_EVERY so the window closes on it and the stall tag is
+    -- written while the fake getStats and renderer identity are live.
+    DebugOverlay.frame(0.6)
+    fakeT = 1e9
+    DebugOverlay.frame(0.01)
+    DebugOverlay.export(sendGame)
+    Platform._resetForTests()
+    _G.love = oldLove4
+    local okJ4, Json4 = pcall(require, "src.link.Json")
+    local sent4 = okJ4 and Json4.decode(bodies[#bodies])
+    local stallLine = nil
+    if sent4 and sent4.ring then
+      for _, line in ipairs(sent4.ring) do
+        if tostring(line):find("STALL>500ms", 1, true) then
+          stallLine = tostring(line)
+          break
+        end
+      end
+    end
+    T.check(stallLine ~= nil, "a >500ms window ships a STALL-tagged line")
+    if stallLine then
+      T.check(stallLine:find("shaderSw=7", 1, true) ~= nil,
+              "the stall tag carries the shader-switch counter")
+      T.check(stallLine:find("texMB=18.4", 1, true) ~= nil,
+              "the stall tag still carries the texture memory")
+      T.check(stallLine:find("gpu=OpenGL Mesa Steam Deck (Van Gogh)", 1, true) ~= nil,
+              "the stall tag names the GPU driver")
+    end
+    mod4.postLog, mod4.manifest = oldPostLog4, oldManifest4
+    mod4.fetch = oldFetch4
+    optionsState.modOptions.potato_voxel.send_logs = oldSendSetting4
   end
 end
 

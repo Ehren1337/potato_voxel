@@ -1279,6 +1279,26 @@ local function runJob(job)
   end
 end
 
+-- Pure geometry for the threaded prebuilder (docs/threaded-geometry-design.md):
+-- Structures analysis + the terrain/water sink streams + the flattened aux
+-- records -- with NO graphics, storage or runtime cache entry. Runs on a
+-- love.thread worker; the main thread turns the returned buffers into cache
+-- files exactly like the serial path's save phase (saveTerrain/saveWater/
+-- saveAux) and never uploads a mesh it does not draw.
+function ChunkMesher.buildGeometryData(map, bodyOnly, masks)
+  local sink = newSink()
+  local waterSink = newSink()
+  runGeometry(map, bodyOnly, masks, sink, waterSink)
+  local okFlat, flat = pcall(flattenAux, map)
+  local tb, tn, ti, tm = sink.buffer()
+  local wb, wn, wi, wm = waterSink.buffer()
+  return {
+    terrain = { buf = tb, n = tn, idx = ti, m = tm },
+    water = { buf = wb, n = wn, idx = wi, m = wm },
+    aux = okFlat and flat or nil,
+  }
+end
+
 -- Queue a build unless the slot is already cached or queued. Returns the
 -- cached mesh when there is one (false-cached misses return nil).
 -- `urgent` marks the current map's meshes: pump() gives those a bigger

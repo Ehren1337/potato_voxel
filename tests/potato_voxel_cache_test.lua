@@ -20,6 +20,7 @@ local fakeGame = { save = { options = optionsState },
 local Prebuild = exports.lib.require("CachePrebuild")
 local MeshCache = exports.lib.require("MeshCache")
 local ChunkMesher = exports.lib.require("ChunkMesher")
+local WorkerPool = exports.lib.require("WorkerPool")
 local Brick = exports.brick
 local Battles = exports.lib.require("OverworldBattle")
 local QualityMode = exports.lib.require("QualityMode")
@@ -517,6 +518,36 @@ if MeshCache.available() then
           "manifest rewrite over an existing record succeeds (F4 self-heal)")
   MeshCache.wipe({ buildJob })
 
+  -- --- BUG-3: an aux-less record must never send a nil key to storage --
+  -- A job whose aux save failed has no aux meta key (aux is OPTIONAL in
+  -- the record shape). updateCompression read it anyway and the engine
+  -- answered invalid_key, spamming one storageWarn per job between
+  -- "prebuild N/N done" and "manifest written". The nil key must be
+  -- skipped before storage: record every key the fake store's read sees
+  -- during writeManifest and assert none is nil.
+  MeshCache.configure({ maps = maps, tilesets = {} })
+  MeshCache.begin()
+  MeshCache.saveTerrain(fakeMap, "body", nil, 0)
+  MeshCache.saveWater(fakeMap, "body", nil, 0)
+  local auxless = MeshCache.jobRecord(fakeMap, "body")
+  auxless.aux = nil
+  auxless.auxFp = nil
+  local readCount, sawNilKey = 0, false
+  local realRead = fakeStore.read
+  fakeStore.read = function(_, _, key)
+    readCount = readCount + 1
+    if key == nil then sawNilKey = true end
+    return realRead(_, _, key)
+  end
+  local wrote = MeshCache.writeManifest({ [auxless.key] = auxless }, 1)
+  fakeStore.read = realRead
+  T.check(wrote, "manifest writes with an aux-less record (BUG-3)")
+  T.check(readCount > 0,
+          "compression update still reads the real terrain/water metas")
+  T.check(not sawNilKey,
+          "no nil key reaches storage: absent aux is skipped, not read")
+  MeshCache.wipe({ buildJob })
+
   -- --- F3: an interrupted build leaves a manifest naming finished jobs --
   local jobSet = Prebuild.enumerate(maps)   -- A body/full, B body/full
   local fakeMapB = {
@@ -740,6 +771,304 @@ T.check(not ChunkMesher.jobPending("A", true),
         "release cancels a loader-backed job like any other")
 T.eq(ChunkMesher.jobStatus("A", true), "cancelled",
      "a cancelled loader-backed job records its status")
+
+-- --- threaded geometry pool: degradation + serialization + parity -------
+-- The worker path (docs/threaded-geometry-design.md) runs the pure
+-- geometry phase on love.thread; headless the pool must be inert and the
+-- serial pump untouched, while the pieces the workers exchange -- the map
+-- source dump and the buildGeometryData streams -- stay byte-compatible
+-- with what the serial path saves.
+T.check(not WorkerPool.enabled(),
+        "headless: no love.thread, the pool stays disabled")
+T.check(not WorkerPool.working(),
+        "headless: no workers are ever started")
+
+local serSrc = WorkerPool.serializeMap(fakeMap)
+local serChunk = assert(load(serSrc, "@ser", "t"))
+local serMap = serChunk()
+T.check(serMap.id == fakeMap.id
+        and serMap.tileset.image == fakeMap.tileset.image,
+        "serializeMap round-trips the map data")
+T.check(type(serMap.tileAt) == "nil",
+        "methods are not serialized (the worker reattaches them)")
+
+-- parity: the streams buildGeometryData returns feed saveTerrain/saveWater/
+-- saveAux exactly like the serial sink buffers, and loadTerrain reads the
+-- same counts back. The worker path runs with the pure engine shims from
+-- workers/geometry_worker.lua (the real TileRenderer needs a full tileset
+-- atlas the fixture cannot provide, and MapLoader constructs one per map)
+-- -- seed the same shims here so the headless geometry matches what the
+-- worker computes, and drive a smoke-map shaped fixture (as the harness
+-- does) instead of MapLoader.
+local TREE_WALL_BLOCK = 0x0F
+local function mapShims()
+  local Map = {
+    isOutdoor = function(def)
+      if def.outdoor ~= nil then return def.outdoor end
+      return def.tileset == "OVERWORLD"
+    end,
+    blockAt = function(self, bx, by)
+      if bx < 0 or by < 0 or bx >= self.def.width or by >= self.def.height then
+        return self.def.borderBlock
+      end
+      return self.def.blocks[by * self.def.width + bx + 1]
+    end,
+    tileAt = function(self, tx, ty)
+      local bx, by = math.floor(tx / 4), math.floor(ty / 4)
+      local block = self.tileset.blocks[self:blockAt(bx, by) + 1]
+      local ix = (ty % 4) * 4 + (tx % 4) + 1
+      return block[ix]
+    end,
+    cellTile = function(self, cx, cy)
+      return self:tileAt(cx * 2, cy * 2 + 1)
+    end,
+    inBounds = function(self, cx, cy)
+      return cx >= 0 and cy >= 0 and cx < self.def.width * 2
+             and cy < self.def.height * 2
+    end,
+    isWalkableCell = function(self, cx, cy)
+      return self.walkable and self.walkable[self:cellTile(cx, cy)] or false
+    end,
+    isGrassCell = function(self, cx, cy)
+      if not self:inBounds(cx, cy) then return false end
+      local grass = self.tileset.grassTile
+      return grass ~= nil and self:cellTile(cx, cy) == grass
+    end,
+    isWaterCell = function(self, cx, cy)
+      return self.waterTiles and self.waterTiles[self:cellTile(cx, cy)] or false
+    end,
+  }
+  return Map
+end
+local TestMap = mapShims()
+package.loaded["src.render.TileRenderer"] = {
+  voidFill = "trees",
+  borderBlockFor = function(map)
+    if map.def.tileset == "OVERWORLD" then
+      return TREE_WALL_BLOCK
+    end
+    return map.def.borderBlock
+  end,
+  defaultAnimatedTiles = function() return nil end,
+}
+package.loaded["src.render.Assets"] = {
+  register = function() end,
+  imageData = function() return nil end,
+}
+package.loaded["src.world.Map"] = TestMap
+do
+  local testBlocks = {}
+  for i = 1, 16 do testBlocks[i] = 1 end
+  local realMap = {
+    id = "PARITY_CITY",
+    def = { width = 4, height = 4, blocks = testBlocks,
+            borderBlock = 1, tileset = "OVERWORLD" },
+    tileset = {
+      id = "PARITY", image = "parity.png", tilesPerRow = 16,
+      imageWidth = 128, imageHeight = 48,
+      blocks = { { 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 },
+                 { 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2 } },
+    },
+    walkable = { [1] = true, [2] = true },
+    waterTiles = {},
+    doorTiles = {},
+  }
+  for _, name in ipairs({ "tileAt", "blockAt", "cellTile", "inBounds",
+                          "isWalkableCell", "isGrassCell", "isWaterCell" }) do
+    realMap[name] = TestMap[name]
+  end
+  local gdata = ChunkMesher.buildGeometryData(realMap, true, {})
+  T.check(gdata and gdata.terrain and gdata.terrain.n and gdata.terrain.n > 0,
+          "buildGeometryData returns terrain streams")
+  T.check(gdata.water ~= nil and gdata.aux ~= nil,
+          "buildGeometryData returns water + aux records")
+  MeshCache.configure({ maps = maps, tilesets = {} })
+  local okT = MeshCache.saveTerrain(realMap, "body", gdata.terrain.buf,
+                                    gdata.terrain.n, gdata.terrain.idx,
+                                    gdata.terrain.m)
+  T.check(okT, "saveTerrain accepts worker streams")
+  local okA = MeshCache.saveAux(realMap, "body", gdata.aux)
+  T.check(okA, "saveAux accepts worker streams")
+  local tdata = MeshCache.loadTerrain(realMap, "body")
+  T.check(tdata ~= nil and tdata.n == gdata.terrain.n,
+          "worker terrain reads back at the same vertex count")
+end
+
+-- --- BUG-2a: the pump pre-empts an oversized job mid-phase --------------
+-- A synthetic job whose phase runs far past its slice must suspend and
+-- resume on the next pump (the "yield, don't run to completion" contract
+-- the freeze logs were missing: 81-428 overshoots a session). The
+-- build-budget deadline itself is unobservable headless (the love stub's
+-- timer is frozen at 0), so the loader spins a fixed oversized phase and
+-- yields exactly where the real budget would suspend it.
+MeshCache.configure({ maps = maps, tilesets = {} })
+ChunkMesher.release("OVERSHOOT")
+local overshootSteps = 0
+local overshootSpun = false
+ChunkMesher.requestMapId("OVERSHOOT", true, {}, false, true, function()
+  if not overshootSpun then
+    overshootSpun = true
+    local target = os.clock() + 0.005   -- a phase longer than the slice
+    while os.clock() < target do overshootSteps = overshootSteps + 1 end
+    coroutine.yield("budget")           -- the budget suspends the job here
+  end
+  return fakeMap
+end)
+T.check(ChunkMesher.jobPending("OVERSHOOT", true), "oversized job queued")
+ChunkMesher.pump(false)
+T.check(overshootSteps > 0, "oversized phase ran before the yield")
+T.check(ChunkMesher.jobPending("OVERSHOOT", true),
+        "oversized job suspended mid-phase instead of running to completion")
+local stepsAfterYield = overshootSteps
+ChunkMesher.pump(false)
+T.check(overshootSteps == stepsAfterYield,
+        "the resumed job continues instead of re-running the phase")
+T.check(ChunkMesher.jobStatus("OVERSHOOT", true) ~= "pending",
+        "the suspended job ran to its end on the next pump")
+ChunkMesher.release("OVERSHOOT")
+
+-- --- BUG-2a: the prebuild pumps a tighter slice and restores it --------
+local origIdle, origCovered = ChunkMesher.IDLE_SLICE, ChunkMesher.COVERED_SLICE
+local pumpSlices = {}
+local origPump = ChunkMesher.pump
+ChunkMesher.pump = function(covered)
+  pumpSlices[#pumpSlices + 1] = {
+    idle = ChunkMesher.IDLE_SLICE, covered = ChunkMesher.COVERED_SLICE,
+    coveredFlag = covered,
+  }
+end
+Prebuild.bootstrap(owGame)
+T.check(Prebuild.autoStart(owGame), "slice test: prebuild running")
+Prebuild.update(false)
+T.check(#pumpSlices >= 1, "slice test: the prebuild pumped once")
+local tight = pumpSlices[#pumpSlices]
+T.check(tight.idle < origIdle,
+        "slice test: idle slice tightened during the build")
+T.check(tight.covered < origCovered,
+        "slice test: covered slice tightened during the build")
+T.check(Prebuild.cancel(), "slice test: build cancels")
+Prebuild.update(false)
+T.eq(ChunkMesher.IDLE_SLICE, origIdle, "slice test: idle slice restored")
+T.eq(ChunkMesher.COVERED_SLICE, origCovered,
+     "slice test: covered slice restored")
+
+-- --- BUG-2a: an overshooting pump yields the next tick ------------------
+-- The containment half of the budget: a resume that blows the slice
+-- pauses the FOLLOWING tick so the freeze does not compound (the job
+-- resumes on the next pump, exactly once). The prebuild's own clock
+-- reads love.timer per call, so a shim with a REAL timer makes the
+-- overshoot measurable headless (the suite's stub timer is frozen).
+ChunkMesher.pump = origPump
+ChunkMesher.release("A")   -- drop the part-1 job so the shimmed loader
+                           -- is captured by the fresh queue below
+local realMapLoader = package.loaded["src.world.MapLoader"]
+package.loaded["src.world.MapLoader"] = {
+  load = function()
+    local target = os.clock() + 0.030
+    while os.clock() < target do end
+    return fakeMap
+  end,
+  evict = function() end,
+  cached = function() return nil end,
+}
+local oldLove = love
+local realLove = {}
+for key, value in pairs(oldLove or {}) do realLove[key] = value end
+realLove.timer = { getTime = function() return os.clock() end }
+_G.love = realLove
+T.check(Prebuild.start(owGame), "overshoot test: build restarted")
+Prebuild.update(false)   -- the ~30ms load resume vs the 3ms slice
+local pumpCalls = 0
+ChunkMesher.pump = function() pumpCalls = pumpCalls + 1 end
+Prebuild.update(false)
+T.eq(pumpCalls, 0, "overshoot test: the tick after an overshoot does not pump")
+Prebuild.update(false)
+T.eq(pumpCalls, 1, "overshoot test: pumping resumes on the following tick")
+_G.love = oldLove
+package.loaded["src.world.MapLoader"] = realMapLoader
+ChunkMesher.pump = origPump
+T.check(Prebuild.cancel(), "overshoot test: cancels")
+Prebuild.update(false)
+ChunkMesher.release("A")
+MeshCache.configure({ maps = maps, tilesets = {} })
+
+-- --- BUG-2b: the resume scan defers across ticks (large sets) ----------
+-- A build whose survivor scan would take seconds on cold flash must not
+-- scan synchronously in start(): the scan advances in update() ticks,
+-- the on-disk survivors are skipped, and only the missing jobs are
+-- dispatched (the resume semantics are unchanged).
+local bigMaps = {}
+for i = 1, 40 do
+  local id = string.format("M%02d", i)
+  bigMaps[id] = { id = id, width = 2, height = 2, borderBlock = 0,
+                  blocks = { 1, 2, 3, 4 }, connections = {} }
+end
+local bigGame = { data = { maps = bigMaps, tilesets = {} } }
+local bigJobs = Prebuild.enumerate(bigMaps)
+T.check(#bigJobs > 16, "scan test: big set exceeds the inline threshold")
+MeshCache.configure({ maps = bigMaps, tilesets = {} })
+local survivor = { id = "M01", tileset = { image = "tileset.png",
+                                           trueColor = false },
+                   renderer = { gbcAtlas = false } }
+MeshCache.saveTerrain(survivor, "body", nil, 0)
+MeshCache.saveWater(survivor, "body", nil, 0)
+MeshCache.saveAux(survivor, "body", { figures = {} })
+T.check(not Prebuild.bootstrap(bigGame), "scan test: big cache not ready")
+T.check(Prebuild.start(bigGame), "scan test: big build starts")
+local bDone, bTotal, bRunning = Prebuild.progress()
+T.check(bRunning, "scan test: build running")
+T.eq(bTotal, #bigJobs, "scan test: full job set")
+T.eq(bDone, 0, "scan test: no synchronous scan on start (deferred)")
+T.check(not ChunkMesher.jobPending("M01", true),
+        "scan test: no dispatch before the resume scan completes")
+ChunkMesher.pump = function() end   -- dispatch only: jobs never run
+for _ = 1, 10 do Prebuild.update(false) end
+T.check(ChunkMesher.jobPending("M01", false),
+        "scan test: dispatch begins at the first missing job")
+T.check(not ChunkMesher.jobPending("M01", true),
+        "scan test: the surviving M01/body job is skipped")
+T.eq(select(1, Prebuild.progress()), 1,
+     "scan test: the survivor counts as done")
+ChunkMesher.pump = origPump
+T.check(Prebuild.cancel(), "scan test: cancels")
+Prebuild.update(false)
+ChunkMesher.release("M01")
+MeshCache.wipe(bigJobs)
+MeshCache.configure({ maps = maps, tilesets = {} })
+
+-- --- BUG-1: the pre-warm hook primes the first map's body mesh ---------
+-- Empty cache: a no-op, never a fresh build, never a crash.
+MeshCache.wipe(jobs)
+ChunkMesher.release("A")
+T.check(not Prebuild.primeFirst(fakeMap),
+        "pre-warm: an empty cache no-ops")
+T.check(ChunkMesher.peek(fakeMap, true) == nil,
+        "pre-warm: no mesh comes out of an empty cache")
+-- A running prebuild owns the cache: the prime must not touch it.
+Prebuild.bootstrap(owGame)
+T.check(Prebuild.autoStart(owGame), "pre-warm: build running for the gate")
+T.check(not Prebuild.primeFirst(fakeMap),
+        "pre-warm: no-op while the prebuild runs")
+T.check(Prebuild.cancel(), "pre-warm: cancels")
+Prebuild.update(false)
+-- Payloads on disk: the prime hands the body slot to the runtime cache
+-- (the first scene renders a small mesh already in memory), once per
+-- session.
+Prebuild.bootstrap(owGame)
+MeshCache.configure({ maps = maps, tilesets = {} })
+MeshCache.begin()
+MeshCache.saveTerrain(fakeMap, "body", nil, 0)
+MeshCache.saveWater(fakeMap, "body", nil, 0)
+MeshCache.saveAux(fakeMap, "body", { figures = {} })
+T.check(Prebuild.primeFirst(fakeMap),
+        "pre-warm: primed with payloads on disk")
+T.check(ChunkMesher.seen("A"),
+        "pre-warm: the runtime cache entry exists after priming")
+T.check(not Prebuild.primeFirst(fakeMap),
+        "pre-warm: the prime is one-shot per session")
+MeshCache.wipe({ { id = "A", slot = "body" } })
+ChunkMesher.release("A")
+MeshCache.configure({ maps = maps, tilesets = {} })
 
 run.release()
 T.finish("potato_voxel_cache")
