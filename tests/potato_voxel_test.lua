@@ -15,12 +15,13 @@ local optionsState = { modOptions = {} }
 optionsState.modOptions.potato_voxel = {}
 exports.lib.mod.options = {
   get = function(_, key) return optionsState.modOptions.potato_voxel[key] end,
-  set = function(_, key, value)
-    optionsState.modOptions.potato_voxel[key] = value
-  end,
 }
+-- The engine's options API has NO set (only define/get); writers persist
+-- through a game's save options, the loader's copy and writeOptions.
+local wroteOptions = 0
 local fakeGame = { save = { options = optionsState },
-                   writeOptions = function() end }
+                   mods = { modOptions = {} },
+                   writeOptions = function() wroteOptions = wroteOptions + 1 end }
 
 -- --- the player support token (PlayerId) ----------------------------------
 -- 8 digits, minted once per install, persisted in OPTIONS (per-install,
@@ -33,11 +34,16 @@ local token = PlayerId.ensure()
 T.check(token ~= nil and token:match("^%d%d%d%d%d%d%d%d$") ~= nil,
         "the player id is an 8-digit token")
 T.eq(PlayerId.get(), token, "the token is stable within the session")
+PlayerId.persist(fakeGame)
 T.eq(optionsState.modOptions.potato_voxel.player_id, token,
      "the token persists in the per-install OPTIONS store")
-local secondSession = PlayerId.ensure()
-T.eq(secondSession, token,
-     "a re-ensure reuses the persisted token (one id per install)")
+T.eq(fakeGame.mods.modOptions.potato_voxel.player_id, token,
+     "the loader copy carries the token for options:get")
+T.eq(wroteOptions, 1, "the options file is written once")
+PlayerId._resetForTests()
+local rebooted = PlayerId.ensure()
+T.eq(rebooted, token,
+     "a reboot re-reads the persisted token (one id per install, not per boot)")
 local brick = exports and exports.brick
 T.check(brick ~= nil and brick.isBrick(), "the one build is the Brick build")
 if brick then

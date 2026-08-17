@@ -1709,6 +1709,7 @@ mod.events:on("game.ready", function(payload)
     DebugOverlay.event("game.ready")
     local caps = Voxel3D.diagnostics()
     DebugOverlay.pipelineAvailable(caps.available, caps.reason, caps)
+    PlayerId.persist(payload.game)
     CachePrebuild.bootstrap(payload.game)
   end
 end)

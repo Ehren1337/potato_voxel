@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.7.7] - 2026-08-17
+
+### Fixed: the player support ID was minted anew on every boot
+
+- The engine's options API has no `set` (only `define`/`get`), so the
+  token's persist call silently no-op'd under pcall: every boot minted a
+  fresh 8-digit id, and a player's logs fragmented across ids from the
+  first reboot onwards. The token now persists the same way the settings
+  rows do -- through the game handle at game.ready (live save options,
+  the loader copy `options:get` reads, then the options file) -- so a
+  reboot re-reads the id it stored. The suite's options mock also carried
+  a fake `set` the real API never had, which is why no test caught it:
+  the mock now matches the engine's API shape and the suite asserts a
+  fresh session re-reads the persisted token.
+
 ## [1.7.6] - 2026-08-17
 
 ### Changed: support logs carry the fix-evidence for the field issues
@@ -20,7 +35,7 @@
   hits out of ~470 jobs while Windows resumed warm) can no longer hide
   the miss ratio.
 
-## [1.7.7] - TBD (threaded geometry workers, needs engine PR #1454)
+## [1.7.8] - TBD (threaded geometry workers, needs engine PR #1454)
 
 ### Added: threaded geometry workers for the prebuilder (multi-core fills)
 

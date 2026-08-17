@@ -19,6 +19,11 @@ local KEY = "player_id"
 local cached = nil
 local seeded = false
 
+local function modId()
+  local mod = V.mod
+  return (mod and mod.id) or "potato_voxel"
+end
+
 local function mint()
   if not seeded then
     seeded = true
@@ -43,17 +48,40 @@ function PlayerId.get()
   return nil
 end
 
--- Mint on first call in the session and try to persist it; a failed
--- persist keeps the session value (the next boot mints a new one).
+-- Mint on first call in the session. The token is NOT written here: the
+-- engine's options API has no set (only define/get -- Loader.lua), so the
+-- write happens later through the game handle, the same three-way persist
+-- the settings rows use (game.save.options, the loader's copy that
+-- options:get reads, then the options file).
 function PlayerId.ensure()
   if PlayerId.get() then return cached end
   local v = mint()
   cached = v
-  local opts = V.mod and V.mod.options
-  if opts and opts.set then
-    pcall(opts.set, opts, KEY, v)
-  end
   return v
+end
+
+-- Persist the session token per-install. Mirrors ModSetting:setIndex:
+-- the live save's options table, the loader's copy that mod.options:get
+-- reads, and then the file -- so the NEXT boot reads the same id back
+-- instead of minting a new one. Needs the game handle, so the caller
+-- fires it from game.ready.
+function PlayerId.persist(game)
+  local v = PlayerId.get()
+  if not v then return end
+  local id = modId()
+  local opts = game and game.save and game.save.options
+  if opts then
+    opts.modOptions = opts.modOptions or {}
+    opts.modOptions[id] = opts.modOptions[id] or {}
+    opts.modOptions[id][KEY] = v
+  end
+  local loader = game and game.mods
+  if loader then
+    loader.modOptions = loader.modOptions or {}
+    loader.modOptions[id] = loader.modOptions[id] or {}
+    loader.modOptions[id][KEY] = v
+  end
+  if game and game.writeOptions then pcall(game.writeOptions, game) end
 end
 
 -- Test seam: forget the session cache (the suites replay boots).
