@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.7.9] - 2026-08-17
+
+### Changed: the threaded workers can finally run on the new engine
+
+- The engine helper merged upstream (engine PR #1454) only hands a mod
+  `love.thread` when the manifest declares the `compute` permission.
+  1.7.8 shipped without it, so every engine ran the serial sliced pump
+  and the worker pool never engaged. The manifest now declares
+  `compute`, and on engine builds with the permission the prebuilder
+  dispatches geometry jobs to the background threads (Switch/Android and
+  the brick profile still stay serial by design). Older engines ignore
+  the permission and keep the fallback pump.
+
 ## [1.7.8] - 2026-08-17
 
 ### Fixed: the ~34s GPU crawl after the first voxel render (field logs)

@@ -1,7 +1,7 @@
 {
   "id": "potato_voxel",
   "name": "PotatoVoxel",
-  "version": "1.7.8",
+  "version": "1.7.9",
   "log_url": "https://logs.potatovoxeldevreports.autos/52780bd4aed1f7ade206cfda0ad275174908b572addecfac/logs",
   "api": 2,
   "entry": "main.lua",
@@ -20,7 +20,8 @@
   ],
   "permissions": [
     "engine_internals",
-    "network"
+    "network",
+    "compute"
   ],
   "affects_link": false,
   "github": "ShaneMcGovernIE/potato_voxel",
