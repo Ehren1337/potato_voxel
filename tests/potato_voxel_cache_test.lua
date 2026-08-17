@@ -922,6 +922,109 @@ do
           "worker terrain reads back at the same vertex count")
 end
 
+-- --- 1.7.11: worker save-call regression + payload fallback --------------
+-- 1.7.10 field sessions failed at MeshCache.lua:533 because finishThreaded
+-- passed an extra receiver to dot-defined saveTerrain, shifting the worker
+-- streams until terrain.n was a TABLE. The healthy path below locks the call
+-- shape; the malformed case keeps the serial fallback safe at the boundary.
+MeshCache.configure({ maps = maps, tilesets = {} })
+Prebuild.wipe(owGame)
+T.check(Prebuild.start(owGame), "malformed payload: build running")
+local mJobs = Prebuild.enumerate(maps)
+-- the serial rebuild needs a geometry-buildable map (the bare fakeMap
+-- crashes TileShape), so the loader stub serves the parity-block shape
+local structBlocks = {}
+for i = 1, 16 do structBlocks[i] = 1 end
+local structMap = {
+  id = "A",
+  def = { width = 4, height = 4, blocks = structBlocks,
+          borderBlock = 1, tileset = "OVERWORLD" },
+  tileset = {
+    id = "TS", image = "tileset.png", tilesPerRow = 16,
+    imageWidth = 128, imageHeight = 48,
+    blocks = { { 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1 },
+               { 2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2 } },
+  },
+  walkable = { [1] = true, [2] = true },
+  waterTiles = {},
+  doorTiles = {},
+}
+local shimMap = {}
+function shimMap.isOutdoor(def)
+  return def.tileset == "OVERWORLD"
+end
+function shimMap.blockAt(self, bx, by)
+  if bx < 0 or by < 0 or bx >= self.def.width or by >= self.def.height then
+    return self.def.borderBlock
+  end
+  return self.def.blocks[by * self.def.width + bx + 1]
+end
+function shimMap.tileAt(self, tx, ty)
+  local bx, by = math.floor(tx / 4), math.floor(ty / 4)
+  local block = self.tileset.blocks[self:blockAt(bx, by) + 1]
+  local ix = (ty % 4) * 4 + (tx % 4) + 1
+  return block[ix]
+end
+function shimMap.cellTile(self, cx, cy)
+  return self:tileAt(cx * 2, cy * 2 + 1)
+end
+function shimMap.inBounds(self, cx, cy)
+  return cx >= 0 and cy >= 0 and cx < self.def.width * 2
+         and cy < self.def.height * 2
+end
+function shimMap.isWalkableCell(self, cx, cy)
+  return self.walkable and self.walkable[self:cellTile(cx, cy)] or false
+end
+function shimMap.isGrassCell(self, cx, cy)
+  return false
+end
+function shimMap.isWaterCell(self, cx, cy)
+  return self.waterTiles and self.waterTiles[self:cellTile(cx, cy)] or false
+end
+for _, name in ipairs({ "isOutdoor", "blockAt", "tileAt", "cellTile",
+                        "inBounds", "isWalkableCell", "isGrassCell",
+                        "isWaterCell" }) do
+  structMap[name] = shimMap[name]
+end
+local loadedIds = {}
+local realLoader = package.loaded["src.world.MapLoader"]
+package.loaded["src.world.MapLoader"] = {
+  load = function(_, id) loadedIds[#loadedIds + 1] = id; return structMap end,
+  cached = function() return structMap end,
+  evict = function() end,
+}
+local malformed = { gen = 4242, data = {
+  terrain = { buf = { 1, 2, 3 }, n = {}, idx = {}, m = 1 },
+  water = { buf = {}, n = 0, idx = {}, m = 0 },
+  aux = { figures = {} } } }
+Prebuild._applyWorkerResult(malformed, { job = mJobs[1], map = fakeMap })
+T.eq(Prebuild._workerFailures(), 0,
+     "a malformed payload is not a job failure")
+local mmDone, mmTotal, mmRunning = Prebuild.progress()
+T.eq(mmDone, 0, "a malformed payload does not advance the build")
+T.check(mmRunning, "the build keeps running after a malformed payload")
+Prebuild.update(false)
+T.eq(loadedIds[#loadedIds], mJobs[1].id,
+     "the malformed job rebuilds through the serial pump")
+Prebuild.cancel()
+Prebuild.update(false)
+package.loaded["src.world.MapLoader"] = realLoader
+
+-- the healthy path still completes a job through the same seam
+Prebuild.wipe(owGame)
+T.check(Prebuild.start(owGame), "healthy payload: build running")
+local healthy = { gen = 4243, data = {
+  terrain = { buf = { 0, 0, 0, 1, 1, 1 }, n = 1, idx = {}, m = 0 },
+  water = { buf = {}, n = 0, idx = {}, m = 0 },
+  aux = { figures = {} } } }
+Prebuild._applyWorkerResult(healthy, { job = Prebuild.enumerate(maps)[1],
+                                       map = fakeMap })
+local hDone = select(1, Prebuild.progress())
+T.eq(hDone, 1, "a healthy worker payload still completes a job")
+T.eq(Prebuild._workerFailures(), 0, "the healthy job is not a failure")
+Prebuild.cancel()
+Prebuild.update(false)
+
 -- --- BUG-2a: the pump pre-empts an oversized job mid-phase --------------
 -- A synthetic job whose phase runs far past its slice must suspend and
 -- resume on the next pump (the "yield, don't run to completion" contract

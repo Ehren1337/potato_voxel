@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.7.11] - 2026-08-17
+
+### Fixed: threaded precache failed while saving every worker result
+
+- 1.7.10's threaded completion path passed `MeshCache` as an extra receiver
+  to the dot-defined `saveTerrain(map, slot, ...)` function. That shifted the
+  worker streams and made `n` a table on Android, Linux, macOS, and desktop
+  builds alike. The call now uses the correct dot-call shape, and the cache
+  suite locks the regression down with a healthy worker-result test.
+- Malformed worker payloads now discard stale in-flight work, preserve already
+  completed jobs, and resume the remainder through the serial pump without
+  double-counting or replaying completed cache entries.
+
 ## [1.7.10] - 2026-08-17
 
 ### Fixed: threaded prebuild aborts on every map ("map serialization too deep (cycle?)")

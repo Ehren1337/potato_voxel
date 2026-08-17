@@ -463,8 +463,48 @@ local function finishThreaded(result)
     fail("worker: " .. tostring(result.error))
     return
   end
+  -- 1.7.10 field: every threaded job failed at the save stage on every
+  -- platform. The logged `n is a table` value was caused by passing the
+  -- module table as an extra receiver to the dot-defined saveTerrain below,
+  -- which shifted every worker stream argument. Keep this boundary check as
+  -- defense-in-depth for genuinely malformed worker payloads.
+  local streams = result.data
+  local function streamOk(s)
+    return type(s) == "table" and type(s.buf) == "table"
+       and type(s.n) == "number" and type(s.idx) == "table"
+       and type(s.m) == "number"
+  end
+  if not (streams and streamOk(streams.terrain) and streamOk(streams.water)) then
+    WorkerPool.shutdown()
+    local rewind = #state.maps + 1
+    for i, candidate in ipairs(state.maps) do
+      if candidate == job
+         or (candidate.id == job.id and candidate.slot == job.slot) then
+        rewind = i
+        break
+      end
+    end
+    -- Any other worker results are now stale. Release their maps and clear
+    -- their entries before switching to the serial pump; completed results
+    -- already recorded in this poll remain skipped by their cache keys.
+    for _, pending in pairs(state.threaded) do
+      releaseMap(pending.job.id, state.game)
+    end
+    state.threaded = {}
+    releaseMap(job.id, state.game)
+    state.done = countKeys(state.completed)
+    state.index = rewind
+    while state.index <= #state.maps do
+      local candidate = state.maps[state.index]
+      local key = tostring(candidate.id) .. "/" .. tostring(candidate.slot)
+      if not state.completed[key] then break end
+      state.index = state.index + 1
+    end
+    state.slot = nil
+    return
+  end
   local okSave = true
-  local okT, terrain = pcall(MeshCache.saveTerrain, MeshCache, map,
+  local okT, terrain = pcall(MeshCache.saveTerrain, map,
                              job.slot, result.data.terrain.buf,
                              result.data.terrain.n, result.data.terrain.idx,
                              result.data.terrain.m)
@@ -863,6 +903,19 @@ function Prebuild.primeFirst(map)
                  okG and mesh and "" or " (payloads present, no mesh)")
   end
   return okG
+end
+
+-- Test seams for the worker-result path (the suite cannot start threads):
+-- _applyWorkerResult drives the poll loop's finishThreaded with an
+-- explicit in-flight entry (production registers entries at dispatch);
+-- _workerFailures exposes the counter the seam's assertions read.
+function Prebuild._applyWorkerResult(result, entry)
+  state.threaded[result.gen] = entry or state.threaded[result.gen]
+  finishThreaded(result)
+end
+
+function Prebuild._workerFailures()
+  return state.failedJobs or 0
 end
 
 return Prebuild
