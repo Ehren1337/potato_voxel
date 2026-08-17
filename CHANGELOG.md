@@ -1,5 +1,24 @@
 # Changelog
 
+## [1.7.10] - 2026-08-17
+
+### Fixed: threaded prebuild aborts on every map ("map serialization too deep (cycle?)")
+
+- 1.7.9's compute permission finally engaged the threaded workers, and
+  the very first map dump exposed a cycle the headless fake map never
+  had: the engine's Map carries a live TileRenderer that back-references
+  the map (`map.renderer.map == map`) and holds `Game.data`. The naive
+  data dump recursed forever, hit its 40-deep guard, and threw
+  `prebuild-tick: map serialization too deep (cycle?)` every frame -- the
+  prebuild re-loaded the same map and re-errored forever, never advancing.
+- `serializeMap` now drops the `renderer` key entirely (the geometry
+  worker rebuilds fresh map data and never reads it -- the dump was also
+  dragging the whole game database into every job payload), and a
+  visited-set backstop cuts any other cyclic engine field at the repeat
+  instead of erroring.
+- If a map dump ever fails again, the prebuild reports it and falls back
+  to the serial pump for the remainder instead of erroring every tick.
+
 ## [1.7.9] - 2026-08-17
 
 ### Changed: the threaded workers can finally run on the new engine

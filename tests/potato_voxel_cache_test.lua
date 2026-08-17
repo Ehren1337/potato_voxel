@@ -792,6 +792,34 @@ T.check(serMap.id == fakeMap.id
 T.check(type(serMap.tileAt) == "nil",
         "methods are not serialized (the worker reattaches them)")
 
+-- The engine Map carries a live TileRenderer that back-references the
+-- map (map.renderer.map == map) and holds Game.data. The dump must drop
+-- the renderer instead of recursing into the cycle -- the 1.7.9
+-- regression: prebuild-tick threw "map serialization too deep (cycle?)"
+-- on every map once the compute permission ran the threaded workers.
+local cyclicMap = { id = "CYC", tileset = { image = "tileset.png" } }
+cyclicMap.renderer = {
+  map = cyclicMap,
+  data = { maps = { CYC = cyclicMap } },
+}
+local cycSrc = WorkerPool.serializeMap(cyclicMap)
+local cycMap = assert(load(cycSrc, "@ser", "t"))()
+T.check(cycMap.id == "CYC"
+        and cycMap.tileset.image == "tileset.png"
+        and cycMap.renderer == nil,
+        "serializeMap drops the cyclic renderer instead of recursing")
+T.check(not cycSrc:find("renderer", 1, true),
+        "the renderer never reaches the dumped source")
+
+-- Backstop: any OTHER cyclic field (not named renderer) must degrade to
+-- nil at the repeat, not blow the depth guard.
+local deepMap = { id = "DEEP", tileset = { image = "tileset.png" } }
+deepMap.def = deepMap
+local deepSrc = WorkerPool.serializeMap(deepMap)
+local deepMapOut = assert(load(deepSrc, "@ser", "t"))()
+T.check(deepMapOut.id == "DEEP" and deepMapOut.def == nil,
+        "a non-renderer cycle is cut at the repeat, not an error")
+
 -- parity: the streams buildGeometryData returns feed saveTerrain/saveWater/
 -- saveAux exactly like the serial sink buffers, and loadTerrain reads the
 -- same counts back. The worker path runs with the pure engine shims from

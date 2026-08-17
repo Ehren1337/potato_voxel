@@ -149,7 +149,14 @@ end
 
 -- ------------------------------------------------------- serialization
 
-local function dumpValue(value, out, depth)
+-- The map's `renderer` is a live engine object, not map data: it
+-- back-references the map (map.renderer.map == map) and holds Game.data,
+-- so dumping it would cycle forever and drag the whole database into the
+-- job payload. The geometry path never reads it -- the worker rebuilds
+-- fresh map data -- so the key is dropped. `seen` is the backstop for
+-- any other cyclic engine field: a table already walked is dropped as
+-- nil (the same convention functions/userdata already follow).
+local function dumpValue(value, out, depth, seen)
   if depth > 40 then
     error("map serialization too deep (cycle?)", 0)
   end
@@ -168,6 +175,11 @@ local function dumpValue(value, out, depth)
   elseif t == "nil" then
     out[#out + 1] = "nil"
   elseif t == "table" then
+    if seen[value] then
+      out[#out + 1] = "nil"
+      return
+    end
+    seen[value] = true
     -- map tables are data-only trees (MapLoader builds fresh objects);
     -- methods/functions are dropped -- the worker reattaches tileAt.
     local seq = #value > 0
@@ -175,19 +187,23 @@ local function dumpValue(value, out, depth)
     local count = 0
     for k, v in pairs(value) do
       if type(k) ~= "string" or k:find("^[%a_][%w_]*$") then
-        count = count + 1
-        if count > 1 then out[#out + 1] = seq and "," or ", " end
-        if not seq then
-          if type(k) == "string" then
-            out[#out + 1] = "[" .. string.format("%q", k) .. "]="
-          else
-            out[#out + 1] = "[" .. tostring(k) .. "]="
-          end
-        end
-        if type(v) ~= "function" and type(v) ~= "userdata" then
-          dumpValue(v, out, depth + 1)
+        if k == "renderer" then
+          -- engine TileRenderer (map back-ref + Game.data): not geometry
         else
-          out[#out + 1] = "nil"
+          count = count + 1
+          if count > 1 then out[#out + 1] = seq and "," or ", " end
+          if not seq then
+            if type(k) == "string" then
+              out[#out + 1] = "[" .. string.format("%q", k) .. "]="
+            else
+              out[#out + 1] = "[" .. tostring(k) .. "]="
+            end
+          end
+          if type(v) ~= "function" and type(v) ~= "userdata" then
+            dumpValue(v, out, depth + 1, seen)
+          else
+            out[#out + 1] = "nil"
+          end
         end
       end
     end
@@ -205,7 +221,7 @@ function WorkerPool.serializeMap(map)
   local cached = state.mapCache[map.id]
   if cached then return cached end
   local out = { "return " }
-  dumpValue(map, out, 0)
+  dumpValue(map, out, 0, {})
   local src = table.concat(out)
   state.mapCache[map.id] = src
   return src

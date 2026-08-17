@@ -543,9 +543,21 @@ local function dispatchThreaded(covered)
   local okTR, TileRenderer = pcall(require, "src.render.TileRenderer")
   local voidFill = (okTR and TileRenderer and TileRenderer.voidFill)
                    or "trees"
+  local okSer, mapSrc = pcall(WorkerPool.serializeMap, map)
+  if not okSer then
+    -- a map the dump cannot represent (a cyclic engine field past the
+    -- renderer): the serial pump builds the same geometry from the live
+    -- object, so report and let update() drop the pool and fall back
+    local okD, Overlay = pcall(V.require, "DebugOverlay")
+    if okD and Overlay then
+      Overlay.error("map dump failed for %s: %s", tostring(job.id),
+                    tostring(mapSrc))
+    end
+    return false
+  end
   local gen = WorkerPool.submit({
     version = MeshCache.GEOMETRY_VERSION,
-    mapSrc = WorkerPool.serializeMap(map),
+    mapSrc = mapSrc,
     bodyOnly = job.slot == "body",
     masks = job.masks,
     voidFill = tostring(voidFill),
