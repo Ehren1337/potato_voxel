@@ -1,4 +1,4 @@
-# PotatoVoxel 1.8.0 (upcoming)
+# PotatoVoxel
 
 PotatoVoxel turns the Pokémon Gen 1 overworld into a 3D voxel diorama while
 keeping the game playable on handhelds, phones, and lower-powered computers.
@@ -52,8 +52,7 @@ play normally, but the first visits to uncached maps may stutter while they are
 built.
 
 On Android and other handhelds, keep the device connected to power during a
-large build. The 1.8.0 builder is bounded so it uses less peak memory, but a
-first complete build can still take time. You can cancel and resume later; do
+large build. A first complete build can still take time. You can cancel and resume later; do
 not force-close the game while it is writing a cache entry if you can avoid it.
 
 ## Cache management
@@ -112,7 +111,7 @@ struggles after the cache has been built.
 - **VR** and first-/third-person modes.
 - The unused **Horde** minigame.
 - Pokémon Stadium ROM importing or bundled Stadium ROM assets.
-- Forest effects and other high-cost features removed for performance and
+- Other high-cost features removed for performance and
   sandbox compatibility.
 
 `3D-BTL` is an optional PotatoVoxel battle presentation setting. It is not a
@@ -190,46 +189,6 @@ diagnostic shortcut when the log option is enabled.
 Diagnostics are intended to contain technical session information only. They
 do not include your name, account, save data, or ROM files.
 
-## What changed in 1.8.0
-
-- Reworked precaching around bounded streaming to reduce peak memory and long
-  tail stalls.
-- Packed geometry and compression work so the main thread does less blocking
-  work during builds and map transitions.
-- Added safer cancellation, worker error handling, resumable progress, cache
-  identity checks, and atomic cache commits.
-- Reduced duplicate body/ring geometry work and unnecessary storage operations.
-- Fixed worker tileset ownership so stacked-sprite vegetation and bollards keep
-  the correct atlas and authored shape after cache loads and rapid map changes.
-- Improved cache-hit loading and destination-map prioritisation to reduce pop-in.
-- Removed VR, Horde, Stadium import, and other retired high-cost features.
-- Kept the mod sandbox-safe and free of bundled ROM assets.
-
-## Developer notes
-
-The mod source is tested from a Gen1Recomp engine checkout. From the engine
-root:
-
-```sh
-POKEPORT_DATA_DIR="$PWD/tests/fixture_data" \
-  luajit mods/potato_voxel/tests/potato_voxel_cache_test.lua
-
-POKEPORT_DATA_DIR="$PWD/tests/fixture_data" \
-  luajit mods/potato_voxel/tests/potato_voxel_test.lua
-
-python3 tools/modkit.py lint mods/potato_voxel
-python3 tools/modkit.py validate mods/potato_voxel --base auto
-python3 tools/modkit.py pack mods/potato_voxel
-```
-
-The optional desktop-only threaded smoke test runs from the mod checkout with
-a real LÖVE binary:
-
-```sh
-love tools/thread_smoke
-```
-
-It is developer tooling and is excluded from the installable mod package.
 
 ## Credits
 
@@ -237,7 +196,4 @@ It is developer tooling and is excluded from the installable mod package.
   forked from.
 - **pret/pokered** — the original game data that Gen1Recomp users provide to
   their own installation.
-- **AverageConsumer** — battle UI/sprite interoperability and loading-cover
-  improvements.
-
-For the complete engineering history, see [CHANGELOG.md](CHANGELOG.md).
+- **Gen1Reconp** — for making this all possible.
