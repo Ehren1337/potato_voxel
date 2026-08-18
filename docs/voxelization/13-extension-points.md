@@ -51,19 +51,19 @@ A companion mod can rebuild/refresh meshes off the same events, or read
    fall back to volumes; the profile fixes the art the detector reads
    wrong. Improvement = better segmentation (more shade-aware floods,
    texture continuity), less authoring per tileset.
-2. **Key collisions**: `keyOf` is a packed int with a ±64-tile
+2. **Key collisions**: `GridKey.of` is a packed int with a ±64-tile
    assumption (fine for Gen 1 maps); a port with bigger maps needs a
-   real hash. Three copies of `keyOf` (Structures, Buildings,
-   ChunkMesher) must stay in sync.
+   real hash. The coordinate contract now lives in `lib/GridKey.lua`, so
+   Structures, Buildings, ShapeDebug, and ChunkMesher cannot drift apart.
 3. **`roundCache` is global and never LRU'd** — bounded in practice by
    tileset art variety, but a tileset-heavy session grows it. A cap or
    per-neighbourhood eviction would harden it.
 4. **The `Assets.register` boot handoff** is a delicate dance (skip the
    first callback; skip on Switch until `builtAnything`). Any engine
    change to asset invalidation ordering needs re-verification.
-5. **`TileRenderer.animFrame` fallback chain** reaches into `tick`'s
-   upvalues via `debug.getupvalue` — an engine refactor of that module
-   silently loses the shared clock (falls back to wall time).
+5. **`TileRenderer.animFrame` fallback chain** uses the exported engine clock
+   when available and otherwise falls back to wall time. It no longer reaches
+   into private `tick` upvalues, keeping the runtime within the sandbox API.
 6. **The map's `doorTiles` fold** assumes door graphics; a tileset that
    reuses a door tile for something else needs the profile pin to win
    (it does — pins override the fold, Structures.lua:264-294).

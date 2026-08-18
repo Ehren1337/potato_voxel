@@ -25,8 +25,9 @@
 -- The panel draws through render.hud over every screen; lines go to the
 -- console and, when scoped storage is reachable, to the bytes key
 -- "debug/log". Repeated identical messages collapse to "xN"; storage
--- writes throttle to once a second. DELIBERATELY TEMPORARY -- removed
--- before the 1.6.1 release.
+-- writes throttle to once a second. The module remains a compatibility façade
+-- for the public debug export; state, environment, and transport live in
+-- focused modules so the HUD can be changed independently.
 
 -- the mod namespace (see main.lua): V.require loads a sibling module
 local V = ...
@@ -34,17 +35,10 @@ local V = ...
 local Overlay = {}
 
 local PlayerId = V.require("PlayerId")
+local DiagnosticsStore = V.require("DiagnosticsStore")
+local DiagnosticsEnvironment = V.require("DiagnosticsEnvironment")
+local DiagnosticsTransport = V.require("DiagnosticsTransport")
 
-local MAX_LINES = 20
-local lines = {}         -- the on-screen ring buffer
-local log = {}           -- the recent deduped line ring
-local logSeq = {}        -- parallel monotonic sequence per ring line (delta sends)
-local bootLog = {}       -- first boot lines, kept even after the ring rolls
-local LOG_KEEP = 600
-local BOOT_KEEP = 128
-local seq = 0            -- next ring sequence number
-local lastSentSeq = 0    -- watermark: ring lines with seq > lastSentSeq are unsent
-local bootSent = false   -- boot evidence ships once per session
 local running = true     -- capture starts at boot, even while hidden
 local visible = false    -- F9 only changes panel visibility
 local verbose = true     -- F10: true = all lines, false = important only
@@ -63,51 +57,6 @@ local statsTime = 0
 local statsMax = 0
 local statsRender = 0
 local statsLast = 0
-
--- session counters, folded into the summary
-local counters = { jobs = 0, jobFails = 0, cacheHits = 0, cacheMisses = 0,
-                   slowLoads = 0, errors = 0, storageFails = 0 }
-local worstFrame = 0
-
--- This is deliberately data-only: it can be written through mod.storage's
--- table surface and exported without exposing a Canvas, shader or game object.
-local health = {
-  frame = 0,
-  session = sessionId,
-  startedAt = os.date("%Y-%m-%dT%H:%M:%S"),
-  pipeline = {
-    id = "voxel", level = 0, updateCalls = 0, drawWorldCalls = 0,
-    rendered = 0, fallbacks = 0, loading = 0, noState = 0,
-    unavailable = 0, availability = nil, reason = nil,
-    detail = {}, lastPath = "never", lastPathFrame = 0,
-    lastAvailabilityFrame = 0,
-  },
-  capabilities = {},
-  renderer = {},
-  storage = { writes = 0, failures = 0, available = nil },
-  build = { jobs = 0, slices = 0, overshoots = 0, worstResumeMs = 0,
-            worstResumeJob = nil },
-  probe = { ok = nil },
-  lastEvent = nil,
-  lastError = nil,
-  platform = nil,
-}
-
--- The device class these logs come from.  The mod sandbox forbids raw OS
--- queries, so the answer comes from the engine's own Platform module --
--- the same one main.lua reads for its mobile gates -- which resolves the
--- OS name inside engine code.  Captured once at boot: a device does not
--- change platform mid-session.
-local function platformName()
-  local ok, Platform = pcall(require, "src.core.Platform")
-  if not ok or type(Platform) ~= "table" then return "?" end
-  local okP, info = pcall(Platform.detect)
-  if not okP or type(info) ~= "table" then return "?" end
-  local osName = tostring(info.os or "?")
-  if osName == "?" or osName == "" then return "?" end
-  local kind = info.console and "console" or info.mobile and "mobile" or nil
-  return kind and (osName .. " (" .. kind .. ")") or osName
-end
 
 -- The VOXEL SETTINGS summary, provided by main.lua (it owns the rows and
 -- the live options API): one space-separated `key=label` line so a
@@ -168,173 +117,36 @@ local function dataCopy(value, depth)
   return out
 end
 
+local diagnostics = DiagnosticsStore.new({
+  sessionId = sessionId,
+  dataCopy = dataCopy,
+})
+local health = diagnostics.health
+local counters = diagnostics.counters
+
+local Environment = DiagnosticsEnvironment.new({
+  health = health,
+  dataCopy = dataCopy,
+})
+
 local function snapshot()
-  return {
-    schema = 2,
-    session = sessionId,
-    startedAt = health.startedAt,
-    frame = health.frame,
-    pipeline = dataCopy(health.pipeline),
-    capabilities = dataCopy(health.capabilities),
-    renderer = dataCopy(health.renderer),
-    storage = dataCopy(health.storage),
-    build = dataCopy(health.build),
-    probe = dataCopy(health.probe),
-    platform = health.platform or platformName(),
+  return diagnostics.snapshot({
+    platform = health.platform or Environment.platformName(),
     settings = settingsLine(),
-    lastEvent = dataCopy(health.lastEvent),
-    lastError = dataCopy(health.lastError),
-    lastPhase = health.lastPhase,
-    counters = dataCopy(counters),
-    worstFrame = worstFrame,
-  }
+  })
 end
 
 local function logText()
-  local out = {}
-  if #bootLog > 0 then
-    out[#out + 1] = "-- boot evidence (first lines) --"
-    for _, line in ipairs(bootLog) do out[#out + 1] = line end
-  end
-  if #log > 0 then
-    out[#out + 1] = "-- recent evidence (ring) --"
-    for _, line in ipairs(log) do out[#out + 1] = line end
-  end
-  return table.concat(out, "\n")
+  return diagnostics.logText()
 end
 
 -- Platform slug for the remote filename/folder: the send's
 -- <platform>-<engine>-<mod>-<DD_MM_YYYY> name and the server's per-platform
 -- subfolder both key off it.  Kept stable and folder-safe (lowercase
 -- letters only) so the server never has to sanitise a free-text platform.
--- L4T (Linux for Tegra -- Ubuntu running on Switch hardware) answers
--- "Linux" to every OS question, so the OS name alone can never tag a
--- Switch-under-Linux session. The GPU string still names the chip, and
--- getRendererInfo is the one hardware witness the sandbox leaves this
--- mod. A Linux session whose renderer is a Tegra slugs as `switch`: the
--- same SoC also powers Jetson devkits, which this folds in on purpose --
--- support triage wants the console, and no other device this mod ships
--- for draws a Tegra (the Brick's GE8300 keeps its honest `linux`).
-local function tegraRenderer()
-  local ri = health.renderer and health.renderer.renderer
-  if not ri then return false end
-  -- all four fields: the chip string lands where the driver puts it --
-  -- LÖVE 11 names it in `device`, some Mesa builds only in `version` --
-  -- and a matcher that missed the real field is what a Steam Deck log
-  -- once proved possible (its vangogh signature lived in version).
-  local s = ("%s %s %s %s"):format(tostring(ri.name or ""),
-                                    tostring(ri.vendor or ""),
-                                    tostring(ri.device or ""),
-                                    tostring(ri.version or "")):lower()
-  return s:find("tegra", 1, true) ~= nil
-      or s:find("nv13", 1, true) ~= nil
-      or s:find("gm20", 1, true) ~= nil
+Overlay._platformSlug = function()
+  return Environment.platformSlug()
 end
-
-local function platformSlug()
-  local p = tostring(health.platform or platformName()):lower()
-  if p:find("switch") or p:find("nx") then return "switch" end
-  if p:find("ios") or p:find("iphone") or p:find("ipad") then return "ios" end
-  if p:find("android") then return "android" end
-  if p:find("linux") then
-    return tegraRenderer() and "switch" or "linux"
-  end
-  if p:find("windows") or p:find("win") then return "windows" end
-  -- The engine names macOS both "OS X" and "macOS" depending on build.
-  if p:find("mac") or p:find("os x") or p:find("osx") or p:find("darwin")
-     then return "macos" end
-  if p:find("web") or p:find("browser") then return "web" end
-  return "unknown"
-end
-
-Overlay._platformSlug = platformSlug   -- named for the suite
-
--- Identity fields for the remote payload.  The server derives the
--- filename (<platform>-<engine>-<mod>-<date>.json) and the platform
--- subfolder from these, so without them a received log cannot be
--- attributed to an engine build, a mod version, or a session.
-local function identityFields()
-  local mod = V.mod
-  local manifest = mod and mod.manifest
-  local ctx = health.storage.context or {}
-  local lv = health.renderer and health.renderer.love
-  local loveVer = lv and (tostring(lv.codename) .. " " .. tostring(lv.major)
-    .. "." .. tostring(lv.minor)) or "?"
-  -- The GPU identity, first thing a received log is sorted by. LÖVE 12's
-  -- getRendererInfo returns one table; LÖVE 11's four values (see
-  -- captureEnvironment, which normalises both).
-  local ri = health.renderer and health.renderer.renderer
-  local gpu = ri and ((tostring(ri.name or "") .. " " .. tostring(ri.device or ""))
-    :gsub("%s+$", "")) or "?"
-  return {
-    platform = platformSlug(),
-    engine = tostring(ctx.engineVersion or "?"),
-    mod = tostring(manifest and manifest.version or "?"),
-    love = loveVer,
-    gpu = gpu,
-  }
-end
-
--- The organized JSON document the send carries (schema 3).  Top-level
--- identity fields let the server name and sort the file without parsing
--- log lines; boot evidence ships once per session; the ring is a delta
--- (only lines newer than the last acked send); status is the structured
--- snapshot, not a flat text excerpt.
-local function jsonPayload()
-  local id = identityFields()
-  local out = {
-    schema = 3,
-    session = tostring(sessionId),
-    frame = health.frame,
-    platform = id.platform,
-    engine = id.engine,
-    mod = id.mod,
-    love = id.love,
-    gpu = id.gpu,
-    date = os.date("%d_%m_%Y"),
-  }
-  -- the per-install support token: random, persisted in OPTIONS, visible
-  -- in the debugger; it only identifies a player once they share it
-  -- (PlayerId). Omitted entirely when the store could not be read.
-  local pid = PlayerId.get()
-  if pid then out.playerId = pid end
-  if not bootSent and #bootLog > 0 then
-    out.boot = {}
-    for _, line in ipairs(bootLog) do out.boot[#out.boot + 1] = line end
-  end
-  if #log > 0 then
-    local first = nil
-    for i = 1, #log do
-      if logSeq[i] and logSeq[i] > lastSentSeq then first = i break end
-    end
-    if first then
-      out.ring = {}
-      for i = first, #log do out.ring[#out.ring + 1] = log[i] end
-    end
-  end
-  out.status = snapshot()
-  return out
-end
-
--- The engine's link-protocol JSON encoder (data-only tables, arrays,
--- strings, numbers, booleans, null).  Resolved once at first send.
-local Json = nil
-local function jsonEncode(v)
-  if Json == nil then
-    local ok, mod = pcall(require, "src.link.Json")
-    Json = ok and mod and mod.encode or false
-  end
-  return Json and Json(v) or nil
-end
-
--- The structured status object ships inside the JSON payload (the
--- server stores the organized document as-is).  The ring only covers
--- what has happened since boot, so a send made early in a session would
--- otherwise carry no rendering, prebuild, or cache evidence; the
--- snapshot aggregates all of it.  The playthroughId stays local.  The
--- one identifier the upload carries is playerId, the player-facing
--- 8-digit support token (PlayerId): random per install, visible in the
--- debugger, and unlinkable to any player who has not shared it.
 
 local function managerLog(kind, msg)
   local mod = V.mod
@@ -362,7 +174,7 @@ local function storageFailure(op, code, message, key)
       (health.storage.expectedUnavailable or 0) + 1
     return
   end
-  counters.storageFails = counters.storageFails + 1
+  diagnostics.count("storageFails")
   -- Do not call Overlay.error here: persistence is called by emit(), and
   -- recursively logging a storage failure would create a write loop.
   pcall(print, "[pv-debug] storage " .. health.storage.lastError)
@@ -464,21 +276,6 @@ local function persist(force)
   if backoff then slowUntil = clock() + backoff end
 end
 
-local function append(line)
-  lines[#lines + 1] = line
-  if #lines > MAX_LINES then table.remove(lines, 1) end
-  if #bootLog < BOOT_KEEP then bootLog[#bootLog + 1] = line end
-  seq = seq + 1
-  log[#log + 1] = line
-  logSeq[#logSeq + 1] = seq
-  if #log > LOG_KEEP then
-    for i = 1, #log - (LOG_KEEP / 2) do
-      table.remove(log, 1)
-      table.remove(logSeq, 1)
-    end
-  end
-end
-
 -- Error lines are the support-report artifact: the throttled persist would
 -- otherwise lose up to a second of them on an abrupt exit. Force the write
 -- on the first error, then only again after a quiet gap -- a flood of
@@ -497,7 +294,7 @@ local function emit(msg, kind)
   -- Count every error occurrence, including deduped repeats: the summary's
   -- "N errors" must match how many errors actually happened.
   if kind == "error" then
-    counters.errors = counters.errors + 1
+    diagnostics.count("errors")
     health.lastError = {
       message = msg,
       frame = health.frame,
@@ -508,14 +305,13 @@ local function emit(msg, kind)
   if msg == lastMsg then
     lastCount = lastCount + 1
     local line = stamp(msg .. (" (x%d)"):format(lastCount))
-    lines[#lines] = line
-    log[#log] = line
+    diagnostics.replaceLatest(line)
     persistFor(kind)
     return
   end
   lastMsg, lastCount = msg, 1
   local line = stamp(msg)
-  append(line)
+  diagnostics.append(line)
   pcall(print, "[pv-debug] " .. line)
   persistFor(kind)
 end
@@ -655,7 +451,7 @@ end
 -- Session counters feed the summary and run from boot with the background
 -- recorder. Panel visibility must not change the support report.
 function Overlay.count(name)
-  counters[name] = (counters[name] or 0) + 1
+  diagnostics.count(name)
 end
 
 -- `enabled` is retained as the public visibility query used by the input
@@ -683,7 +479,7 @@ function Overlay.setVisible(show)
   visible = show
   if not visible then Overlay.summary() end
   local line = "debugger " .. (visible and "VISIBLE" or "HIDDEN")
-  append(stamp(line))
+  diagnostics.append(stamp(line))
   pcall(print, "[pv-debug] " .. stamp(line))
   persist(true)
 end
@@ -699,79 +495,24 @@ function Overlay.toggleVerbose()
   Overlay.note("verbosity %s", verbose and "ALL" or "IMPORTANT")
 end
 
+local Transport = DiagnosticsTransport.new({
+  store = diagnostics,
+  environment = Environment,
+  snapshot = snapshot,
+  note = Overlay.note,
+  trace = Overlay.trace,
+  clock = clock,
+})
+
+function Overlay.sendLogs()
+  return Transport.send()
+end
+
 -- F8's loghook companion: ship the stored evidence to the manifest-declared
 -- log_url, one-way.  Engine feature #1363 (mod.postLog); silently no-ops on
 -- engines without it or without a log_url.  Fire-and-forget: the job is
 -- polled once on the next frame and released when it settles, so a hung
 -- endpoint never accumulates in the worker pool.
-local sendHandle = nil
-local sendAt = 0   -- wall clock when the current send was submitted
-
-function Overlay.sendLogs()
-  local mod = V.mod
-  if not (mod and type(mod.postLog) == "function") then return false end
-  if not (mod.manifest and mod.manifest.log_url) then return false end
-  -- The organized JSON document (schema 3): identity fields at the top
-  -- (the server names and sorts the file from them), boot evidence once
-  -- per session, a ring DELTA (only lines newer than the last acked
-  -- send), and the structured status snapshot.  The engine's postLog
-  -- ceiling is 512 KiB since engine PR #1382 (64 KiB before); a delta is
-  -- normally <2 KiB, and the first send of a session (boot + full ring)
-  -- still fits the conservative budget.  If the engine rejects the JSON
-  -- as too large, retry once with boot omitted and the ring capped.
-  local function buildBody(slim)
-    local payload = jsonPayload()
-    if slim then
-      payload.boot = nil
-      if payload.ring and #payload.ring > 200 then
-        local kept = {}
-        for i = #payload.ring - 199, #payload.ring do
-          kept[#kept + 1] = payload.ring[i]
-        end
-        payload.ring = kept
-      end
-    end
-    local body = jsonEncode(payload)
-    if not body then
-      Overlay.note("log send failed: JSON encoder unavailable")
-      return nil
-    end
-    return body
-  end
-  local body = buildBody(false)
-  if not body then return false end
-  -- The engine rejects a send by returning nil plus a REASON (too large,
-  -- too many in flight, bad URL...); pcall forwards both returns, so the
-  -- reason is captured and shown instead of reading as a bare nil.
-  local ok, handle, reason = pcall(mod.postLog, mod, body, { format = "text" })
-  if not ok or not handle and reason and reason:find("too large") then
-    -- An engine without PR #1382 caps at 64 KiB: retry once with the
-    -- conservative budget before reporting a failure.
-    Overlay.trace("log send: payload too large for this engine; retrying trimmed")
-    body = buildBody(true)
-    if not body then return false end
-    ok, handle, reason = pcall(mod.postLog, mod, body, { format = "text" })
-  end
-  if not ok or not handle then
-    Overlay.note("log send failed: %s",
-      tostring(handle or reason or "engine rejected the send"))
-    return false
-  end
-  -- Acknowledged: advance the delta watermark so the next send carries
-  -- only newer lines.  On a failed send the watermark stays put, so the
-  -- next send retries the same delta (at-least-once, same as today).
-  -- The watermark is captured AFTER the confirmation note below appends
-  -- its own ring line, so the send's self-lines are never re-sent and
-  -- the idle gate (seq == lastSentSeq) can actually trip once the send
-  -- settles; the poll half advances it again past its confirmation trace.
-  bootSent = true
-  sendHandle = handle
-  sendAt = clock()
-  Overlay.note("log sent to loghook")
-  lastSentSeq = seq
-  return true
-end
-
 -- ------- log-send opt-out
 --
 -- F8, the SEND LOGS row and the START chord all ship the stored evidence
@@ -787,9 +528,7 @@ end
 -- plus a manifest log_url. The gate only exists where a send would
 -- actually happen, so a local-only export never sends.
 function Overlay.canSend()
-  local mod = V.mod
-  return not not (mod and type(mod.postLog) == "function"
-                  and mod.manifest and mod.manifest.log_url)
+  return Transport.canSend()
 end
 
 -- Whether the player has opted out. Read live through the options API
@@ -818,12 +557,12 @@ function Overlay.export(g)
       Overlay.note("log send disabled (LOGS TO DEV OFF)")
     end
   end
-  pcall(print, "[pv-log] ---- boot evidence (" .. #bootLog .. " lines) ----")
-  for _, line in ipairs(bootLog) do
+  pcall(print, "[pv-log] ---- boot evidence (" .. #diagnostics.bootLog .. " lines) ----")
+  for _, line in ipairs(diagnostics.bootLog) do
     pcall(print, "[pv-log] " .. line)
   end
-  pcall(print, "[pv-log] ---- recent evidence (" .. #log .. " lines) ----")
-  for _, line in ipairs(log) do
+  pcall(print, "[pv-log] ---- recent evidence (" .. #diagnostics.log .. " lines) ----")
+  for _, line in ipairs(diagnostics.log) do
     pcall(print, "[pv-log] " .. line)
   end
   local current = snapshot()
@@ -839,9 +578,9 @@ function Overlay.export(g)
              .. " rendered=" .. tostring(current.pipeline.rendered)
              .. " fallbacks=" .. tostring(current.pipeline.fallbacks))
   pcall(print, "[pv-log] ---- end ----")
-  local line = stamp("log exported: " .. (#bootLog + #log)
+  local line = stamp("log exported: " .. (#diagnostics.bootLog + #diagnostics.log)
                      .. " lines + status -> storage debug/log")
-  append(line)
+  diagnostics.append(line)
   pcall(print, "[pv-debug] " .. line)
   persist(true)
 end
@@ -853,10 +592,10 @@ function Overlay.summary()
     .. "%d errors, %d storage fails, worst frame %.1fms",
     counters.jobs, counters.jobFails, counters.cacheHits, counters.cacheMisses,
     counters.slowLoads, counters.errors, counters.storageFails,
-    worstFrame)
+    diagnostics.worstFrame)
   if not ok then msg = "session summary unavailable" end
   local line = stamp(msg)
-  append(line)
+  diagnostics.append(line)
   pcall(print, "[pv-debug] " .. line)
   persist(true)
 end
@@ -887,40 +626,10 @@ local IDLE_HEARTBEAT_EVERY = 300
 local lastAutoSendElapsed = 0   -- game time of the last auto-send (heartbeat cap anchor)
 
 function Overlay.frame(dt, renderMs)
-  if sendHandle and V.mod and V.mod.fetch
-      and type(V.mod.fetch.poll) == "function" then
-    local ok, st = pcall(V.mod.fetch.poll, V.mod.fetch, sendHandle)
-    if ok and st and st.status ~= "pending" then
-      -- The job settled.  The engine worker does not report through the
-      -- send notice, so surface its result here: a failure is important
-      -- (stored in the support log and shown), a success is a trace.
-      if st.status == "ok" then
-        Overlay.trace("log send confirmed")
-        lastSentSeq = seq
-      else
-        Overlay.note("log send failed: %s", tostring(st.err or st.status))
-      end
-      pcall(V.mod.fetch.release, V.mod.fetch, sendHandle)
-      sendHandle = nil
-    elseif ok and clock() - sendAt > 40 then
-      -- A worker that hangs (e.g. a stuck process spawn) leaves the job
-      -- pending forever; every further F8 then trips the engine's
-      -- 4-in-flight ceiling ("log send failed: nil").  Cancel and drop the
-      -- handle so the next send starts clean.
-      Overlay.note("log send timed out after %ds; cancelling",
-                   math.floor(clock() - sendAt))
-      pcall(V.mod.fetch.cancel, V.mod.fetch, sendHandle)
-      pcall(V.mod.fetch.release, V.mod.fetch, sendHandle)
-      sendHandle = nil
-    elseif not ok then
-      Overlay.note("log send poll failed: %s", tostring(st))
-      pcall(V.mod.fetch.release, V.mod.fetch, sendHandle)
-      sendHandle = nil
-    end
-  end
+  Transport.poll()
   if Overlay.canSend() and Overlay.sendingAllowed()
-      and not sendHandle and autoSendElapsed >= nextAutoAt then
-    if bootSent and seq == lastSentSeq
+      and not Transport.pending() and autoSendElapsed >= nextAutoAt then
+    if diagnostics.bootSent and diagnostics.seq == diagnostics.lastSentSeq
         and nextAutoAt < lastAutoSendElapsed + IDLE_HEARTBEAT_EVERY then
       -- Nothing new since the last send and the heartbeat window is
       -- still open: skip the identical-delta ship and push the deadline
@@ -942,7 +651,7 @@ function Overlay.frame(dt, renderMs)
   autoSendElapsed = autoSendElapsed + (dt or 0)
   health.frame = health.frame + 1
   local frameMs = (dt or 0) * 1000
-  if frameMs > worstFrame then worstFrame = frameMs end
+  diagnostics.updateWorstFrame(frameMs)
   statsFrames = statsFrames + 1
   statsTime = statsTime + frameMs
   if renderMs and renderMs > statsMax then statsMax = renderMs end
@@ -1091,7 +800,7 @@ function Overlay.lint(mod, moduleNames)
 end
 
 function Overlay.draw()
-  if not visible or #lines == 0 then return end
+  if not visible or #diagnostics.lines == 0 then return end
   local g = love.graphics
   if not g then return end
   local prevFont, okF = pcall(g.getFont)
@@ -1114,7 +823,7 @@ function Overlay.draw()
   -- match against the received file's name.
   local pid = PlayerId.get() or "--------"
   shown[#shown + 1] = ("id %s   session %s"):format(pid, tostring(sessionId))
-  for _, line in ipairs(lines) do
+  for _, line in ipairs(diagnostics.lines) do
     if verbose or line:find(" ERROR ") or line:find("FWD%-LOCAL")
        or line:find("mesh job failed") or line:find("SLOW load")
        or line:find("storage ") or line:find("prebuild job failed")
@@ -1135,54 +844,7 @@ function Overlay.draw()
   pcall(g.setBlendMode, prevBlend, prevBlendAlpha)
 end
 
-function Overlay.captureEnvironment()
-  local g = love and love.graphics
-  local out = {}
-  health.platform = platformName()
-  if love and love.getVersion then
-    local ok, major, minor, revision, codename = pcall(love.getVersion)
-    if ok then
-      out.love = { major = major, minor = minor, revision = revision,
-                   codename = codename }
-    end
-  end
-  if g then
-    if g.getRendererInfo then
-      -- LÖVE 12 returns one table (name/vendor/device/version); LÖVE 11
-      -- returns four values, in the order (name, version, vendor, device)
-      -- -- the field order matters: a Deck log once stored "AMD" as the
-      -- device and left the vangogh signature in the version slot, which
-      -- is how the GPU line degraded to "OpenGL AMD". Both shapes are the
-      -- same identity -- the GPU and the backend behind every render and
-      -- shadow issue.
-      local ok, a, b, c, d = pcall(g.getRendererInfo)
-      if ok and type(a) == "table" then
-        out.renderer = dataCopy(a)
-      elseif ok and a then
-        out.renderer = { name = tostring(a), version = tostring(b or ""),
-                         vendor = tostring(c or ""), device = tostring(d or "") }
-      end
-    end
-    if g.getDimensions then
-      local ok, w, h = pcall(g.getDimensions)
-      if ok then out.dimensions = { w = w, h = h } end
-    end
-    if g.getPixelDimensions then
-      local ok, w, h = pcall(g.getPixelDimensions)
-      if ok then out.pixelDimensions = { w = w, h = h } end
-    end
-    if g.getSupported then
-      local ok, caps = pcall(g.getSupported)
-      if ok then out.supported = dataCopy(caps) end
-    end
-    if g.getSystemLimits then
-      local ok, limits = pcall(g.getSystemLimits)
-      if ok then out.systemLimits = dataCopy(limits) end
-    end
-  end
-  health.renderer = out
-  return dataCopy(out)
-end
+Overlay.captureEnvironment = Environment.capture
 
 function Overlay.install()
   if Overlay.installed then return end
